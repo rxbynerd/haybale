@@ -2,11 +2,15 @@ package config
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -89,6 +93,48 @@ func writeTestRSAKeyFile(t *testing.T) string {
 	return path
 }
 
+// writeTestTLSCertKeyFiles generates a throwaway, self-signed ECDSA
+// certificate/key pair (never committed anywhere — generated fresh every
+// test run) and writes them PEM-encoded to two files under t.TempDir(),
+// returning their paths. Good enough to exercise "tls" config
+// validation, which only cares that tls.LoadX509KeyPair can load the
+// pair — it never needs to be trusted by anything.
+func writeTestTLSCertKeyFiles(t *testing.T) (certPath, keyPath string) {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa.GenerateKey: %v", err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "haybale-config-test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("x509.CreateCertificate: %v", err)
+	}
+
+	dir := t.TempDir()
+	certPath = filepath.Join(dir, "cert.pem")
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(cert.pem): %v", err)
+	}
+
+	keyDER, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		t.Fatalf("x509.MarshalECPrivateKey: %v", err)
+	}
+	keyPath = filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(key.pem): %v", err)
+	}
+	return certPath, keyPath
+}
+
 // newFakeGitHubAppServer stands up a minimal httptest stand-in for the
 // two GitHub REST endpoints upstream.GitHubAppSource calls: installation
 // lookup and scoped-token mint. It always resolves to installationID and
@@ -162,6 +208,132 @@ func TestValidate(t *testing.T) {
 				}
 			},
 			wantErr: "logLevel",
+		},
+		{
+			name: "tls certPath without keyPath",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				certPath, _ := writeTestTLSCertKeyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					TLS:       TLSConfig{CertPath: certPath},
+					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "certPath and keyPath must both be set",
+		},
+		{
+			name: "tls keyPath without certPath",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				_, keyPath := writeTestTLSCertKeyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					TLS:       TLSConfig{KeyPath: keyPath},
+					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "certPath and keyPath must both be set",
+		},
+		{
+			name: "tls certPath does not exist",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				_, keyPath := writeTestTLSCertKeyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					TLS:       TLSConfig{CertPath: filepath.Join(t.TempDir(), "nope.pem"), KeyPath: keyPath},
+					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "load certPath",
+		},
+		{
+			name: "tls cert and key do not match",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				certPath, _ := writeTestTLSCertKeyFiles(t)
+				_, otherKeyPath := writeTestTLSCertKeyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					TLS:       TLSConfig{CertPath: certPath, KeyPath: otherKeyPath},
+					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "load certPath",
+		},
+		{
+			name: "tls valid cert/key pair",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				certPath, keyPath := writeTestTLSCertKeyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					TLS:       TLSConfig{CertPath: certPath, KeyPath: keyPath},
+					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			// No TLS is also valid (the zero TLSConfig) — see "valid
+			// minimal config" above, which leaves TLS entirely empty.
+		},
+		{
+			name: "drainTimeout is not a valid duration",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:       ":8466",
+					LogLevel:     "info",
+					DrainTimeout: "not-a-duration",
+					Identity:     IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:       PolicyConfig{Path: policyPath},
+					Upstreams:    []Upstream{validUpstream},
+				}
+			},
+			wantErr: "drainTimeout",
+		},
+		{
+			name: "drainTimeout is negative",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:       ":8466",
+					LogLevel:     "info",
+					DrainTimeout: "-1m",
+					Identity:     IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:       PolicyConfig{Path: policyPath},
+					Upstreams:    []Upstream{validUpstream},
+				}
+			},
+			wantErr: "must not be negative",
+		},
+		{
+			name: "drainTimeout explicit zero is valid (unbounded wait)",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:       ":8466",
+					LogLevel:     "info",
+					DrainTimeout: "0s",
+					Identity:     IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:       PolicyConfig{Path: policyPath},
+					Upstreams:    []Upstream{validUpstream},
+				}
+			},
 		},
 		{
 			name: "no upstreams",
@@ -706,6 +878,63 @@ func TestValidatePopulatesGitHubAppCredentialSource(t *testing.T) {
 	}
 }
 
+// TestValidatePopulatesCertificate asserts Validate() loads a
+// *tls.Certificate from a "tls" block's certPath/keyPath, leaves it nil
+// (and TLSConfig.Enabled() false) when the block is left entirely empty,
+// and populates Config.ParsedDrainTimeout() from DrainTimeout.
+func TestValidatePopulatesCertificate(t *testing.T) {
+	t.Setenv(testTokenEnv, testTokenEnvValue)
+	identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+	certPath, keyPath := writeTestTLSCertKeyFiles(t)
+
+	cfg := Config{
+		Listen:       ":8466",
+		LogLevel:     "info",
+		TLS:          TLSConfig{CertPath: certPath, KeyPath: keyPath},
+		DrainTimeout: "90s",
+		Identity:     IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+		Policy:       PolicyConfig{Path: policyPath},
+		Upstreams:    []Upstream{{Host: "github.com", BaseURL: "https://github.com", Credential: validCredential}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected error: %v", err)
+	}
+
+	if !cfg.TLS.Enabled() {
+		t.Error("TLS.Enabled() = false after Validate() with certPath/keyPath set")
+	}
+	if cfg.TLS.Certificate() == nil {
+		t.Error("TLS.Certificate() = nil after successful Validate()")
+	}
+	if got, want := cfg.ParsedDrainTimeout(), 90*time.Second; got != want {
+		t.Errorf("ParsedDrainTimeout() = %v, want %v", got, want)
+	}
+}
+
+// TestValidateLeavesTLSDisabledWhenEmpty asserts a Config with no "tls"
+// block at all validates successfully with TLS disabled — plain HTTP is
+// the default, not an error.
+func TestValidateLeavesTLSDisabledWhenEmpty(t *testing.T) {
+	t.Setenv(testTokenEnv, testTokenEnvValue)
+	identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+	cfg := Config{
+		Listen:    ":8466",
+		LogLevel:  "info",
+		Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+		Policy:    PolicyConfig{Path: policyPath},
+		Upstreams: []Upstream{{Host: "github.com", BaseURL: "https://github.com", Credential: validCredential}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected error: %v", err)
+	}
+	if cfg.TLS.Enabled() {
+		t.Error("TLS.Enabled() = true for a Config with no tls block")
+	}
+	if cfg.TLS.Certificate() != nil {
+		t.Error("TLS.Certificate() != nil for a Config with no tls block")
+	}
+}
+
 func TestApplyDefaults(t *testing.T) {
 	cfg := Config{
 		Upstreams: []Upstream{{Host: "github.com", BaseURL: "https://github.com"}},
@@ -718,12 +947,16 @@ func TestApplyDefaults(t *testing.T) {
 	if cfg.LogLevel != defaultLogLevel {
 		t.Errorf("LogLevel = %q, want default %q", cfg.LogLevel, defaultLogLevel)
 	}
+	if cfg.DrainTimeout != defaultDrainTimeout {
+		t.Errorf("DrainTimeout = %q, want default %q", cfg.DrainTimeout, defaultDrainTimeout)
+	}
 }
 
 func TestApplyDefaultsDoesNotOverrideExplicitValues(t *testing.T) {
 	cfg := Config{
-		Listen:   "127.0.0.1:9000",
-		LogLevel: "debug",
+		Listen:       "127.0.0.1:9000",
+		LogLevel:     "debug",
+		DrainTimeout: "10s",
 	}
 	cfg.applyDefaults()
 
@@ -732,6 +965,9 @@ func TestApplyDefaultsDoesNotOverrideExplicitValues(t *testing.T) {
 	}
 	if cfg.LogLevel != "debug" {
 		t.Errorf("LogLevel = %q, want unchanged %q", cfg.LogLevel, "debug")
+	}
+	if cfg.DrainTimeout != "10s" {
+		t.Errorf("DrainTimeout = %q, want unchanged %q", cfg.DrainTimeout, "10s")
 	}
 }
 
@@ -790,6 +1026,112 @@ upstreams:
 	}
 }
 
+// TestLoadWithTLSOverride asserts WithTLSOverride's certPath/keyPath
+// values win over whatever (if anything) the YAML file itself set — the
+// seam --tls-cert-path/--tls-key-path serve flags use to override
+// haybale.yaml's own "tls" block.
+func TestLoadWithTLSOverride(t *testing.T) {
+	t.Setenv(testTokenEnv, testTokenEnvValue)
+	dir := t.TempDir()
+	identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+	path := filepath.Join(dir, "haybale.yaml")
+	yamlContent := `
+identity:
+  type: static-token-file
+  path: ` + identityPath + `
+policy:
+  path: ` + policyPath + `
+upstreams:
+  - host: github.com
+    baseURL: https://github.com
+    credential: { type: static, tokenEnv: ` + testTokenEnv + ` }
+`
+	if err := os.WriteFile(path, []byte(yamlContent), 0o600); err != nil {
+		t.Fatalf("os.WriteFile: %v", err)
+	}
+
+	certPath, keyPath := writeTestTLSCertKeyFiles(t)
+	cfg, err := Load(path, WithTLSOverride(certPath, keyPath))
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if cfg.TLS.CertPath != certPath || cfg.TLS.KeyPath != keyPath {
+		t.Errorf("TLS = %+v, want CertPath=%q KeyPath=%q", cfg.TLS, certPath, keyPath)
+	}
+	if !cfg.TLS.Enabled() || cfg.TLS.Certificate() == nil {
+		t.Error("TLS override did not participate in Validate()'s cert loading")
+	}
+}
+
+// TestLoadWithTLSOverrideLeavesUnsetFieldsAlone asserts passing "" for
+// one of WithTLSOverride's two arguments leaves that field exactly as
+// the YAML file set it — a flag the operator left unset must never
+// clobber a configured value.
+func TestLoadWithTLSOverrideLeavesUnsetFieldsAlone(t *testing.T) {
+	t.Setenv(testTokenEnv, testTokenEnvValue)
+	dir := t.TempDir()
+	identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+	certPath, keyPath := writeTestTLSCertKeyFiles(t)
+	path := filepath.Join(dir, "haybale.yaml")
+	yamlContent := `
+identity:
+  type: static-token-file
+  path: ` + identityPath + `
+policy:
+  path: ` + policyPath + `
+tls:
+  certPath: ` + certPath + `
+  keyPath: ` + keyPath + `
+upstreams:
+  - host: github.com
+    baseURL: https://github.com
+    credential: { type: static, tokenEnv: ` + testTokenEnv + ` }
+`
+	if err := os.WriteFile(path, []byte(yamlContent), 0o600); err != nil {
+		t.Fatalf("os.WriteFile: %v", err)
+	}
+
+	cfg, err := Load(path, WithTLSOverride("", ""))
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if cfg.TLS.CertPath != certPath || cfg.TLS.KeyPath != keyPath {
+		t.Errorf("TLS = %+v, want the YAML file's own CertPath=%q KeyPath=%q left untouched", cfg.TLS, certPath, keyPath)
+	}
+}
+
+// TestLoadWithDrainTimeoutOverride mirrors TestLoadWithTLSOverride for
+// WithDrainTimeoutOverride — the seam --drain-timeout uses.
+func TestLoadWithDrainTimeoutOverride(t *testing.T) {
+	t.Setenv(testTokenEnv, testTokenEnvValue)
+	dir := t.TempDir()
+	identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+	path := filepath.Join(dir, "haybale.yaml")
+	yamlContent := `
+identity:
+  type: static-token-file
+  path: ` + identityPath + `
+policy:
+  path: ` + policyPath + `
+drainTimeout: 5m
+upstreams:
+  - host: github.com
+    baseURL: https://github.com
+    credential: { type: static, tokenEnv: ` + testTokenEnv + ` }
+`
+	if err := os.WriteFile(path, []byte(yamlContent), 0o600); err != nil {
+		t.Fatalf("os.WriteFile: %v", err)
+	}
+
+	cfg, err := Load(path, WithDrainTimeoutOverride("30s"))
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if got, want := cfg.ParsedDrainTimeout(), 30*time.Second; got != want {
+		t.Errorf("ParsedDrainTimeout() = %v, want override value %v (not the YAML file's 5m)", got, want)
+	}
+}
+
 func TestLoadAppliesDefaults(t *testing.T) {
 	t.Setenv(testTokenEnv, testTokenEnvValue)
 	dir := t.TempDir()
@@ -820,6 +1162,22 @@ upstreams:
 	if cfg.LogLevel != defaultLogLevel {
 		t.Errorf("LogLevel = %q, want default %q", cfg.LogLevel, defaultLogLevel)
 	}
+	if got, want := cfg.ParsedDrainTimeout(), mustParseDuration(t, defaultDrainTimeout); got != want {
+		t.Errorf("ParsedDrainTimeout() = %v, want default %v", got, want)
+	}
+}
+
+// mustParseDuration parses s, failing the test immediately on error —
+// used only to turn defaultDrainTimeout (a string constant, already
+// known-valid by construction) into a time.Duration for comparison,
+// rather than hardcoding its parsed value a second time.
+func mustParseDuration(t *testing.T, s string) time.Duration {
+	t.Helper()
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		t.Fatalf("time.ParseDuration(%q): %v", s, err)
+	}
+	return d
 }
 
 func TestLoadRejectsInvalidConfig(t *testing.T) {

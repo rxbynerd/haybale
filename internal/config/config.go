@@ -14,10 +14,12 @@
 package config
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -31,6 +33,15 @@ const defaultListen = ":8466"
 
 // defaultLogLevel is used when LogLevel is left empty in the YAML.
 const defaultLogLevel = "info"
+
+// defaultDrainTimeout is used when DrainTimeout is left empty in the
+// YAML: a few minutes is generous for even a large git clone/push to
+// finish streaming once a graceful shutdown begins, while still giving
+// an operator a backstop against a connection that never completes on
+// its own (a stalled client, not a legitimate large transfer). An
+// operator who wants to wait indefinitely instead sets drainTimeout to
+// "0s" explicitly — see DrainTimeout's doc comment.
+const defaultDrainTimeout = "2m"
 
 // validLogLevels is the closed set of log/slog levels haybale accepts.
 var validLogLevels = map[string]bool{
@@ -48,6 +59,20 @@ type Config struct {
 	// LogLevel is one of debug|info|warn|error. Defaults to "info" when
 	// empty.
 	LogLevel string `yaml:"logLevel"`
+	// TLS optionally configures HTTPS for Listen. Leaving it entirely
+	// empty serves plain HTTP — documented (docs/security.md) as safe
+	// only for a cluster-internal deployment, since haybale otherwise
+	// carries the client's bearer token and the upstream git credential
+	// over the wire.
+	TLS TLSConfig `yaml:"tls"`
+	// DrainTimeout bounds how long a graceful shutdown (SIGTERM/SIGINT)
+	// waits for in-flight requests — a large git clone/push in particular
+	// — to finish before the server forcibly closes them. A Go duration
+	// string, e.g. "2m". Defaults to defaultDrainTimeout when empty; set
+	// explicitly to "0s" for an unbounded wait (Shutdown blocks until
+	// every in-flight request finishes on its own, however long that
+	// takes).
+	DrainTimeout string `yaml:"drainTimeout"`
 	// Identity configures how haybale authenticates inbound requests.
 	Identity IdentityConfig `yaml:"identity"`
 	// Policy configures how haybale authorizes an authenticated
@@ -57,6 +82,60 @@ type Config struct {
 	// first path segment of the host-in-path URL scheme
 	// (/{host}/{owner}/{repo}.git/<endpoint>).
 	Upstreams []Upstream `yaml:"upstreams"`
+
+	// parsedDrainTimeout caches the time.Duration Validate() parsed from
+	// DrainTimeout, for the same reuse-not-reparse reason
+	// Upstream.parsedBaseURL exists.
+	parsedDrainTimeout time.Duration
+}
+
+// ParsedDrainTimeout returns the time.Duration a prior successful call to
+// Validate() parsed from DrainTimeout. Zero means "wait indefinitely"
+// (either DrainTimeout was explicitly set to "0s", or Validate() has not
+// yet run for this Config).
+func (c Config) ParsedDrainTimeout() time.Duration {
+	return c.parsedDrainTimeout
+}
+
+// TLSConfig optionally configures HTTPS for haybale's listener. When
+// both CertPath and KeyPath are set, haybale serves HTTPS via
+// http.Server.ListenAndServeTLS; when both are left empty, it serves
+// plain HTTP. Setting exactly one of the two fails Validate() — a
+// half-configured TLS block is far more likely to be a mistake (a typo'd
+// key path, a copy-paste that missed one field) than an intentional
+// choice.
+type TLSConfig struct {
+	// CertPath is the path to a PEM-encoded certificate (optionally a
+	// full chain).
+	CertPath string `yaml:"certPath"`
+	// KeyPath is the path to the PEM-encoded private key matching
+	// CertPath.
+	KeyPath string `yaml:"keyPath"`
+
+	// certificate is the *tls.Certificate Validate() loaded from
+	// CertPath/KeyPath via tls.LoadX509KeyPair, so callers (serve.go)
+	// reuse that exact parse rather than re-reading the files a second
+	// time — the same reuse-not-reparse pattern
+	// IdentityConfig.authenticator/PolicyConfig.engine/
+	// Upstream.parsedBaseURL already establish. nil when TLS is not
+	// configured at all.
+	certificate *tls.Certificate
+}
+
+// Enabled reports whether this TLSConfig configures TLS at all, i.e.
+// whether CertPath/KeyPath are both set. Validate() rejects a
+// half-configured TLSConfig (exactly one of the two set) outright, so by
+// the time Enabled is called on a Validate()'d Config the only two
+// states are "both set" and "both empty".
+func (c TLSConfig) Enabled() bool {
+	return c.CertPath != "" && c.KeyPath != ""
+}
+
+// Certificate returns the *tls.Certificate a prior successful call to
+// Validate() loaded from CertPath/KeyPath, or nil if TLS is not
+// configured (Enabled() is false) or Validate() has not yet run.
+func (c TLSConfig) Certificate() *tls.Certificate {
+	return c.certificate
 }
 
 // identityTypeStaticTokenFile is the only Identity.Type value v0.1
@@ -209,10 +288,46 @@ type CredentialConfig struct {
 	APIBaseURL string `yaml:"apiBaseURL"`
 }
 
-// Load reads and parses the YAML file at path, applies defaults, and
-// validates the result. It returns an error immediately if the config is
-// invalid — callers should treat any error here as fatal at startup.
-func Load(path string) (*Config, error) {
+// LoadOption customises the Config Load parses, applied after the YAML
+// file is unmarshalled but before applyDefaults/Validate run — the seam
+// a CLI flag uses to override a value that would otherwise come from the
+// file (see WithTLSOverride/WithDrainTimeoutOverride and
+// cmd/haybale/cmd/serve.go's --tls-cert-path/--tls-key-path/
+// --drain-timeout flags). Applying overrides before Validate() means an
+// override participates in the same fail-fast validation (a bad
+// certPath/keyPath pair, a malformed duration) as a value set directly
+// in the YAML file.
+type LoadOption func(*Config)
+
+// WithTLSOverride overrides TLS.CertPath/TLS.KeyPath when non-empty.
+// Passing "" for either argument leaves that field as parsed from the
+// YAML file, so a flag the operator left unset never clobbers a
+// configured value.
+func WithTLSOverride(certPath, keyPath string) LoadOption {
+	return func(c *Config) {
+		if certPath != "" {
+			c.TLS.CertPath = certPath
+		}
+		if keyPath != "" {
+			c.TLS.KeyPath = keyPath
+		}
+	}
+}
+
+// WithDrainTimeoutOverride overrides DrainTimeout when non-empty.
+func WithDrainTimeoutOverride(drainTimeout string) LoadOption {
+	return func(c *Config) {
+		if drainTimeout != "" {
+			c.DrainTimeout = drainTimeout
+		}
+	}
+}
+
+// Load reads and parses the YAML file at path, applies opts (see
+// LoadOption), applies defaults, and validates the result. It returns an
+// error immediately if the config is invalid — callers should treat any
+// error here as fatal at startup.
+func Load(path string, opts ...LoadOption) (*Config, error) {
 	data, err := os.ReadFile(path) //nolint:gosec // path is the operator-supplied --config flag value, not attacker input
 	if err != nil {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
@@ -223,6 +338,10 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}
 
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	cfg.applyDefaults()
 
 	if err := cfg.Validate(); err != nil {
@@ -231,13 +350,17 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// applyDefaults fills in Listen and LogLevel when left empty.
+// applyDefaults fills in Listen, LogLevel, and DrainTimeout when left
+// empty.
 func (c *Config) applyDefaults() {
 	if c.Listen == "" {
 		c.Listen = defaultListen
 	}
 	if c.LogLevel == "" {
 		c.LogLevel = defaultLogLevel
+	}
+	if c.DrainTimeout == "" {
+		c.DrainTimeout = defaultDrainTimeout
 	}
 }
 
@@ -251,6 +374,43 @@ func (c *Config) applyDefaults() {
 func (c *Config) Validate() error {
 	if !validLogLevels[strings.ToLower(c.LogLevel)] {
 		return fmt.Errorf("logLevel %q is not one of debug, info, warn, error", c.LogLevel)
+	}
+
+	if (c.TLS.CertPath == "") != (c.TLS.KeyPath == "") {
+		return fmt.Errorf("tls: certPath and keyPath must both be set, or both left empty")
+	}
+	if c.TLS.CertPath != "" {
+		// Loaded (not merely stat'd) here, at Validate() time, for the
+		// same fail-fast-at-startup reason the github-app credential's
+		// privateKeyPath is read and parsed here rather than deferred to
+		// the first TLS handshake: a missing file, an unreadable one, or
+		// a cert/key pair that don't match should refuse to serve traffic
+		// at startup, not fail unpredictably on the first inbound
+		// connection.
+		cert, err := tls.LoadX509KeyPair(c.TLS.CertPath, c.TLS.KeyPath)
+		if err != nil {
+			return fmt.Errorf("tls: load certPath %q / keyPath %q: %w", c.TLS.CertPath, c.TLS.KeyPath, err)
+		}
+		c.TLS.certificate = &cert
+	}
+
+	// An empty DrainTimeout is left as the zero Duration (wait
+	// indefinitely) rather than rejected outright: production configs
+	// always flow through Load(), which runs applyDefaults() (filling
+	// in defaultDrainTimeout) before Validate() ever sees the field, but
+	// Validate() itself — like every other field here — must also accept
+	// a hand-built Config that left it unset, the same way LogLevel's own
+	// default is only ever applied by applyDefaults(), never by
+	// Validate() reaching in to override an empty value.
+	if c.DrainTimeout != "" {
+		drainTimeout, err := time.ParseDuration(c.DrainTimeout)
+		if err != nil {
+			return fmt.Errorf("drainTimeout %q is not a valid duration: %w", c.DrainTimeout, err)
+		}
+		if drainTimeout < 0 {
+			return fmt.Errorf("drainTimeout %q must not be negative", c.DrainTimeout)
+		}
+		c.parsedDrainTimeout = drainTimeout
 	}
 
 	if len(c.Upstreams) == 0 {
