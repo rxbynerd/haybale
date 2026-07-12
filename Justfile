@@ -32,5 +32,17 @@ test-race:
 lint:
     golangci-lint run ./...
 
+# e2e-github runs the M6 acceptance: a credential-less container clones
+# and pushes a real private GitHub repo through a locally-running
+# haybale, using a real GitHub App — see
+# docs/runbook-github-acceptance.md and scripts/e2e-github.sh for the
+# full detail. Requires HAYBALE_APP_KEY_PATH (path to the GitHub App's
+# PEM private key) in the environment. Uses {{container}} (docker or
+# podman) exactly like image-build above. Not part of `just test`/CI:
+# it needs a real GitHub App private key, a real private repo, and a
+# container runtime that can reach back out to the host.
+e2e-github: build
+    HAYBALE_CONTAINER_RUNTIME={{container}} ./scripts/e2e-github.sh
+
 clean:
     rm -f haybale

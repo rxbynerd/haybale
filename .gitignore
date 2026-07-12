@@ -6,5 +6,11 @@
 # Coordinator scratch dir — never tracked
 .reviews/
 
+# scripts/e2e-github.sh's scratch dir: a minted identity token, the
+# generated identities.yaml/policy.yaml/haybale.yaml for that run, and
+# haybale's own log — never tracked, and removed by the script itself
+# on every exit path regardless.
+.e2e-github/
+
 # Editor/OS cruft
 .DS_Store
