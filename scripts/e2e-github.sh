@@ -37,7 +37,14 @@
 #                               how that repo was created).
 #   HAYBALE_BIN                 path to the haybale binary (default: ./haybale).
 #   HAYBALE_E2E_PORT            port haybale listens on for this run
-#                               (default: 8466).
+#                               (default: derived from this script's own
+#                               PID, so two concurrent runs don't race on
+#                               the same port).
+#   HAYBALE_E2E_SCRATCH         scratch dir for this run's generated
+#                               token/config/log (default: .e2e-github.$$,
+#                               $$ being this script's PID, so concurrent
+#                               runs don't clobber each other's in-flight
+#                               files — see .gitignore's `.e2e-github*/`).
 #
 # Run from the repo root after `just build`:
 #   HAYBALE_APP_KEY_PATH=/path/to/key.pem just e2e-github
@@ -50,8 +57,13 @@ HAYBALE_BIN="${HAYBALE_BIN:-./haybale}"
 CONTAINER_RUNTIME="${HAYBALE_CONTAINER_RUNTIME:-podman}"
 APP_ID="${HAYBALE_APP_ID:-4278664}"
 E2E_REPO="${HAYBALE_E2E_REPO:-rxbynerd/haybale-e2e}"
-E2E_PORT="${HAYBALE_E2E_PORT:-8466}"
-SCRATCH_DIR="${HAYBALE_E2E_SCRATCH:-.e2e-github}"
+# Both defaults below fold in this script's own PID so two concurrent
+# invocations don't race on the same scratch dir (whose rm -rf could
+# delete an in-flight sibling run's identities/token files) or the same
+# listen port (a same-port collision fails loudly; the scratch-dir one
+# fails confusingly, mid-run, in whichever run loses the race).
+E2E_PORT="${HAYBALE_E2E_PORT:-$((8400 + ($$ % 500)))}"
+SCRATCH_DIR="${HAYBALE_E2E_SCRATCH:-.e2e-github.$$}"
 CONTAINER_IMAGE="docker.io/alpine/git"
 
 if [[ -z "${HAYBALE_APP_KEY_PATH:-}" ]]; then
@@ -99,10 +111,11 @@ fi
 # ---- scratch dir + cleanup ---------------------------------------------
 #
 # Everything this script generates — the minted raw token, both YAML
-# configs, and haybale's own log for this run — lives under SCRATCH_DIR,
-# which is .gitignore'd (see .gitignore) and removed on every exit path
-# (success, failure, or interrupt) so nothing it contains ever has a
-# chance to end up committed.
+# configs, and haybale's own log for this run — lives under SCRATCH_DIR
+# (default includes this script's PID — see the header comment), which
+# is .gitignore'd (see .gitignore's `.e2e-github*/`) and removed on
+# every exit path (success, failure, or interrupt) so nothing it
+# contains ever has a chance to end up committed.
 
 rm -rf "$SCRATCH_DIR"
 mkdir -p "$SCRATCH_DIR"

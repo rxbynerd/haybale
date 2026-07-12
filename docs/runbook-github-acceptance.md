@@ -106,7 +106,8 @@ for the full list):
 | `HAYBALE_CONTAINER_RUNTIME`    | `podman`                    | `docker` or `podman`. |
 | `HAYBALE_APP_ID`               | `4278664` ("haybale dev")   | GitHub App ID. |
 | `HAYBALE_E2E_REPO`             | `rxbynerd/haybale-e2e`      | `owner/repo` on `github.com` to round-trip against. |
-| `HAYBALE_E2E_PORT`             | `8466`                      | Port haybale listens on for this run. |
+| `HAYBALE_E2E_PORT`             | derived from the script's own PID | Port haybale listens on for this run — randomized by default so two concurrent runs don't race on the same port; override to pin a specific one. |
+| `HAYBALE_E2E_SCRATCH`          | `.e2e-github.$PID`         | Scratch dir for this run's generated token/config/log — PID-suffixed by default so concurrent runs don't clobber each other's in-flight files; `.gitignore`'d by a stable `.e2e-github*/` prefix pattern. |
 
 ### What it does
 
@@ -114,8 +115,9 @@ for the full list):
    writes a scratch `identities.yaml`/`policy.yaml`/`haybale.yaml` — the
    policy grants that one identity `read`+`write` on exactly
    `HAYBALE_E2E_REPO`, nothing else. All three files (and the raw token)
-   live under `.e2e-github/` (`.gitignore`'d) and are deleted on every
-   exit path, success or failure.
+   live under a per-run scratch dir (default `.e2e-github.$PID`, PID
+   being this script's own — override via `HAYBALE_E2E_SCRATCH`),
+   `.gitignore`'d and deleted on every exit path, success or failure.
 2. Starts `haybale serve` on the host, in the background, and polls
    `/healthz` until it's up.
 3. Runs a single `podman run --rm` (or `docker run --rm`) container of
