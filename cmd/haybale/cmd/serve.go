@@ -1,12 +1,17 @@
 package cmd
 
 import (
+	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -25,7 +30,12 @@ import (
 // sends a request line.
 const readHeaderTimeout = 10 * time.Second
 
-var configPath string
+var (
+	configPath       string
+	tlsCertPathFlag  string
+	tlsKeyPathFlag   string
+	drainTimeoutFlag string
+)
 
 var serveCmd = &cobra.Command{
 	Use:   "serve",
@@ -38,11 +48,14 @@ var serveCmd = &cobra.Command{
 
 func init() {
 	serveCmd.Flags().StringVar(&configPath, "config", "haybale.yaml", "path to haybale's YAML config file")
+	serveCmd.Flags().StringVar(&tlsCertPathFlag, "tls-cert-path", "", "path to a PEM certificate; overrides tls.certPath in the config file")
+	serveCmd.Flags().StringVar(&tlsKeyPathFlag, "tls-key-path", "", "path to the PEM private key matching --tls-cert-path; overrides tls.keyPath in the config file")
+	serveCmd.Flags().StringVar(&drainTimeoutFlag, "drain-timeout", "", `bounds how long graceful shutdown waits for in-flight requests to finish, e.g. "2m" ("0s" for unbounded); overrides drainTimeout in the config file`)
 	rootCmd.AddCommand(serveCmd)
 }
 
 func runServe(cmd *cobra.Command, path string) error {
-	cfg, err := config.Load(path)
+	cfg, err := config.Load(path, config.WithTLSOverride(tlsCertPathFlag, tlsKeyPathFlag), config.WithDrainTimeoutOverride(drainTimeoutFlag))
 	if err != nil {
 		return err
 	}
@@ -92,21 +105,116 @@ func runServe(cmd *cobra.Command, path string) error {
 	if err != nil {
 		return fmt.Errorf("build proxy: %w", err)
 	}
-	srv := &http.Server{
+	srv, listenAndServe, scheme := newServer(cfg, p)
+
+	logger.Info("starting haybale", "listen", cfg.Listen, "scheme", scheme, "upstreams", len(upstreams), "drainTimeout", cfg.ParsedDrainTimeout())
+	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "haybale listening on %s://%s\n", scheme, cfg.Listen); err != nil {
+		return err
+	}
+
+	// signal.NotifyContext, not signal.Notify: ctx.Done() fires exactly
+	// once, on the first SIGTERM or SIGINT, which is all
+	// serveWithGracefulDrain needs — a second signal during an already
+	// -in-progress drain is not handled specially (it does not, for
+	// instance, force an immediate hard shutdown); an operator who needs
+	// that has srv.Close()/a process kill -9 available to them regardless
+	// of anything this handler does.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	return serveWithGracefulDrain(ctx, srv, p, cfg.ParsedDrainTimeout(), listenAndServe, logger)
+}
+
+// newServer builds the *http.Server cfg's Listen/TLS blocks describe,
+// alongside the listenAndServe function runServe should call to start it
+// and the scheme ("http" or "https") it's serving, for logging. When
+// cfg.TLS is disabled, listenAndServe is exactly srv.ListenAndServe and
+// srv.TLSConfig is left nil; when enabled, srv.TLSConfig carries the
+// certificate config.Validate() already loaded and parsed once (the same
+// fail-fast-at-startup, reuse-not-reparse pattern
+// upstream.CredentialSource/identity.Authenticator/policy.Engine already
+// establish — Certificates, not GetCertificate, since there is nothing
+// left for ListenAndServeTLS's own certFile/keyFile arguments to do), and
+// listenAndServe calls srv.ListenAndServeTLS("", "") to use it.
+// MinVersion is set explicitly (rather than left at Go's default, itself
+// already TLS 1.2) so that floor is visible here as a deliberate choice.
+//
+// Deliberately absent in both cases: ReadTimeout/WriteTimeout/
+// IdleTimeout — TLS must not introduce a bound on how long a
+// multi-gigabyte pack transfer is allowed to take; only
+// ReadHeaderTimeout bounds anything, for TLS exactly as for plain HTTP.
+//
+// Extracted from runServe so TLS wiring is testable without a real
+// listener — see TestNewServerTLSEnabled/TestNewServerPlainHTTP.
+func newServer(cfg *config.Config, handler http.Handler) (srv *http.Server, listenAndServe func() error, scheme string) {
+	srv = &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           p,
+		Handler:           handler,
 		ReadHeaderTimeout: readHeaderTimeout,
 	}
 
-	logger.Info("starting haybale", "listen", cfg.Listen, "upstreams", len(upstreams))
-	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "haybale listening on %s\n", cfg.Listen); err != nil {
-		return err
+	if !cfg.TLS.Enabled() {
+		return srv, srv.ListenAndServe, "http"
 	}
 
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		return err
+	srv.TLSConfig = &tls.Config{
+		Certificates: []tls.Certificate{*cfg.TLS.Certificate()},
+		MinVersion:   tls.VersionTLS12,
 	}
-	return nil
+	return srv, func() error { return srv.ListenAndServeTLS("", "") }, "https"
+}
+
+// serveWithGracefulDrain runs listenAndServe (srv.ListenAndServe or the
+// srv.ListenAndServeTLS closure runServe built, already bound to srv)
+// until either it returns on its own or ctx is done — a SIGTERM/SIGINT
+// runServe's signal.NotifyContext caught. On ctx.Done() it marks p as
+// draining (see proxy.Proxy.BeginDrain: /healthz starts returning 503,
+// telling a load balancer to stop routing new traffic here), then calls
+// srv.Shutdown to stop accepting new connections while letting in-flight
+// requests — a large git clone/push in particular — finish streaming to
+// completion rather than being cut off mid-transfer. drainTimeout bounds
+// how long Shutdown waits for that; <= 0 means wait indefinitely, for
+// however long the slowest in-flight transfer takes to finish on its
+// own.
+//
+// Extracted from runServe specifically so this logic is testable without
+// a real OS signal or a real TLS listener — see
+// TestServeWithGracefulDrainWaitsForInFlightRequest.
+func serveWithGracefulDrain(ctx context.Context, srv *http.Server, p *proxy.Proxy, drainTimeout time.Duration, listenAndServe func() error, logger *slog.Logger) error {
+	errCh := make(chan error, 1)
+	go func() { errCh <- listenAndServe() }()
+
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		logger.Info("shutdown signal received, draining in-flight requests before exiting")
+		p.BeginDrain()
+
+		shutdownCtx := context.Background()
+		if drainTimeout > 0 {
+			var cancel context.CancelFunc
+			shutdownCtx, cancel = context.WithTimeout(shutdownCtx, drainTimeout)
+			defer cancel()
+		}
+		shutdownErr := srv.Shutdown(shutdownCtx)
+		if shutdownErr != nil {
+			logger.Warn("graceful shutdown did not complete cleanly", "error", shutdownErr)
+		}
+
+		// Shutdown only signals listenAndServe to stop; it doesn't itself
+		// return listenAndServe's own error. Waiting for errCh here means
+		// this function (and so runServe, and so main()) doesn't report
+		// back to the caller while Serve is still unwinding in-flight
+		// connections in the background.
+		if serveErr := <-errCh; serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) && shutdownErr == nil {
+			return serveErr
+		}
+		return shutdownErr
+	}
 }
 
 // buildUpstreams converts config.Upstreams (already validated) into the
