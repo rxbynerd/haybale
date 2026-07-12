@@ -27,10 +27,12 @@ type namedPattern struct {
 //     URLs commonly carry a token this way
 //     (https://x-access-token:ghs_xxx@host/owner/repo.git), and neither
 //     the Basic nor Bearer pattern above matches that shape.
-//   - GitHub's own token prefixes (ghp_/ghs_) — what a real personal
-//     access token or GitHub App installation token (M4's
-//     GitHubAppSource) looks like, in case one is ever echoed into an
-//     error string from a dependency this package doesn't control.
+//   - GitHub's own token prefixes (ghp_/gho_/ghu_/ghs_/ghr_ and the
+//     github_pat_ fine-grained PAT shape) — what a real personal access
+//     token, OAuth token, user-to-server token, GitHub App installation
+//     token (ghs_, what M4's GitHubAppSource mints), or refresh token
+//     looks like, in case one is ever echoed into an error string from a
+//     dependency this package doesn't control.
 //   - a PEM private key block — M4's github-app credential type carries
 //     a privateKeyPath; if that key's contents were ever passed to a log
 //     call by mistake, this is the last line of defense.
@@ -48,8 +50,11 @@ var secretPatterns = []namedPattern{
 	{"url_userinfo", regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://[^\s/@]+@`)},
 	{"basic_auth_header", regexp.MustCompile(`(?i)Basic\s+[A-Za-z0-9+/]+=*`)},
 	{"bearer_token_header", regexp.MustCompile(`(?i)Bearer\s+[A-Za-z0-9._~+/=-]+`)},
-	{"github_pat", regexp.MustCompile(`ghp_[A-Za-z0-9]+`)},
-	{"github_app_token", regexp.MustCompile(`ghs_[A-Za-z0-9]+`)},
+	// Covers every current GitHub token-prefix shape (classic PAT ghp_,
+	// OAuth gho_, user-to-server ghu_, App installation ghs_, refresh
+	// ghr_) plus the github_pat_ fine-grained PAT shape, which doesn't
+	// share the ghX_ prefix pattern at all.
+	{"github_token", regexp.MustCompile(`\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]+\b|github_pat_[A-Za-z0-9_]+`)},
 	{"pem_private_key", regexp.MustCompile(`-----BEGIN[\s\w]+KEY-----`)},
 }
 

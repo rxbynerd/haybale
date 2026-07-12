@@ -42,6 +42,30 @@ func TestScrub(t *testing.T) {
 			wantGone: []string{"ghs_abcdEFGH1234567890"},
 			wantKept: []string{"minted", "for repo"},
 		},
+		{
+			name:     "github oauth token",
+			input:    `token gho_1234567890abcdefghijklmnopqrstuvwx leaked`,
+			wantGone: []string{"gho_1234567890abcdefghijklmnopqrstuvwx"},
+			wantKept: []string{"token", "leaked"},
+		},
+		{
+			name:     "github user-to-server token",
+			input:    `token ghu_1234567890abcdefghijklmnopqrstuvwx leaked`,
+			wantGone: []string{"ghu_1234567890abcdefghijklmnopqrstuvwx"},
+			wantKept: []string{"token", "leaked"},
+		},
+		{
+			name:     "github refresh token",
+			input:    `token ghr_1234567890abcdefghijklmnopqrstuvwx leaked`,
+			wantGone: []string{"ghr_1234567890abcdefghijklmnopqrstuvwx"},
+			wantKept: []string{"token", "leaked"},
+		},
+		{
+			name:     "github fine-grained personal access token",
+			input:    `token github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz0123456789 leaked`,
+			wantGone: []string{"github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz0123456789"},
+			wantKept: []string{"token", "leaked"},
+		},
 		{ //nolint:gosec // G101: fake test fixture exercising Scrub's pem_private_key pattern, not a real key
 			name:     "pem private key",
 			input:    "-----BEGIN RSA PRIVATE KEY-----\nMIIBogIBAAJ...\n-----END RSA PRIVATE KEY-----",
