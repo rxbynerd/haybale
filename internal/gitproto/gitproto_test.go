@@ -2,7 +2,9 @@ package gitproto
 
 import (
 	"errors"
+	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -56,9 +58,26 @@ func TestParseRequest(t *testing.T) {
 
 		// --- malformed paths ---
 		{
-			name:      "too few segments",
+			// This target splits into 4 segments (host, owner, "info",
+			// "refs"), so it is rejected by parseEndpoint's default:
+			// branch (endpoint = ["refs"] matches no valid shape) — not
+			// by the len(segments) < 4 guard a name of "too few
+			// segments" would suggest. Named for what it actually
+			// exercises so a regression in the < 4 guard isn't masked by
+			// a test whose name implies it would catch it.
+			name:      "unrecognized endpoint token, no service=",
 			method:    "GET",
 			target:    "/github.com/acme/info/refs?service=git-upload-pack",
+			wantErr:   true,
+			wantErrIs: ErrInvalidRequest,
+		},
+		{
+			// A genuine 3-segment path (host, owner, repo — no endpoint
+			// segment at all), which actually exercises the
+			// len(segments) < 4 guard in ParseRequest.
+			name:      "too few segments",
+			method:    "GET",
+			target:    "/github.com/acme/widgets.git",
 			wantErr:   true,
 			wantErrIs: ErrInvalidRequest,
 		},
@@ -216,6 +235,29 @@ func TestParseRequest(t *testing.T) {
 				t.Errorf("ParseRequest(%s %s) verb = %v, want %v", tt.method, tt.target, verb, tt.wantVerb)
 			}
 		})
+	}
+}
+
+// TestParseRequestEmptyHostSegment exercises the host == "" disjunct of
+// ParseRequest's empty-segment check, which the table above (via
+// httptest.NewRequest / url.Parse) cannot reach: a target string with a
+// literal "//" prefix is parsed by net/url as scheme-relative (the
+// segment after "//" becomes Host, not Path), so it never produces a
+// path with a leading empty segment. Constructing the *http.Request by
+// hand bypasses that and lands r.URL.Path exactly on the shape under
+// test.
+func TestParseRequestEmptyHostSegment(t *testing.T) {
+	req := &http.Request{
+		Method: http.MethodPost,
+		URL:    &url.URL{Path: "//acme/widgets.git/git-upload-pack"},
+	}
+
+	_, _, err := ParseRequest(req)
+	if err == nil {
+		t.Fatal("ParseRequest with empty host segment = nil error, want error")
+	}
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Errorf("ParseRequest error = %v, want errors.Is(_, ErrInvalidRequest)", err)
 	}
 }
 
