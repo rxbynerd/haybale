@@ -1,13 +1,13 @@
 // Package proxy implements haybale's streaming passthrough reverse
 // proxy for git smart-HTTP traffic.
 //
-// For M1 this is pure passthrough: every request that gitproto.ParseRequest
-// accepts is forwarded to the upstream configured for its host-in-path
-// segment, with request and response bodies streamed through unmodified.
-// Pack data can run to gigabytes, so nothing here may buffer or parse a
-// body — only httputil.ReverseProxy's plumbing touches it. Identity,
-// policy, and credential injection land in M2/M3 as additional stages
-// around this same Rewrite hook.
+// Every request that gitproto.ParseRequest accepts and that resolves to
+// a configured upstream is authenticated (internal/identity) and
+// authorized (internal/policy) before it is forwarded; only then is it
+// streamed through to the upstream unmodified. Pack data can run to
+// gigabytes, so nothing here may buffer or parse a body — only
+// httputil.ReverseProxy's plumbing touches it. Credential injection
+// lands in M3 as an additional stage around this same Rewrite hook.
 package proxy
 
 import (
@@ -19,17 +19,28 @@ import (
 	"strings"
 
 	"github.com/rxbynerd/haybale/internal/gitproto"
+	"github.com/rxbynerd/haybale/internal/identity"
+	"github.com/rxbynerd/haybale/internal/policy"
+	"github.com/rxbynerd/haybale/internal/security"
 )
 
-// Proxy is an http.Handler that validates inbound smart-HTTP requests
-// and streams them through to the configured upstream.
+// wwwAuthenticateChallenge is the WWW-Authenticate header value sent
+// alongside a 401: it names the Basic scheme so a git client re-prompts
+// for (or retries with) credentials rather than giving up outright.
+const wwwAuthenticateChallenge = `Basic realm="haybale"`
+
+// Proxy is an http.Handler that validates inbound smart-HTTP requests,
+// authenticates and authorizes the caller, and streams the request
+// through to the configured upstream.
 type Proxy struct {
 	// upstreams maps a host-in-path key (e.g. "github.com") to that
 	// upstream's base URL. Treated as immutable after New returns — safe
 	// for concurrent reads without a lock since nothing ever mutates it.
-	upstreams map[string]*url.URL
-	rp        *httputil.ReverseProxy
-	logger    *slog.Logger
+	upstreams     map[string]*url.URL
+	rp            *httputil.ReverseProxy
+	logger        *slog.Logger
+	authenticator identity.Authenticator
+	policyEngine  policy.Engine
 }
 
 // routeKey is the context key ServeHTTP uses to hand the resolved
@@ -40,13 +51,16 @@ type routeKey struct{}
 // maps that key to the upstream's base URL. This map is the injectable
 // seam a caller (production config, or the e2e harness) uses to point a
 // host key at an arbitrary base URL, such as an httptest server.
+// authenticator and policyEngine gate every non-healthz request: a
+// request that fails Authenticate gets a 401, and one that Authorize
+// denies gets a 404 indistinguishable from an unknown or malformed one.
 //
 // A nil logger falls back to slog.Default().
-func New(upstreams map[string]*url.URL, logger *slog.Logger) *Proxy {
+func New(upstreams map[string]*url.URL, authenticator identity.Authenticator, policyEngine policy.Engine, logger *slog.Logger) *Proxy {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	p := &Proxy{upstreams: upstreams, logger: logger}
+	p := &Proxy{upstreams: upstreams, authenticator: authenticator, policyEngine: policyEngine, logger: logger}
 	p.rp = &httputil.ReverseProxy{
 		Rewrite: p.rewrite,
 		// -1 disables periodic batching and flushes on every write
@@ -101,6 +115,41 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	id, err := p.authenticator.Authenticate(r.Context(), r)
+	if err != nil {
+		// The credential itself is never logged — only that
+		// authentication failed and for which repo/verb it was
+		// attempted, which is the audit-relevant context.
+		security.Log(p.logger, security.EventAuthnFailed,
+			"host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "verb", verb.String())
+		w.Header().Set("WWW-Authenticate", wwwAuthenticateChallenge)
+		http.Error(w, "401 Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	decision := p.policyEngine.Authorize(*id, repo, verb)
+	if !decision.Allowed {
+		// matchedRule is "none" when no rule's identity/repo patterns
+		// matched at all (default deny), or the matched rule's own
+		// String() when a rule matched but didn't grant this verb —
+		// distinguishing the two for audit purposes without ever
+		// logging anything from the request itself beyond repo/verb.
+		matchedRule := "none"
+		if decision.Rule != nil {
+			matchedRule = decision.Rule.String()
+		}
+		// Policy-denied and unknown/malformed requests must be
+		// byte-identical to the client: no existence oracle. This is
+		// exactly the same http.NotFound(w, r) call the two branches
+		// above use, with nothing written to w beforehand — do not add
+		// a header or a body here.
+		security.Log(p.logger, security.EventPolicyDenied,
+			"identity", id.ID, "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "verb", verb.String(),
+			"reason", decision.Reason, "matchedRule", matchedRule)
+		http.NotFound(w, r)
+		return
+	}
+
 	ctx := context.WithValue(r.Context(), routeKey{}, base)
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	p.rp.ServeHTTP(rec, r.WithContext(ctx))
@@ -112,7 +161,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Debug so a default-configured deployment (LogLevel: "info") gets
 	// baseline per-request observability instead of logging nothing.
 	p.logger.Info("proxied request",
-		"host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "verb", verb.String(), "status", rec.status)
+		"identity", id.ID, "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "verb", verb.String(), "status", rec.status)
 }
 
 // statusRecorder wraps an http.ResponseWriter to capture the status code

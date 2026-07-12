@@ -57,7 +57,10 @@ func runServe(cmd *cobra.Command, path string) error {
 		return fmt.Errorf("build upstreams: %w", err)
 	}
 
-	p := proxy.New(upstreams, logger)
+	// Load already ran Validate(), which populates these from the
+	// identity/policy blocks — nil here would indicate a caller bug
+	// (Validate() didn't run), not a runtime condition.
+	p := proxy.New(upstreams, cfg.Identity.Authenticator(), cfg.Policy.Engine(), logger)
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           p,

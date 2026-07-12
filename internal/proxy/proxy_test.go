@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"log/slog"
 	"net/http"
@@ -11,6 +12,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/rxbynerd/haybale/internal/gitproto"
+	"github.com/rxbynerd/haybale/internal/identity"
+	"github.com/rxbynerd/haybale/internal/policy"
 )
 
 // newUpstreamMap parses raw upstream URLs into the map New expects,
@@ -33,8 +38,51 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// testIdentityID is the Identity every allowAllAuthenticator call
+// returns, so tests that don't care about identity/policy semantics
+// (most of the tests in this file, which predate M2 and exercise the
+// passthrough path) can assert on a stable, known identity where
+// relevant.
+const testIdentityID = "test-identity"
+
+// allowAllAuthenticator authenticates any request as testIdentityID
+// regardless of what credential (if any) is presented. Tests that only
+// care about routing/streaming behaviour use this rather than standing
+// up a real identity.StaticTokenAuthenticator fixture.
+type allowAllAuthenticator struct{}
+
+func (allowAllAuthenticator) Authenticate(context.Context, *http.Request) (*identity.Identity, error) {
+	return &identity.Identity{ID: testIdentityID}, nil
+}
+
+// denyAllAuthenticator fails every Authenticate call, for exercising the
+// 401 path.
+type denyAllAuthenticator struct{}
+
+func (denyAllAuthenticator) Authenticate(context.Context, *http.Request) (*identity.Identity, error) {
+	return nil, identity.ErrAuthenticationFailed
+}
+
+// allowAllPolicy grants every request, regardless of identity, repo, or
+// verb.
+type allowAllPolicy struct{}
+
+func (allowAllPolicy) Authorize(identity.Identity, gitproto.Repo, gitproto.Verb) policy.Decision {
+	return policy.Decision{Allowed: true, Reason: "test: allow all"}
+}
+
+// denyAllPolicy denies every request, for exercising the policy-denied
+// 404 path. matchedRule is nil, mirroring a true default-deny (no
+// matching rule) rather than "a rule matched but didn't grant this
+// verb".
+type denyAllPolicy struct{}
+
+func (denyAllPolicy) Authorize(identity.Identity, gitproto.Repo, gitproto.Verb) policy.Decision {
+	return policy.Decision{Allowed: false, Rule: nil, Reason: "test: deny all"}
+}
+
 func TestHealthz(t *testing.T) {
-	p := New(newUpstreamMap(t, nil), discardLogger())
+	p := New(newUpstreamMap(t, nil), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -49,7 +97,7 @@ func TestHealthz(t *testing.T) {
 }
 
 func TestInvalidRequestMaps404(t *testing.T) {
-	p := New(newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), discardLogger())
+	p := New(newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -100,7 +148,7 @@ func TestUpstreamUnreachableMaps502(t *testing.T) {
 	}
 	deadSrv.Close()
 
-	p := New(map[string]*url.URL{"testhost": deadURL}, discardLogger())
+	p := New(map[string]*url.URL{"testhost": deadURL}, allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -115,7 +163,7 @@ func TestUpstreamUnreachableMaps502(t *testing.T) {
 }
 
 func TestUnknownHostMaps404(t *testing.T) {
-	p := New(newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), discardLogger())
+	p := New(newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -171,7 +219,7 @@ func TestForwardsToUpstreamStrippingHostSegment(t *testing.T) {
 	upstreamSrv := httptest.NewServer(up.handler())
 	defer upstreamSrv.Close()
 
-	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), discardLogger())
+	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -243,7 +291,7 @@ func TestClientXForwardedHeadersAreSuppressed(t *testing.T) {
 	upstreamSrv := httptest.NewServer(up.handler())
 	defer upstreamSrv.Close()
 
-	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), discardLogger())
+	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -278,7 +326,7 @@ func TestForwardsQueryStringAndInfoRefs(t *testing.T) {
 	upstreamSrv := httptest.NewServer(up.handler())
 	defer upstreamSrv.Close()
 
-	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), discardLogger())
+	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -308,7 +356,7 @@ func TestForwardsContentEncoding(t *testing.T) {
 	upstreamSrv := httptest.NewServer(up.handler())
 	defer upstreamSrv.Close()
 
-	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), discardLogger())
+	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -336,7 +384,7 @@ func TestStreamsLargeBodyUnmodified(t *testing.T) {
 	upstreamSrv := httptest.NewServer(up.handler())
 	defer upstreamSrv.Close()
 
-	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), discardLogger())
+	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -379,7 +427,7 @@ func logLines(buf *bytes.Buffer) []string {
 func TestRejectedRequestIsLogged(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
-	p := New(newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), logger)
+	p := New(newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), allowAllAuthenticator{}, allowAllPolicy{}, logger)
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -407,7 +455,7 @@ func TestRejectedRequestIsLogged(t *testing.T) {
 func TestUnknownHostIsLogged(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
-	p := New(newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), logger)
+	p := New(newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), allowAllAuthenticator{}, allowAllPolicy{}, logger)
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -437,7 +485,7 @@ func TestProxiedRequestLogsRepoVerbStatus(t *testing.T) {
 
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
-	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), logger)
+	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, logger)
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -458,6 +506,7 @@ func TestProxiedRequestLogsRepoVerbStatus(t *testing.T) {
 	line := lines[0]
 	for _, want := range []string{
 		`"level":"INFO"`,
+		`"identity":"` + testIdentityID + `"`,
 		`"host":"testhost"`,
 		`"owner":"acme"`,
 		`"repo":"widgets"`,
@@ -467,5 +516,227 @@ func TestProxiedRequestLogsRepoVerbStatus(t *testing.T) {
 		if !strings.Contains(line, want) {
 			t.Errorf("log record = %q, want it to contain %q", line, want)
 		}
+	}
+}
+
+// TestAuthenticationFailureMaps401 exercises the M2 authn gate: a
+// request whose Authenticate call fails must get a 401 with a
+// WWW-Authenticate challenge, so a git client knows to (re)prompt for
+// credentials rather than treating the response as a generic error.
+func TestAuthenticationFailureMaps401(t *testing.T) {
+	p := New(newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"}), denyAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+	if got := resp.Header.Get("WWW-Authenticate"); got != wwwAuthenticateChallenge {
+		t.Errorf("WWW-Authenticate = %q, want %q", got, wwwAuthenticateChallenge)
+	}
+}
+
+func TestAuthenticationFailureIsLogged(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	p := New(newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"}), denyAllAuthenticator{}, allowAllPolicy{}, logger)
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/testhost/acme/widgets.git/info/refs?service=git-upload-pack", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.SetBasicAuth("someuser", "super-secret-token-value")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	lines := logLines(&buf)
+	if len(lines) != 1 {
+		t.Fatalf("got %d log records, want exactly 1: %q", len(lines), buf.String())
+	}
+	line := lines[0]
+	for _, want := range []string{
+		`"level":"WARN"`,
+		`"event":"authn_failed"`,
+		`"host":"testhost"`,
+		`"owner":"acme"`,
+		`"repo":"widgets"`,
+		`"verb":"read"`,
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("log record = %q, want it to contain %q", line, want)
+		}
+	}
+	if strings.Contains(line, "super-secret-token-value") {
+		t.Errorf("log record = %q, must never contain the presented credential", line)
+	}
+}
+
+// TestPolicyDenialMaps404 exercises the M2 authz gate: an authenticated
+// request Authorize denies must get a 404 — never a 403, which would let
+// a caller distinguish "exists but denied" from "does not exist".
+func TestPolicyDenialMaps404(t *testing.T) {
+	p := New(newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"}), allowAllAuthenticator{}, denyAllPolicy{}, discardLogger())
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestPolicyDenialIsLogged(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	p := New(newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"}), allowAllAuthenticator{}, denyAllPolicy{}, logger)
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	lines := logLines(&buf)
+	if len(lines) != 1 {
+		t.Fatalf("got %d log records, want exactly 1: %q", len(lines), buf.String())
+	}
+	line := lines[0]
+	for _, want := range []string{
+		`"level":"WARN"`,
+		`"event":"policy_denied"`,
+		`"identity":"` + testIdentityID + `"`,
+		`"host":"testhost"`,
+		`"owner":"acme"`,
+		`"repo":"widgets"`,
+		`"verb":"read"`,
+		`"matchedRule":"none"`,
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("log record = %q, want it to contain %q", line, want)
+		}
+	}
+}
+
+// TestPolicyDenialResponseMatchesUnknownHost404 pins the core M2
+// security invariant: a policy-denied request must produce a response
+// byte-identical (status, body, and the headers http.NotFound sets) to
+// an unknown-host 404. Both branches call the exact same http.NotFound
+// helper with nothing written to the ResponseWriter beforehand, so a
+// caller holding a valid credential cannot distinguish "this repo exists
+// but I'm denied" from "haybale doesn't even recognise this host" — no
+// existence oracle.
+func TestPolicyDenialResponseMatchesUnknownHost404(t *testing.T) {
+	upstreams := newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"})
+
+	denyingProxy := New(upstreams, allowAllAuthenticator{}, denyAllPolicy{}, discardLogger())
+	denySrv := httptest.NewServer(denyingProxy)
+	defer denySrv.Close()
+
+	unknownHostProxy := New(upstreams, allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+	unknownSrv := httptest.NewServer(unknownHostProxy)
+	defer unknownSrv.Close()
+
+	denyResp, err := http.Get(denySrv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
+	if err != nil {
+		t.Fatalf("GET (policy-denied): %v", err)
+	}
+	defer func() { _ = denyResp.Body.Close() }()
+	denyBody, err := io.ReadAll(denyResp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll (policy-denied): %v", err)
+	}
+
+	unknownResp, err := http.Get(unknownSrv.URL + "/some-other-host/acme/widgets.git/info/refs?service=git-upload-pack")
+	if err != nil {
+		t.Fatalf("GET (unknown host): %v", err)
+	}
+	defer func() { _ = unknownResp.Body.Close() }()
+	unknownBody, err := io.ReadAll(unknownResp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll (unknown host): %v", err)
+	}
+
+	if denyResp.StatusCode != unknownResp.StatusCode {
+		t.Errorf("status: policy-denied = %d, unknown-host = %d, want equal", denyResp.StatusCode, unknownResp.StatusCode)
+	}
+	if !bytes.Equal(denyBody, unknownBody) {
+		t.Errorf("body: policy-denied = %q, unknown-host = %q, want byte-identical", denyBody, unknownBody)
+	}
+	for _, h := range []string{"Content-Type", "X-Content-Type-Options"} {
+		if got, want := denyResp.Header.Get(h), unknownResp.Header.Get(h); got != want {
+			t.Errorf("header %s: policy-denied = %q, unknown-host = %q, want equal", h, got, want)
+		}
+	}
+}
+
+func TestAuthenticationFailureNeverReachesUpstream(t *testing.T) {
+	up := &recordingUpstream{}
+	upstreamSrv := httptest.NewServer(up.handler())
+	defer upstreamSrv.Close()
+
+	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), denyAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+	method, _, _, _, _ := up.snapshot()
+	if method != "" {
+		t.Errorf("upstream saw a request (method %q) for an authentication failure, want none", method)
+	}
+}
+
+func TestPolicyDenialNeverReachesUpstream(t *testing.T) {
+	up := &recordingUpstream{}
+	upstreamSrv := httptest.NewServer(up.handler())
+	defer upstreamSrv.Close()
+
+	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, denyAllPolicy{}, discardLogger())
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+	method, _, _, _, _ := up.snapshot()
+	if method != "" {
+		t.Errorf("upstream saw a request (method %q) for a policy denial, want none", method)
 	}
 }
