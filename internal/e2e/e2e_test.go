@@ -17,7 +17,6 @@ import (
 	"testing"
 
 	"github.com/rxbynerd/haybale/internal/policy"
-	"github.com/rxbynerd/haybale/internal/proxy"
 )
 
 // hostKey is the host-in-path segment the test client uses to reach the
@@ -58,7 +57,7 @@ func TestCloneThroughProxy(t *testing.T) {
 		{Identities: []string{testID}, Repos: []string{repoKey(hostKey, owner, repoName)}, Permissions: []policy.Permission{policy.PermissionRead, policy.PermissionWrite}},
 	})
 
-	haybale := proxy.New(map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
+	haybale := mustNewProxy(t, map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
 	haybaleSrv := httptest.NewServer(haybale)
 	t.Cleanup(haybaleSrv.Close)
 
@@ -117,7 +116,7 @@ func TestPushThroughProxy(t *testing.T) {
 		{Identities: []string{testID}, Repos: []string{repoKey(hostKey, owner, repoName)}, Permissions: []policy.Permission{policy.PermissionRead, policy.PermissionWrite}},
 	})
 
-	haybale := proxy.New(map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
+	haybale := mustNewProxy(t, map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
 	haybaleSrv := httptest.NewServer(haybale)
 	t.Cleanup(haybaleSrv.Close)
 

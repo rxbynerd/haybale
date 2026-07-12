@@ -59,8 +59,14 @@ func runServe(cmd *cobra.Command, path string) error {
 
 	// Load already ran Validate(), which populates these from the
 	// identity/policy blocks — nil here would indicate a caller bug
-	// (Validate() didn't run), not a runtime condition.
-	p := proxy.New(upstreams, cfg.Identity.Authenticator(), cfg.Policy.Engine(), logger)
+	// (Validate() didn't run), not a runtime condition. proxy.New itself
+	// rejects a nil authenticator/policyEngine at construction, so that
+	// caller bug now surfaces here as an error rather than a panic on
+	// the first request.
+	p, err := proxy.New(upstreams, cfg.Identity.Authenticator(), cfg.Policy.Engine(), logger)
+	if err != nil {
+		return fmt.Errorf("build proxy: %w", err)
+	}
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           p,

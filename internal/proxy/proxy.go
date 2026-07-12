@@ -12,6 +12,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
@@ -54,9 +55,22 @@ type routeKey struct{}
 // authenticator and policyEngine gate every non-healthz request: a
 // request that fails Authenticate gets a 401, and one that Authorize
 // denies gets a 404 indistinguishable from an unknown or malformed one.
+// A nil authenticator or policyEngine is rejected here, at construction
+// time, rather than left to panic on the first non-/healthz request —
+// every production call path already has both by the time it reaches
+// New (config.Validate() populates them before serve.go calls New), so
+// a nil value here indicates a caller bug this constructor should catch
+// immediately, matching the fail-fast-at-startup philosophy
+// internal/config already uses.
 //
 // A nil logger falls back to slog.Default().
-func New(upstreams map[string]*url.URL, authenticator identity.Authenticator, policyEngine policy.Engine, logger *slog.Logger) *Proxy {
+func New(upstreams map[string]*url.URL, authenticator identity.Authenticator, policyEngine policy.Engine, logger *slog.Logger) (*Proxy, error) {
+	if authenticator == nil {
+		return nil, fmt.Errorf("proxy: authenticator is required")
+	}
+	if policyEngine == nil {
+		return nil, fmt.Errorf("proxy: policyEngine is required")
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -83,7 +97,7 @@ func New(upstreams map[string]*url.URL, authenticator identity.Authenticator, po
 		},
 		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
-	return p
+	return p, nil
 }
 
 // ServeHTTP implements http.Handler.

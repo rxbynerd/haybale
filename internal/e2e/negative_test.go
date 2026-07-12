@@ -17,7 +17,6 @@ import (
 	"testing"
 
 	"github.com/rxbynerd/haybale/internal/policy"
-	"github.com/rxbynerd/haybale/internal/proxy"
 )
 
 // TestBadOrAbsentTokenMapsTo401 clones with either a wrong token or no
@@ -43,7 +42,7 @@ func TestBadOrAbsentTokenMapsTo401(t *testing.T) {
 		{Identities: []string{testID}, Repos: []string{repoKey(hostKey, owner, repoName)}, Permissions: []policy.Permission{policy.PermissionRead, policy.PermissionWrite}},
 	})
 
-	haybale := proxy.New(map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
+	haybale := mustNewProxy(t, map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
 	haybaleSrv := httptest.NewServer(haybale)
 	t.Cleanup(haybaleSrv.Close)
 
@@ -115,7 +114,7 @@ func TestPolicyDeniedRepoCloneFailsWith404(t *testing.T) {
 		{Identities: []string{testID}, Repos: []string{repoKey(hostKey, owner, "some-other-repo")}, Permissions: []policy.Permission{policy.PermissionRead, policy.PermissionWrite}},
 	})
 
-	haybale := proxy.New(map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
+	haybale := mustNewProxy(t, map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
 	haybaleSrv := httptest.NewServer(haybale)
 	t.Cleanup(haybaleSrv.Close)
 
@@ -166,7 +165,7 @@ func TestPolicyDeniedRepoResponseMatchesNonexistentRepo404(t *testing.T) {
 		{Identities: []string{testID}, Repos: []string{repoKey(hostKey, owner, "some-allowed-repo")}, Permissions: []policy.Permission{policy.PermissionRead, policy.PermissionWrite}},
 	})
 
-	haybale := proxy.New(map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
+	haybale := mustNewProxy(t, map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
 	haybaleSrv := httptest.NewServer(haybale)
 	t.Cleanup(haybaleSrv.Close)
 
@@ -239,7 +238,7 @@ func TestReadOnlyIdentityCanCloneButNotPush(t *testing.T) {
 		{Identities: []string{testID}, Repos: []string{repoKey(hostKey, owner, repoName)}, Permissions: []policy.Permission{policy.PermissionRead}},
 	})
 
-	haybale := proxy.New(map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
+	haybale := mustNewProxy(t, map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
 	haybaleSrv := httptest.NewServer(haybale)
 	t.Cleanup(haybaleSrv.Close)
 

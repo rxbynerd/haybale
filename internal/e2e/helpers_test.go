@@ -8,6 +8,7 @@ import (
 
 	"github.com/rxbynerd/haybale/internal/identity"
 	"github.com/rxbynerd/haybale/internal/policy"
+	"github.com/rxbynerd/haybale/internal/proxy"
 )
 
 // discardLogger is the *slog.Logger every test in this package hands to
@@ -56,6 +57,19 @@ func newPolicy(t *testing.T, rules []policy.Rule) policy.Engine {
 // join in three different test files.
 func repoKey(host, owner, name string) string {
 	return host + "/" + owner + "/" + name
+}
+
+// mustNewProxy builds a *proxy.Proxy via proxy.New, failing the test
+// immediately if construction returns an error — mirrors the
+// fail-fast-on-a-test-bug style mintTestToken/newPolicy already use for
+// this harness's other constructors.
+func mustNewProxy(t *testing.T, upstreams map[string]*url.URL, authenticator identity.Authenticator, policyEngine policy.Engine, logger *slog.Logger) *proxy.Proxy {
+	t.Helper()
+	p, err := proxy.New(upstreams, authenticator, policyEngine, logger)
+	if err != nil {
+		t.Fatalf("proxy.New() error = %v", err)
+	}
+	return p
 }
 
 // withToken returns rawURL with token embedded as the Basic-auth

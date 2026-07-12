@@ -38,6 +38,21 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// mustNew builds a Proxy via New, failing the test immediately if
+// construction returns an error. Every test in this file (other than
+// TestNewRejectsNilAuthenticator/TestNewRejectsNilPolicyEngine, which
+// exercise that error path directly) passes well-formed dependencies, so
+// an error here would indicate a test bug rather than the behaviour
+// under test.
+func mustNew(t *testing.T, upstreams map[string]*url.URL, authenticator identity.Authenticator, policyEngine policy.Engine, logger *slog.Logger) *Proxy {
+	t.Helper()
+	p, err := New(upstreams, authenticator, policyEngine, logger)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	return p
+}
+
 // testIdentityID is the Identity every allowAllAuthenticator call
 // returns, so tests that don't care about identity/policy semantics
 // (most of the tests in this file, which predate M2 and exercise the
@@ -82,7 +97,7 @@ func (denyAllPolicy) Authorize(identity.Identity, gitproto.Repo, gitproto.Verb) 
 }
 
 func TestHealthz(t *testing.T) {
-	p := New(newUpstreamMap(t, nil), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+	p := mustNew(t, newUpstreamMap(t, nil), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -97,7 +112,7 @@ func TestHealthz(t *testing.T) {
 }
 
 func TestInvalidRequestMaps404(t *testing.T) {
-	p := New(newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+	p := mustNew(t, newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -148,7 +163,7 @@ func TestUpstreamUnreachableMaps502(t *testing.T) {
 	}
 	deadSrv.Close()
 
-	p := New(map[string]*url.URL{"testhost": deadURL}, allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+	p := mustNew(t, map[string]*url.URL{"testhost": deadURL}, allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -163,7 +178,7 @@ func TestUpstreamUnreachableMaps502(t *testing.T) {
 }
 
 func TestUnknownHostMaps404(t *testing.T) {
-	p := New(newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+	p := mustNew(t, newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -219,7 +234,7 @@ func TestForwardsToUpstreamStrippingHostSegment(t *testing.T) {
 	upstreamSrv := httptest.NewServer(up.handler())
 	defer upstreamSrv.Close()
 
-	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -291,7 +306,7 @@ func TestClientXForwardedHeadersAreSuppressed(t *testing.T) {
 	upstreamSrv := httptest.NewServer(up.handler())
 	defer upstreamSrv.Close()
 
-	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -357,7 +372,7 @@ func TestInboundAuthorizationHeaderIsStripped(t *testing.T) {
 			upstreamSrv := httptest.NewServer(up.handler())
 			defer upstreamSrv.Close()
 
-			p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+			p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 			srv := httptest.NewServer(p)
 			defer srv.Close()
 
@@ -390,7 +405,7 @@ func TestForwardsQueryStringAndInfoRefs(t *testing.T) {
 	upstreamSrv := httptest.NewServer(up.handler())
 	defer upstreamSrv.Close()
 
-	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -420,7 +435,7 @@ func TestForwardsContentEncoding(t *testing.T) {
 	upstreamSrv := httptest.NewServer(up.handler())
 	defer upstreamSrv.Close()
 
-	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -448,7 +463,7 @@ func TestStreamsLargeBodyUnmodified(t *testing.T) {
 	upstreamSrv := httptest.NewServer(up.handler())
 	defer upstreamSrv.Close()
 
-	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -491,7 +506,7 @@ func logLines(buf *bytes.Buffer) []string {
 func TestRejectedRequestIsLogged(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
-	p := New(newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), allowAllAuthenticator{}, allowAllPolicy{}, logger)
+	p := mustNew(t, newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), allowAllAuthenticator{}, allowAllPolicy{}, logger)
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -519,7 +534,7 @@ func TestRejectedRequestIsLogged(t *testing.T) {
 func TestUnknownHostIsLogged(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
-	p := New(newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), allowAllAuthenticator{}, allowAllPolicy{}, logger)
+	p := mustNew(t, newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), allowAllAuthenticator{}, allowAllPolicy{}, logger)
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -549,7 +564,7 @@ func TestProxiedRequestLogsRepoVerbStatus(t *testing.T) {
 
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
-	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, logger)
+	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, logger)
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -588,7 +603,7 @@ func TestProxiedRequestLogsRepoVerbStatus(t *testing.T) {
 // WWW-Authenticate challenge, so a git client knows to (re)prompt for
 // credentials rather than treating the response as a generic error.
 func TestAuthenticationFailureMaps401(t *testing.T) {
-	p := New(newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"}), denyAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"}), denyAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -610,7 +625,7 @@ func TestAuthenticationFailureMaps401(t *testing.T) {
 func TestAuthenticationFailureIsLogged(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
-	p := New(newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"}), denyAllAuthenticator{}, allowAllPolicy{}, logger)
+	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"}), denyAllAuthenticator{}, allowAllPolicy{}, logger)
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -652,7 +667,7 @@ func TestAuthenticationFailureIsLogged(t *testing.T) {
 // request Authorize denies must get a 404 — never a 403, which would let
 // a caller distinguish "exists but denied" from "does not exist".
 func TestPolicyDenialMaps404(t *testing.T) {
-	p := New(newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"}), allowAllAuthenticator{}, denyAllPolicy{}, discardLogger())
+	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"}), allowAllAuthenticator{}, denyAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -671,7 +686,7 @@ func TestPolicyDenialMaps404(t *testing.T) {
 func TestPolicyDenialIsLogged(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
-	p := New(newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"}), allowAllAuthenticator{}, denyAllPolicy{}, logger)
+	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"}), allowAllAuthenticator{}, denyAllPolicy{}, logger)
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -714,11 +729,11 @@ func TestPolicyDenialIsLogged(t *testing.T) {
 func TestPolicyDenialResponseMatchesUnknownHost404(t *testing.T) {
 	upstreams := newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"})
 
-	denyingProxy := New(upstreams, allowAllAuthenticator{}, denyAllPolicy{}, discardLogger())
+	denyingProxy := mustNew(t, upstreams, allowAllAuthenticator{}, denyAllPolicy{}, discardLogger())
 	denySrv := httptest.NewServer(denyingProxy)
 	defer denySrv.Close()
 
-	unknownHostProxy := New(upstreams, allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+	unknownHostProxy := mustNew(t, upstreams, allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	unknownSrv := httptest.NewServer(unknownHostProxy)
 	defer unknownSrv.Close()
 
@@ -760,7 +775,7 @@ func TestAuthenticationFailureNeverReachesUpstream(t *testing.T) {
 	upstreamSrv := httptest.NewServer(up.handler())
 	defer upstreamSrv.Close()
 
-	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), denyAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), denyAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -785,7 +800,7 @@ func TestPolicyDenialNeverReachesUpstream(t *testing.T) {
 	upstreamSrv := httptest.NewServer(up.handler())
 	defer upstreamSrv.Close()
 
-	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, denyAllPolicy{}, discardLogger())
+	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, denyAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
@@ -802,5 +817,38 @@ func TestPolicyDenialNeverReachesUpstream(t *testing.T) {
 	method, _, _, _, _ := up.snapshot()
 	if method != "" {
 		t.Errorf("upstream saw a request (method %q) for a policy denial, want none", method)
+	}
+}
+
+// TestNewRejectsNilAuthenticator exercises H-2: New must fail at
+// construction time when handed a nil Authenticator, rather than
+// succeeding and panicking on the first non-/healthz request that
+// reaches it.
+func TestNewRejectsNilAuthenticator(t *testing.T) {
+	p, err := New(newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"}), nil, allowAllPolicy{}, discardLogger())
+	if err == nil {
+		t.Fatal("New() = nil error, want an error for a nil authenticator")
+	}
+	if p != nil {
+		t.Errorf("New() = %v, want nil Proxy alongside the error", p)
+	}
+	if !strings.Contains(err.Error(), "authenticator") {
+		t.Errorf("New() error = %q, want it to mention the missing authenticator", err.Error())
+	}
+}
+
+// TestNewRejectsNilPolicyEngine mirrors TestNewRejectsNilAuthenticator
+// for the other required dependency New's H-2 fix guards: a nil
+// policy.Engine must also fail at construction time.
+func TestNewRejectsNilPolicyEngine(t *testing.T) {
+	p, err := New(newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"}), allowAllAuthenticator{}, nil, discardLogger())
+	if err == nil {
+		t.Fatal("New() = nil error, want an error for a nil policyEngine")
+	}
+	if p != nil {
+		t.Errorf("New() = %v, want nil Proxy alongside the error", p)
+	}
+	if !strings.Contains(err.Error(), "policyEngine") {
+		t.Errorf("New() error = %q, want it to mention the missing policyEngine", err.Error())
 	}
 }
