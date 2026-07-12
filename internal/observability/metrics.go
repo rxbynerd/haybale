@@ -113,6 +113,23 @@ func NewNoopMetrics() *Metrics {
 	return m
 }
 
+// NewTestMetrics builds a Metrics backed by an in-memory ManualReader,
+// returning both so a test in any package can drive the record methods and
+// then Collect and assert the emitted data points without standing up an
+// OTLP collector. Mirrors Stirrup's NewOTelTraceEmitterForTest. Not for
+// production use — production builds go through Setup.
+func NewTestMetrics() (*Metrics, *sdkmetric.ManualReader) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	m, err := newMetricsFromMeter(provider.Meter(ScopeName), provider)
+	if err != nil {
+		// Instrument construction cannot fail for a valid meter (see
+		// newMetricsFromMeter); a non-nil error here is a bug in this file.
+		panic(fmt.Sprintf("observability: test metrics construction failed: %v", err))
+	}
+	return m, reader
+}
+
 // NewMetrics builds a Metrics backed by an OTLP metric exporter dialled per
 // cfg, sharing res with the trace and log pipelines so a backend can
 // correlate all three signals. Called only from Setup, with an
