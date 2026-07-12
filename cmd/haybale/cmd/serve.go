@@ -65,7 +65,9 @@ func runServe(cmd *cobra.Command, path string) error {
 	}
 
 	logger.Info("starting haybale", "listen", cfg.Listen, "upstreams", len(upstreams))
-	fmt.Fprintf(cmd.OutOrStdout(), "haybale listening on %s\n", cfg.Listen)
+	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "haybale listening on %s\n", cfg.Listen); err != nil {
+		return err
+	}
 
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err

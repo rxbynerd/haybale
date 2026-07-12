@@ -16,7 +16,10 @@ var versionCmd = &cobra.Command{
 	Short: "Print the haybale version",
 	Args:  cobra.NoArgs,
 	Run: func(cmd *cobra.Command, _ []string) {
-		fmt.Fprintln(cmd.OutOrStdout(), version)
+		// Best-effort: a write failure to the command's configured output
+		// stream isn't actionable from a version print, and Run (not
+		// RunE) can't propagate an error here anyway.
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), version)
 	},
 }
 

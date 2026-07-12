@@ -41,7 +41,7 @@ func TestHealthz(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET /healthz: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("GET /healthz status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
@@ -73,7 +73,7 @@ func TestInvalidRequestMaps404(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Do: %v", err)
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			if resp.StatusCode != http.StatusNotFound {
 				t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
 			}
@@ -90,7 +90,7 @@ func TestUnknownHostMaps404(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want %d for an unconfigured host", resp.StatusCode, http.StatusNotFound)
 	}
@@ -156,7 +156,7 @@ func TestForwardsToUpstreamStrippingHostSegment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Do: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
@@ -210,7 +210,7 @@ func TestForwardsQueryStringAndInfoRefs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
@@ -246,7 +246,7 @@ func TestForwardsContentEncoding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Do: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, resp.Body)
 
 	_, _, _, headers, _ := up.snapshot()
@@ -281,7 +281,7 @@ func TestStreamsLargeBodyUnmodified(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Do: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
