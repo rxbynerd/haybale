@@ -42,7 +42,8 @@ func TestBadOrAbsentTokenMapsTo401(t *testing.T) {
 		{Identities: []string{testID}, Repos: []string{repoKey(hostKey, owner, repoName)}, Permissions: []policy.Permission{policy.PermissionRead, policy.PermissionWrite}},
 	})
 
-	haybale := mustNewProxy(t, map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
+	creds := credentialsForHost(t, hostKey, upstreamBasicAuthUsername, upstreamBasicAuthToken)
+	haybale := mustNewProxy(t, map[string]*url.URL{hostKey: upstreamURL}, creds, auth, eng, discardLogger())
 	haybaleSrv := httptest.NewServer(haybale)
 	t.Cleanup(haybaleSrv.Close)
 
@@ -114,7 +115,8 @@ func TestPolicyDeniedRepoCloneFailsWith404(t *testing.T) {
 		{Identities: []string{testID}, Repos: []string{repoKey(hostKey, owner, "some-other-repo")}, Permissions: []policy.Permission{policy.PermissionRead, policy.PermissionWrite}},
 	})
 
-	haybale := mustNewProxy(t, map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
+	creds := credentialsForHost(t, hostKey, upstreamBasicAuthUsername, upstreamBasicAuthToken)
+	haybale := mustNewProxy(t, map[string]*url.URL{hostKey: upstreamURL}, creds, auth, eng, discardLogger())
 	haybaleSrv := httptest.NewServer(haybale)
 	t.Cleanup(haybaleSrv.Close)
 
@@ -165,7 +167,8 @@ func TestPolicyDeniedRepoResponseMatchesNonexistentRepo404(t *testing.T) {
 		{Identities: []string{testID}, Repos: []string{repoKey(hostKey, owner, "some-allowed-repo")}, Permissions: []policy.Permission{policy.PermissionRead, policy.PermissionWrite}},
 	})
 
-	haybale := mustNewProxy(t, map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
+	creds := credentialsForHost(t, hostKey, upstreamBasicAuthUsername, upstreamBasicAuthToken)
+	haybale := mustNewProxy(t, map[string]*url.URL{hostKey: upstreamURL}, creds, auth, eng, discardLogger())
 	haybaleSrv := httptest.NewServer(haybale)
 	t.Cleanup(haybaleSrv.Close)
 
@@ -238,7 +241,8 @@ func TestReadOnlyIdentityCanCloneButNotPush(t *testing.T) {
 		{Identities: []string{testID}, Repos: []string{repoKey(hostKey, owner, repoName)}, Permissions: []policy.Permission{policy.PermissionRead}},
 	})
 
-	haybale := mustNewProxy(t, map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
+	creds := credentialsForHost(t, hostKey, upstreamBasicAuthUsername, upstreamBasicAuthToken)
+	haybale := mustNewProxy(t, map[string]*url.URL{hostKey: upstreamURL}, creds, auth, eng, discardLogger())
 	haybaleSrv := httptest.NewServer(haybale)
 	t.Cleanup(haybaleSrv.Close)
 

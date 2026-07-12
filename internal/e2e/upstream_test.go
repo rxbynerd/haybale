@@ -8,6 +8,18 @@ import (
 	"testing"
 )
 
+// upstreamBasicAuthUsername and upstreamBasicAuthToken are the Basic-auth
+// credential newUpstream's middleware requires on every request — the
+// "real" upstream credential haybale must inject (never the client's own
+// haybale token) for a proxied request to succeed at all. M3 e2e
+// requirement: the upstream now genuinely enforces auth, so a successful
+// clone/push through haybale is proof injection works, not a passthrough
+// that happened to work because the upstream never checked anything.
+const (
+	upstreamBasicAuthUsername = "x-access-token"
+	upstreamBasicAuthToken    = "e2e-upstream-token"
+)
+
 // headerRecorder captures headers seen on the first request the
 // upstream receives, so a test can assert haybale forwarded something
 // (Git-Protocol in particular) without the recording logic living
@@ -38,13 +50,30 @@ func (r *headerRecorder) GitProtocol() string {
 	return r.headers.Get("Git-Protocol")
 }
 
+// Authorization returns the Authorization header value from the first
+// request the upstream received, or "" if none arrived yet — used by
+// the M3 leak assertions to confirm the upstream sees haybale's injected
+// credential rather than anything derived from the client's own token.
+func (r *headerRecorder) Authorization() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.headers == nil {
+		return ""
+	}
+	return r.headers.Get("Authorization")
+}
+
 // newUpstream stands up a real git smart-HTTP server: an httptest server
 // backed by git-http-backend via net/http/cgi, serving whatever bare
-// repos live under projectRoot. A headerRecorder middleware sits in
-// front of the CGI handler so the test can assert on headers the
-// request arrived with (this is the "upstream middleware" the M1 e2e
-// requirement calls for), independent of whatever git-http-backend
-// itself does with them.
+// repos live under projectRoot. A Basic-auth-requiring middleware sits
+// in front of a headerRecorder middleware sits in front of the CGI
+// handler, so a test can assert both that haybale's injected credential
+// (rather than the client's own token) is what reaches upstream, and
+// that the upstream genuinely enforces auth rather than accepting
+// anything (or nothing) at all — a request presenting anything other
+// than upstreamBasicAuthUsername/upstreamBasicAuthToken gets a 401 with
+// a WWW-Authenticate challenge, exactly the shape a real git host's auth
+// failure takes.
 func newUpstream(t *testing.T, httpBackendPath, projectRoot string) (*httptest.Server, *headerRecorder) {
 	t.Helper()
 
@@ -61,6 +90,12 @@ func newUpstream(t *testing.T, httpBackendPath, projectRoot string) (*httptest.S
 	rec := &headerRecorder{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		username, password, ok := r.BasicAuth()
+		if !ok || username != upstreamBasicAuthUsername || password != upstreamBasicAuthToken {
+			w.Header().Set("WWW-Authenticate", `Basic realm="e2e-upstream"`)
+			http.Error(w, "401 Unauthorized", http.StatusUnauthorized)
+			return
+		}
 		rec.record(r.Header)
 		backend.ServeHTTP(w, r)
 	})

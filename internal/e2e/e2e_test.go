@@ -3,9 +3,11 @@
 // forwards to a real `git http-backend` CGI upstream — no mocked git
 // protocol, no stubbed proxy behaviour, and (since M2) the real
 // identity.StaticTokenAuthenticator and policy.GlobEngine wired in ahead
-// of the passthrough, not test stubs. M3 extends this same harness with
-// upstream-credential negative cases (mint failure, upstream auth) as
-// that layer lands.
+// of the passthrough, not test stubs. Since M3, the fake upstream
+// (upstream_test.go's newUpstream) also genuinely requires Basic auth,
+// with a real upstream.StaticSource configured to satisfy it — see
+// credential_test.go for the upstream-credential acceptance and negative
+// cases that landed alongside that requirement.
 package e2e
 
 import (
@@ -57,7 +59,8 @@ func TestCloneThroughProxy(t *testing.T) {
 		{Identities: []string{testID}, Repos: []string{repoKey(hostKey, owner, repoName)}, Permissions: []policy.Permission{policy.PermissionRead, policy.PermissionWrite}},
 	})
 
-	haybale := mustNewProxy(t, map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
+	creds := credentialsForHost(t, hostKey, upstreamBasicAuthUsername, upstreamBasicAuthToken)
+	haybale := mustNewProxy(t, map[string]*url.URL{hostKey: upstreamURL}, creds, auth, eng, discardLogger())
 	haybaleSrv := httptest.NewServer(haybale)
 	t.Cleanup(haybaleSrv.Close)
 
@@ -116,7 +119,8 @@ func TestPushThroughProxy(t *testing.T) {
 		{Identities: []string{testID}, Repos: []string{repoKey(hostKey, owner, repoName)}, Permissions: []policy.Permission{policy.PermissionRead, policy.PermissionWrite}},
 	})
 
-	haybale := mustNewProxy(t, map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
+	creds := credentialsForHost(t, hostKey, upstreamBasicAuthUsername, upstreamBasicAuthToken)
+	haybale := mustNewProxy(t, map[string]*url.URL{hostKey: upstreamURL}, creds, auth, eng, discardLogger())
 	haybaleSrv := httptest.NewServer(haybale)
 	t.Cleanup(haybaleSrv.Close)
 
