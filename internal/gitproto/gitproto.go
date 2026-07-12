@@ -148,7 +148,20 @@ func parseEndpoint(r *http.Request, endpoint []string) (Verb, error) {
 		if r.Method != http.MethodGet {
 			return 0, invalid("info/refs requires GET")
 		}
-		switch r.URL.Query().Get("service") {
+		// url.Values.Get returns only the first value of a repeated
+		// query parameter, but the full, unmodified query string
+		// (including every repeated value) is what reaches upstream.
+		// git-http-backend's own parser is not guaranteed to agree with
+		// Get's "first value wins" behaviour, so a client sending
+		// service=git-upload-pack&service=git-receive-pack could be
+		// classified here as a read while upstream processes it as a
+		// write. Requiring exactly one value keeps classification
+		// unambiguous regardless of how upstream parses it.
+		services := r.URL.Query()["service"]
+		if len(services) != 1 {
+			return 0, invalid("service= parameter must appear exactly once")
+		}
+		switch services[0] {
 		case "git-upload-pack":
 			return Read, nil
 		case "git-receive-pack":

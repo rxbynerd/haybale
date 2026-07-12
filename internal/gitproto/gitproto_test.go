@@ -185,6 +185,17 @@ func TestParseRequest(t *testing.T) {
 			wantErr:   true,
 			wantErrIs: ErrInvalidRequest,
 		},
+		{
+			// url.Values.Get would silently pick the first value; the
+			// full raw query string (both values) still reaches
+			// upstream, so haybale must not classify this request when
+			// it cannot be sure which value upstream's own parser uses.
+			name:      "repeated service= parameter",
+			method:    "GET",
+			target:    "/github.com/acme/widgets.git/info/refs?service=git-upload-pack&service=git-receive-pack",
+			wantErr:   true,
+			wantErrIs: ErrInvalidRequest,
+		},
 
 		// --- method mismatches ---
 		{
