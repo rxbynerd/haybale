@@ -175,12 +175,13 @@ handshake — before any pack data is exchanged — not merely at the
 Every logger haybale constructs is wrapped in a scrubbing handler
 (`internal/security/scrubhandler.go`) that redacts known secret shapes —
 `Authorization: Basic`/`Bearer` headers, a credential embedded in a
-URL's userinfo (`https://user:token@host/...`), GitHub's own token
-prefixes (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`), and PEM
+URL's userinfo (`https://user:token@host/...`), a compact JWT (the
+`eyJ`-prefixed three-segment token a caller now presents), GitHub's own
+token prefixes (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`), and PEM
 private key blocks — from any log record, regardless of level, before it
 reaches the log sink. This is defense-in-depth: the primary defense is
 that haybale's own logging call sites only ever pass
-repo/owner/host/verb/identity/status as structured attributes (see
+repo/owner/host/verb/identity/issuer/status as structured attributes (see
 `internal/proxy/proxy.go`), never a raw request, URL, or credential —
 the scrubber exists for the case where that discipline slips, e.g. in an
 error string from a dependency this package doesn't control.
@@ -189,13 +190,60 @@ Full request URLs are never logged either way: log call sites pass the
 individual `host`/`owner`/`repo`/`verb` fields gitproto parsed out, not
 `r.URL` itself.
 
-The identity file (`identities.yaml`) stores only a SHA-256 digest of
-each token (`sha256:<hex>`), never the raw token — `haybale token new`
-prints the raw token exactly once, to the operator's terminal, and never
-persists it anywhere. Authentication (`internal/identity/statictoken.go`)
-hashes the presented credential and compares digests using
-`crypto/subtle.ConstantTimeCompare`, so response timing can't leak how
-close a guessed token is to a valid one.
+The **verified** claims of a JWT are assertions, not secrets, and so are
+loggable: successful authentication logs the issuer, mapped identity,
+`jti`, and `exp` — never the compact token itself. The **unverified**
+`iss` a caller presents (used only to select which issuer's keys to
+verify against) is treated as attacker-controlled: it is never used as a
+metric label (it would be an unbounded-cardinality vector) and never
+logged above debug. Only the verified issuer — drawn from the operator's
+own bounded, configured set — appears on spans, metrics, and info logs.
+
+## JWT verification (RFC 8725)
+
+haybale is a **pure verifier**: it mints no tokens and holds no signing
+key. It trusts one or more issuers, each through that issuer's published
+public keys (a JWKS). See `docs/jwt-identity.md` for the token contract.
+Verification (`internal/identity/jwt.go`) enforces, per issuer:
+
+- an **asymmetric-only** algorithm allowlist, checked before the signature
+  — so `alg: none` and the HMAC-signed-with-the-public-key confusion
+  attack are rejected before a key is ever consulted;
+- **issuer-bound trust material**: the token's unverified `iss` only
+  *selects* a verifier; full validation then runs against **only** that
+  issuer's key set, never "try every issuer's keys", closing cross-issuer
+  key confusion;
+- **mandatory** `aud` (any-of the configured set) and `exp`; honored
+  `nbf`/`iat` within a configurable leeway; optional required `typ`;
+- a **size cap** (64 KiB) applied before the parser runs, bounding the
+  work an attacker can force with a giant, never-valid blob.
+
+Authentication yields an identity via each issuer's `claimBindings`
+(pinning an open issuer to trusted callers) and `identityTemplate`; the
+YAML policy engine remains the sole authorization decision point. Signature
+verification uses a **public** key, so it is not a secret comparison and no
+constant-time discipline applies to it — unlike the prior static-token
+scheme, where a digest comparison used `crypto/subtle.ConstantTimeCompare`.
+
+## JWKS is haybale's first outbound dependency
+
+A `jwksURL` is the first non-upstream outbound request haybale makes.
+This is a named part of the threat model:
+
+- A **compromised or spoofed JWKS endpoint** can mint an arbitrary
+  identity *for that issuer* — it is equivalent to a signing-key
+  compromise. Two things bound the blast radius: haybale keeps each
+  issuer's trust material separate (a bad JWKS for issuer A cannot forge a
+  token for issuer B), and the operator's `claimBindings` restrict which
+  callers an issuer may authenticate at all.
+- Config validation **requires `https`** for a `jwksURL` (plaintext
+  `http` is permitted only for a loopback host, for testing), so trust
+  material is never fetched over a spoofable plaintext channel.
+- The initial fetch is **fail-fast**: an unreachable or empty JWKS at
+  startup refuses to serve traffic. At runtime the key set is refreshed in
+  the background (honoring `Cache-Control`) and refetched on an unseen
+  `kid` behind a rate limit, so a burst of unknown-`kid` tokens cannot be
+  turned into an outbound-fetch amplification vector.
 
 ## Default-deny policy
 

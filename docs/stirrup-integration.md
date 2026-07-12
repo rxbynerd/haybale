@@ -20,6 +20,21 @@ change to Stirrup itself. It uses two mechanisms Stirrup already has
 (the Ring 2 egress allowlist, and `hooks.preRun`) plus one Git already
 has (env-sourced config via `GIT_CONFIG_COUNT`).
 
+> **Authentication is now JWT-based.** haybale no longer mints its own
+> static tokens; it verifies a signed **JWT** that a control plane issued
+> to the run, against that issuer's JWKS (`docs/jwt-identity.md`). The
+> sandbox wiring below is unchanged in shape — the credential is still fed
+> as the Basic-auth password — but the credential is now a control-plane
+> JWT, not a `haybale token new` string.
+>
+> Stirrup does not yet have a control plane that can issue such JWTs (the
+> `stirrup` binary is a gRPC client with no signing/JWKS infrastructure),
+> so this document describes the **target** integration. Until an external
+> control plane can mint per-run JWTs per the contract, the concrete,
+> deployable-today issuer is **GitHub Actions OIDC**
+> (`docs/github-actions.md`); Stirrup-side issuance is tracked separately
+> and is out of scope for haybale.
+
 ## Deployment
 
 Run haybale as its own Deployment/Service, in the same namespace as (and
@@ -64,21 +79,23 @@ inherits, not one haybale introduces.
 
 ## Provisioning (operator, per run)
 
-For each run that needs access, an operator (not the agent, and not
+For each run that needs access, the control plane (not the agent, and not
 anything inside the sandbox) does two things ahead of time:
 
-1. Mint an identity token scoped to that run:
+1. Issue a JWT for that run, per `docs/jwt-identity.md`: signed with the
+   control plane's key, `iss` equal to haybale's configured issuer, `aud`
+   equal to haybale's configured audience, and `sub: run-<RunID>` (so an
+   `identityTemplate: "{sub}"` renders the identity as `run-<RunID>`).
+   `<RunID>` is Stirrup's own `RunConfig.RunID` — using it keeps haybale's
+   audit log (`identity=run-<RunID>` on every proxied request and security
+   event) correlated with Stirrup's own per-run tracing. The JWT is handed
+   to whatever provisions the sandbox's environment (see below); haybale
+   holds only the issuer's public keys, never the signing key.
 
-   ```
-   haybale token new --id run-<RunID>
-   ```
-
-   This prints the raw token once (to hand to whatever provisions the
-   sandbox's environment — see below) and the `identities.yaml` stanza
-   to add in its place. `<RunID>` is Stirrup's own `RunConfig.RunID` —
-   using it as the identity ID keeps haybale's audit log
-   (`identity=run-<RunID>` on every proxied request and security event)
-   correlated with Stirrup's own per-run tracing.
+   Optionally, the control plane can narrow a single run below the YAML
+   policy by including a `repoScopeClaim` array on the token
+   (`docs/jwt-identity.md`) — per-run blast-radius reduction that a static
+   token could not express.
 
 2. Add a `policy.yaml` rule scoping `run-<RunID>` to exactly the
    repo(s) and verb(s) that run needs — nothing broader:
@@ -105,7 +122,7 @@ written to the sandbox's disk, which matters because anything a hook
 rest of the run.
 
 ```
-HAYBALE_TOKEN=<the raw token from `haybale token new`>
+HAYBALE_TOKEN=<the run's JWT, issued by the control plane per docs/jwt-identity.md>
 
 GIT_CONFIG_COUNT=2
 GIT_CONFIG_KEY_0=url.http://haybale.internal:8466/github.com/.insteadOf

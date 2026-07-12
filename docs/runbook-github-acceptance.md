@@ -114,13 +114,16 @@ for the full list):
 
 ### What it does
 
-1. Mints a run-scoped haybale identity token (`haybale token new`) and
-   writes a scratch `identities.yaml`/`policy.yaml`/`haybale.yaml` — the
-   policy grants that one identity `read`+`write` on exactly
-   `HAYBALE_E2E_REPO`, nothing else. All three files (and the raw token)
-   live under a per-run scratch dir (default `.e2e-github.$PID`, PID
-   being this script's own — override via `HAYBALE_E2E_SCRATCH`),
-   `.gitignore`'d and deleted on every exit path, success or failure.
+1. Mints a run-scoped identity **JWT** — via `scripts/mint-e2e-jwt`, a
+   local ES256 issuer standing in for a control plane (haybale itself
+   mints nothing; it verifies) — and writes a scratch
+   `jwks.json`/`policy.yaml`/`haybale.yaml`. The `haybale.yaml` configures
+   a single `jwt` issuer trusting that `jwks.json`; the policy grants that
+   one identity `read`+`write` on exactly `HAYBALE_E2E_REPO`, nothing
+   else. All files (and the minted token) live under a per-run scratch dir
+   (default `.e2e-github.$PID`, PID being this script's own — override via
+   `HAYBALE_E2E_SCRATCH`), `.gitignore`'d and deleted on every exit path,
+   success or failure.
 2. Starts `haybale serve` on the host, in the background, and polls
    `/healthz` until it's up.
 3. Runs a single `podman run --rm` (or `docker run --rm`) container of

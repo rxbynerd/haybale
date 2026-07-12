@@ -10,9 +10,11 @@
 # runtime that can reach back out to the host — none of which CI has).
 #
 # What it does:
-#   1. Mints a run-scoped haybale identity token and writes scratch
-#      identities.yaml/policy.yaml/haybale.yaml granting that identity
-#      read+write on exactly HAYBALE_E2E_REPO — nothing else.
+#   1. Mints a run-scoped identity JWT (via scripts/mint-e2e-jwt, a local
+#      ES256 issuer standing in for a control plane) and writes scratch
+#      jwks.json/policy.yaml/haybale.yaml granting that identity read+write
+#      on exactly HAYBALE_E2E_REPO — nothing else. haybale itself verifies
+#      the JWT against jwks.json; it mints nothing.
 #   2. Starts `haybale serve` on the host, waits for /healthz.
 #   3. Runs a container with ONLY HAYBALE_URL/HAYBALE_TOKEN as env vars.
 #      Entirely from inside that container: configures git via
@@ -196,24 +198,26 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ---- 1. mint identity + write scratch config ---------------------------
+# ---- 1. mint identity JWT + write scratch config -----------------------
+#
+# haybale is a verifier and mints nothing itself; a local ES256 issuer
+# stands in for a control plane. scripts/mint-e2e-jwt generates a fresh
+# keypair, writes its public half as a JWKS document haybale trusts via
+# jwksFile, and prints a signed, short-lived JWT whose `sub` is the run id
+# — exactly the shape docs/jwt-identity.md specifies. The private key never
+# leaves that helper process; only the public JWKS is written to disk.
 
 run_id="run-e2e-$(date +%s)-$$"
-echo "e2e-github: minting identity token for $run_id"
-mint_output="$("$HAYBALE_BIN" token new --id "$run_id")"
-
-raw_token="$(printf '%s\n' "$mint_output" | awk '/^token \(save this now/{getline; print; exit}')"
-token_digest="$(printf '%s\n' "$mint_output" | awk -F'tokenDigest: ' '/tokenDigest:/{print $2; exit}')"
-if [[ -z "$raw_token" || -z "$token_digest" ]]; then
-  echo "e2e-github: failed to parse 'haybale token new' output" >&2
+issuer="https://control-plane.e2e.haybale.internal"
+audience="https://haybale.e2e.internal"
+echo "e2e-github: minting identity JWT for $run_id"
+raw_token="$(go run ./scripts/mint-e2e-jwt \
+  --sub "$run_id" --iss "$issuer" --aud "$audience" \
+  --jwks-out "$SCRATCH_ABS/jwks.json")"
+if [[ -z "$raw_token" ]]; then
+  echo "e2e-github: failed to mint identity JWT" >&2
   exit 1
 fi
-
-cat > "$SCRATCH_ABS/identities.yaml" <<EOF
-identities:
-  - id: $run_id
-    tokenDigest: $token_digest
-EOF
 
 cat > "$SCRATCH_ABS/policy.yaml" <<EOF
 rules:
@@ -225,7 +229,15 @@ EOF
 cat > "$SCRATCH_ABS/haybale.yaml" <<EOF
 listen: ":$E2E_PORT"
 logLevel: info
-identity: { type: static-token-file, path: $SCRATCH_ABS/identities.yaml }
+identity:
+  type: jwt
+  issuers:
+    - issuer: $issuer
+      jwksFile: $SCRATCH_ABS/jwks.json
+      algorithms: [ES256]
+      audiences: [$audience]
+      typ: at+jwt
+      identityTemplate: "{sub}"
 policy: { path: $SCRATCH_ABS/policy.yaml }
 upstreams:
   - host: github.com
