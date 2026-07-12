@@ -706,3 +706,88 @@ func TestInstallationLookupTTLBoundary(t *testing.T) {
 		t.Fatalf("lookup calls = %d, want 2 (exactly at the TTL boundary must trigger a re-fetch)", calls.Load())
 	}
 }
+
+// TestInstallationLookupSingleflightDoesNotCollapseDifferentKeys is H2's
+// installationLookup-side counterpart to
+// TestTokenCacheSingleflightDoesNotCollapseDifferentKeys: concurrent
+// lookups across distinct (owner, repo) pairs must each produce their own
+// upstream GET, proving the sfKey (owner + "/" + repo) construction
+// actually discriminates between repos rather than accidentally
+// collapsing all concurrent lookups into one.
+func TestInstallationLookupSingleflightDoesNotCollapseDifferentKeys(t *testing.T) {
+	var calls atomic.Int64
+	var mu sync.Mutex
+	seenPaths := make(map[string]struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		mu.Lock()
+		seenPaths[r.URL.Path] = struct{}{}
+		mu.Unlock()
+		// Block every lookup open until every distinct key's leader has
+		// registered (see below) — without this, a fast lookup can
+		// complete and be cleaned up from the singleflight group before
+		// every concurrent same-key caller reaches it, causing a
+		// same-key race that would masquerade as a different-key
+		// non-collapse failure.
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id": 7}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	lookup := newInstallationLookup(time.Now)
+	client := &http.Client{}
+
+	type ownerRepo struct{ owner, repo string }
+	keys := []ownerRepo{
+		{owner: "acme", repo: "widgets"},
+		{owner: "acme", repo: "gadgets"},
+		{owner: "other", repo: "widgets"},
+	}
+
+	const perKey = 10
+	var startWG sync.WaitGroup
+	startWG.Add(1)
+	var done sync.WaitGroup
+	errs := make([]error, len(keys)*perKey)
+	idx := 0
+	for _, k := range keys {
+		for i := 0; i < perKey; i++ {
+			done.Add(1)
+			go func(i int, k ownerRepo) {
+				defer done.Done()
+				startWG.Wait()
+				_, errs[i] = lookup.get(context.Background(), client, srv.URL, k.owner, k.repo)
+			}(idx, k)
+			idx++
+		}
+	}
+	startWG.Done()
+
+	// Wait until every distinct key has produced exactly one (blocked)
+	// lookup call before releasing them all together.
+	deadline := time.Now().Add(2 * time.Second)
+	for calls.Load() < int64(len(keys)) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	done.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("get() goroutine %d unexpected error: %v", i, err)
+		}
+	}
+	if calls.Load() != int64(len(keys)) {
+		t.Fatalf("installation lookup calls = %d, want %d (one per distinct owner/repo key, not 1 and not %d)", calls.Load(), len(keys), len(keys)*perKey)
+	}
+	if len(seenPaths) != len(keys) {
+		t.Fatalf("distinct lookup paths = %d, want %d", len(seenPaths), len(keys))
+	}
+}

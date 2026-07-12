@@ -307,3 +307,87 @@ func TestTokenCacheFollowerHonorsOwnContextDeadline(t *testing.T) {
 		t.Fatalf("mint calls = %d, want exactly 1 (the follower giving up early must not trigger a second mint, and the leader's mint must still complete for anyone still waiting)", calls.Load())
 	}
 }
+
+// TestTokenCacheSingleflightDoesNotCollapseDifferentKeys is H2: unlike
+// TestTokenCacheSingleflightCollapsesConcurrentMints (which proves
+// same-key collapse), this proves DIFFERENT (repo, verb) keys do NOT
+// collapse — concurrent Get calls across distinct repos and distinct
+// verbs for the same repo must each produce their own mint. verb is
+// deliberately folded into the singleflight key (see get's doc comment)
+// specifically so a concurrent read and write don't collapse into each
+// other's result; an accidental typo dropping verb from the key's format
+// string would still pass every same-key test but would fail this one.
+func TestTokenCacheSingleflightDoesNotCollapseDifferentKeys(t *testing.T) {
+	clock := newFakeClock(time.Unix(0, 0))
+	cache := newTokenCache(clock.Now)
+
+	type repoVerb struct {
+		repo gitproto.Repo
+		verb gitproto.Verb
+	}
+	keys := []repoVerb{
+		{repo: gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}, verb: gitproto.Read},
+		{repo: gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}, verb: gitproto.Write},
+		{repo: gitproto.Repo{Host: "github.com", Owner: "acme", Name: "gadgets"}, verb: gitproto.Read},
+	}
+
+	var calls atomic.Int64
+	var mu sync.Mutex
+	seenKeys := make(map[string]struct{})
+	release := make(chan struct{})
+	mint := func(_ context.Context, repo gitproto.Repo, verb gitproto.Verb) (BasicAuth, time.Time, error) {
+		calls.Add(1)
+		k := repo.Name + "/" + verb.String()
+		mu.Lock()
+		seenKeys[k] = struct{}{}
+		mu.Unlock()
+		// Block every mint open until every distinct key's leader has
+		// registered (see below) — without this, a fast mint can complete
+		// and be cleaned up from the singleflight group before every
+		// concurrent same-key caller reaches it, causing a same-key race
+		// that would masquerade as a different-key non-collapse failure.
+		<-release
+		return BasicAuth{Username: "x-access-token", Password: "token-" + k}, clock.Now().Add(time.Hour), nil
+	}
+
+	const perKey = 10
+	var start sync.WaitGroup
+	start.Add(1)
+	var done sync.WaitGroup
+	errs := make([]error, len(keys)*perKey)
+	idx := 0
+	for _, k := range keys {
+		for i := 0; i < perKey; i++ {
+			done.Add(1)
+			go func(i int, k repoVerb) {
+				defer done.Done()
+				start.Wait()
+				_, errs[i] = cache.get(context.Background(), k.repo, k.verb, mint)
+			}(idx, k)
+			idx++
+		}
+	}
+	start.Done()
+
+	// Wait until every distinct key has produced exactly one (blocked)
+	// mint call before releasing them all together.
+	deadline := time.Now().Add(2 * time.Second)
+	for calls.Load() < int64(len(keys)) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	done.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("get() goroutine %d unexpected error: %v", i, err)
+		}
+	}
+	if calls.Load() != int64(len(keys)) {
+		t.Fatalf("mint calls = %d, want %d (one per distinct (repo, verb) key, not 1 and not %d)", calls.Load(), len(keys), len(keys)*perKey)
+	}
+	if len(seenKeys) != len(keys) {
+		t.Fatalf("distinct keys minted = %d, want %d", len(seenKeys), len(keys))
+	}
+}
