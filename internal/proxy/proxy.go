@@ -145,6 +145,15 @@ func (s *statusRecorder) Flush() {
 // every header (Git-Protocol, Content-Type, Content-Encoding, Accept,
 // Accept-Encoding included) that pr.Out already carries as a clone of
 // the inbound request, pass through unchanged.
+//
+// Deliberately absent: a call to pr.SetXForwarded(). ReverseProxy only
+// strips inbound Forwarded/X-Forwarded-* headers and reintroduces its
+// own X-Forwarded-For/Host/Proto when SetXForwarded is called — leaving
+// it uncalled is the mechanism by which those headers are suppressed
+// rather than forwarded, per this proxy's security design (never inject
+// client IP/host/proto upstream). Do not "fix" this by adding
+// SetXForwarded(); TestClientXForwardedHeadersAreSuppressed guards
+// against exactly that regression.
 func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 	base, _ := pr.In.Context().Value(routeKey{}).(*url.URL)
 

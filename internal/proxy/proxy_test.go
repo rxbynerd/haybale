@@ -230,6 +230,49 @@ func TestForwardsToUpstreamStrippingHostSegment(t *testing.T) {
 	}
 }
 
+// TestClientXForwardedHeadersAreSuppressed pins the intentional security
+// posture documented on rewrite(): haybale must never inject client
+// IP/host/proto upstream. A client-supplied X-Forwarded-For (or
+// X-Forwarded-Host/X-Forwarded-Proto) must not reach the upstream —
+// neither the client's original value nor a haybale-originated
+// replacement. This guards against a future refactor "fixing" the
+// absence of pr.SetXForwarded() the way the original R9 finding
+// suggested, which would leak client IP/host/proto to the upstream.
+func TestClientXForwardedHeadersAreSuppressed(t *testing.T) {
+	up := &recordingUpstream{}
+	upstreamSrv := httptest.NewServer(up.handler())
+	defer upstreamSrv.Close()
+
+	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), discardLogger())
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/testhost/acme/widgets.git/info/refs?service=git-upload-pack", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("X-Forwarded-For", "203.0.113.7")
+	req.Header.Set("X-Forwarded-Host", "attacker.example")
+	req.Header.Set("X-Forwarded-Proto", "https")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	_, _, _, headers, _ := up.snapshot()
+	for _, h := range []string{"X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto"} {
+		if got := headers.Get(h); got != "" {
+			t.Errorf("upstream saw %s = %q, want it absent", h, got)
+		}
+	}
+}
+
 func TestForwardsQueryStringAndInfoRefs(t *testing.T) {
 	up := &recordingUpstream{}
 	upstreamSrv := httptest.NewServer(up.handler())
