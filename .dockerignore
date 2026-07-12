@@ -1,0 +1,9 @@
+.git
+.github
+.claude
+.reviews
+docs
+*.md
+haybale
+*.test
+*.out
