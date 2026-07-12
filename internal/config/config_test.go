@@ -1,10 +1,13 @@
 package config
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/rxbynerd/haybale/internal/gitproto"
 )
 
 // fakeTokenDigest is a structurally valid "sha256:<hex>" tokenDigest
@@ -15,6 +18,22 @@ const fakeTokenDigest = "sha256:" + "11" + "22" + "33" + "44" + "55" + "66" + "7
 	"99" + "aa" + "bb" + "cc" + "dd" + "ee" + "ff" + "00" +
 	"11" + "22" + "33" + "44" + "55" + "66" + "77" + "88" +
 	"99" + "aa" + "bb" + "cc" + "dd" + "ee" + "ff" + "00"
+
+// testTokenEnv is the environment variable name every config_test.go
+// fixture's "static" credential block points tokenEnv at. Every test
+// that needs Validate() (or Load()) to succeed sets it via t.Setenv, so
+// buildCredentialSource's "environment variable is unset or empty" check
+// passes without needing a real upstream credential.
+const testTokenEnv = "HAYBALE_CONFIG_TEST_TOKEN"
+
+// testTokenEnvValue is the value testTokenEnv is set to wherever a valid
+// static credential is needed; its exact contents are never asserted on.
+const testTokenEnvValue = "test-token-value"
+
+// validCredential is a "static" CredentialConfig that Validate()
+// succeeds on as long as the test also does t.Setenv(testTokenEnv,
+// testTokenEnvValue).
+var validCredential = CredentialConfig{Type: credentialTypeStatic, TokenEnv: testTokenEnv}
 
 // writeValidIdentityAndPolicyFiles writes a minimal valid identities.yaml
 // and policy.yaml under t.TempDir(), returning their paths. Every
@@ -41,7 +60,8 @@ func writeValidIdentityAndPolicyFiles(t *testing.T) (identityPath, policyPath st
 }
 
 func TestValidate(t *testing.T) {
-	validUpstream := Upstream{Host: "github.com", BaseURL: "https://github.com"}
+	t.Setenv(testTokenEnv, testTokenEnvValue)
+	validUpstream := Upstream{Host: "github.com", BaseURL: "https://github.com", Credential: validCredential}
 
 	tests := []struct {
 		name    string
@@ -171,12 +191,149 @@ func TestValidate(t *testing.T) {
 					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
 					Policy:   PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{
-						{Host: "github.com", BaseURL: "https://github.com"},
-						{Host: "github.com", BaseURL: "https://github.example.com"},
+						{Host: "github.com", BaseURL: "https://github.com", Credential: validCredential},
+						{Host: "github.com", BaseURL: "https://github.example.com", Credential: validCredential},
 					},
 				}
 			},
 			wantErr: "duplicate host",
+		},
+		{
+			name: "credential type empty",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{{Host: "github.com", BaseURL: "https://github.com"}},
+				}
+			},
+			wantErr: "credential: type",
+		},
+		{
+			name: "credential type unsupported",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:   PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{
+						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{Type: "ldap"}},
+					},
+				}
+			},
+			wantErr: "credential: type",
+		},
+		{
+			name: "credential inline token rejected",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:   PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{
+						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
+							Type: credentialTypeStatic, TokenEnv: testTokenEnv, Token: "inline-secret-value",
+						}},
+					},
+				}
+			},
+			wantErr: "inline token is not supported",
+		},
+		{
+			name: "credential static missing tokenEnv",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:   PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{
+						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{Type: credentialTypeStatic}},
+					},
+				}
+			},
+			wantErr: "tokenEnv is required",
+		},
+		{
+			name: "credential static tokenEnv unset",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:   PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{
+						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
+							Type: credentialTypeStatic, TokenEnv: "HAYBALE_CONFIG_TEST_DEFINITELY_UNSET",
+						}},
+					},
+				}
+			},
+			wantErr: "is unset or empty",
+		},
+		{
+			name: "credential github-app missing appID",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:   PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{
+						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
+							Type: credentialTypeGitHubApp, PrivateKeyPath: "/tmp/app.pem",
+						}},
+					},
+				}
+			},
+			wantErr: "appID is required",
+		},
+		{
+			name: "credential github-app missing privateKeyPath",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:   PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{
+						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
+							Type: credentialTypeGitHubApp, AppID: 12345,
+						}},
+					},
+				}
+			},
+			wantErr: "privateKeyPath is required",
+		},
+		{
+			name: "credential github-app valid shape",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:   PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{
+						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
+							Type: credentialTypeGitHubApp, AppID: 12345, PrivateKeyPath: "/tmp/app.pem",
+						}},
+					},
+				}
+			},
+			// Structurally valid: Validate() succeeds even though no
+			// CredentialSource actually mints anything until M4.
 		},
 		{
 			name: "identity type empty",
@@ -322,6 +479,7 @@ func TestValidate(t *testing.T) {
 }
 
 func TestValidatePopulatesParsedBaseURL(t *testing.T) {
+	t.Setenv(testTokenEnv, testTokenEnvValue)
 	identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
 	cfg := Config{
 		Listen:   ":8466",
@@ -329,7 +487,7 @@ func TestValidatePopulatesParsedBaseURL(t *testing.T) {
 		Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
 		Policy:   PolicyConfig{Path: policyPath},
 		Upstreams: []Upstream{
-			{Host: "github.com", BaseURL: "https://github.com:8443"},
+			{Host: "github.com", BaseURL: "https://github.com:8443", Credential: validCredential},
 		},
 	}
 	if err := cfg.Validate(); err != nil {
@@ -346,13 +504,14 @@ func TestValidatePopulatesParsedBaseURL(t *testing.T) {
 }
 
 func TestValidatePopulatesAuthenticatorAndEngine(t *testing.T) {
+	t.Setenv(testTokenEnv, testTokenEnvValue)
 	identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
 	cfg := Config{
 		Listen:    ":8466",
 		LogLevel:  "info",
 		Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
 		Policy:    PolicyConfig{Path: policyPath},
-		Upstreams: []Upstream{{Host: "github.com", BaseURL: "https://github.com"}},
+		Upstreams: []Upstream{{Host: "github.com", BaseURL: "https://github.com", Credential: validCredential}},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() unexpected error: %v", err)
@@ -363,6 +522,78 @@ func TestValidatePopulatesAuthenticatorAndEngine(t *testing.T) {
 	}
 	if cfg.Policy.Engine() == nil {
 		t.Error("Policy.Engine() = nil after successful Validate()")
+	}
+}
+
+// TestValidatePopulatesCredentialSource asserts Validate() builds a
+// working upstream.CredentialSource for a "static" credential block,
+// including the defaultStaticUsername fallback when Username is left
+// empty.
+func TestValidatePopulatesCredentialSource(t *testing.T) {
+	t.Setenv(testTokenEnv, testTokenEnvValue)
+	identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+	cfg := Config{
+		Listen:   ":8466",
+		LogLevel: "info",
+		Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+		Policy:   PolicyConfig{Path: policyPath},
+		Upstreams: []Upstream{
+			{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
+				Type: credentialTypeStatic, TokenEnv: testTokenEnv,
+			}},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected error: %v", err)
+	}
+
+	src := cfg.Upstreams[0].CredentialSource()
+	if src == nil {
+		t.Fatal("CredentialSource() = nil after successful Validate()")
+	}
+	cred, err := src.Credentials(context.Background(), gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}, gitproto.Read)
+	if err != nil {
+		t.Fatalf("Credentials() unexpected error: %v", err)
+	}
+	if cred.Username != defaultStaticUsername {
+		t.Errorf("Credentials().Username = %q, want default %q", cred.Username, defaultStaticUsername)
+	}
+	if cred.Password != testTokenEnvValue {
+		t.Errorf("Credentials().Password = %q, want the tokenEnv value %q", cred.Password, testTokenEnvValue)
+	}
+}
+
+// TestValidateGitHubAppCredentialSourceStubErrors asserts the
+// credentialTypeGitHubApp stub's contract: Validate() accepts the
+// structurally-valid shape, but the CredentialSource it builds always
+// errors — never mints a real token — until M4 replaces it.
+func TestValidateGitHubAppCredentialSourceStubErrors(t *testing.T) {
+	identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+	cfg := Config{
+		Listen:   ":8466",
+		LogLevel: "info",
+		Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+		Policy:   PolicyConfig{Path: policyPath},
+		Upstreams: []Upstream{
+			{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
+				Type: credentialTypeGitHubApp, AppID: 12345, PrivateKeyPath: "/tmp/app.pem",
+			}},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected error: %v", err)
+	}
+
+	src := cfg.Upstreams[0].CredentialSource()
+	if src == nil {
+		t.Fatal("CredentialSource() = nil after successful Validate()")
+	}
+	_, err := src.Credentials(context.Background(), gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}, gitproto.Read)
+	if err == nil {
+		t.Fatal("Credentials() = nil error, want an error from the not-yet-implemented stub")
+	}
+	if !strings.Contains(err.Error(), "not yet implemented") {
+		t.Errorf("Credentials() error = %q, want it to mention \"not yet implemented\"", err.Error())
 	}
 }
 
@@ -396,6 +627,7 @@ func TestApplyDefaultsDoesNotOverrideExplicitValues(t *testing.T) {
 }
 
 func TestLoad(t *testing.T) {
+	t.Setenv(testTokenEnv, testTokenEnvValue)
 	dir := t.TempDir()
 	identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
 	path := filepath.Join(dir, "haybale.yaml")
@@ -410,8 +642,10 @@ policy:
 upstreams:
   - host: github.com
     baseURL: https://github.com
+    credential: { type: static, tokenEnv: ` + testTokenEnv + ` }
   - host: git.internal.example
     baseURL: https://git.internal.example
+    credential: { type: static, username: git, tokenEnv: ` + testTokenEnv + ` }
 `
 	if err := os.WriteFile(path, []byte(yamlContent), 0o600); err != nil {
 		t.Fatalf("os.WriteFile: %v", err)
@@ -433,6 +667,12 @@ upstreams:
 	if cfg.Upstreams[0].Host != "github.com" || cfg.Upstreams[0].BaseURL != "https://github.com" {
 		t.Errorf("Upstreams[0] = %+v, want {github.com https://github.com}", cfg.Upstreams[0])
 	}
+	if cfg.Upstreams[0].CredentialSource() == nil {
+		t.Error("Upstreams[0].CredentialSource() = nil after Load()")
+	}
+	if cfg.Upstreams[1].CredentialSource() == nil {
+		t.Error("Upstreams[1].CredentialSource() = nil after Load()")
+	}
 	if cfg.Identity.Authenticator() == nil {
 		t.Error("Identity.Authenticator() = nil after Load()")
 	}
@@ -442,6 +682,7 @@ upstreams:
 }
 
 func TestLoadAppliesDefaults(t *testing.T) {
+	t.Setenv(testTokenEnv, testTokenEnvValue)
 	dir := t.TempDir()
 	identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
 	path := filepath.Join(dir, "haybale.yaml")
@@ -454,6 +695,7 @@ policy:
 upstreams:
   - host: github.com
     baseURL: https://github.com
+    credential: { type: static, tokenEnv: ` + testTokenEnv + ` }
 `
 	if err := os.WriteFile(path, []byte(yamlContent), 0o600); err != nil {
 		t.Fatalf("os.WriteFile: %v", err)
