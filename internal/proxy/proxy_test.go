@@ -321,6 +321,70 @@ func TestClientXForwardedHeadersAreSuppressed(t *testing.T) {
 	}
 }
 
+// TestInboundAuthorizationHeaderIsStripped exercises B-1: the client's
+// inbound Authorization header — the haybale auth token Authenticate
+// just checked, whether presented as HTTP Basic or as an
+// `Authorization: Bearer <token>` header — must never reach the
+// upstream. httputil.ReverseProxy only strips the RFC hop-by-hop header
+// set by default, and Authorization is end-to-end, not hop-by-hop, so
+// without an explicit strip it clones straight through, letting anything
+// with visibility into the upstream leg replay the haybale credential
+// directly against haybale itself. M3 will inject its own
+// upstream-appropriate Authorization in this same spot; until then, the
+// correct behaviour is simply "absent", which is what this test pins.
+func TestInboundAuthorizationHeaderIsStripped(t *testing.T) {
+	tests := []struct {
+		name    string
+		setAuth func(*http.Request)
+	}{
+		{
+			name: "basic auth",
+			setAuth: func(r *http.Request) {
+				r.SetBasicAuth("ignored-username", "haybale-secret-token")
+			},
+		},
+		{
+			name: "bearer token",
+			setAuth: func(r *http.Request) {
+				r.Header.Set("Authorization", "Bearer haybale-secret-token")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			up := &recordingUpstream{}
+			upstreamSrv := httptest.NewServer(up.handler())
+			defer upstreamSrv.Close()
+
+			p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+			srv := httptest.NewServer(p)
+			defer srv.Close()
+
+			req, err := http.NewRequest(http.MethodGet, srv.URL+"/testhost/acme/widgets.git/info/refs?service=git-upload-pack", nil)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			tt.setAuth(req)
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			_, _ = io.Copy(io.Discard, resp.Body)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200", resp.StatusCode)
+			}
+
+			_, _, _, headers, _ := up.snapshot()
+			if got := headers.Get("Authorization"); got != "" {
+				t.Errorf("upstream saw Authorization = %q, want it absent", got)
+			}
+		})
+	}
+}
+
 func TestForwardsQueryStringAndInfoRefs(t *testing.T) {
 	up := &recordingUpstream{}
 	upstreamSrv := httptest.NewServer(up.handler())

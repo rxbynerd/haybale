@@ -193,7 +193,8 @@ func (s *statusRecorder) Flush() {
 // /{owner}/{repo}[.git]/<endpoint> suffix and query string, along with
 // every header (Git-Protocol, Content-Type, Content-Encoding, Accept,
 // Accept-Encoding included) that pr.Out already carries as a clone of
-// the inbound request, pass through unchanged.
+// the inbound request, pass through unchanged — except Authorization,
+// which is explicitly deleted (see below).
 //
 // Deliberately absent: a call to pr.SetXForwarded(). ReverseProxy only
 // strips inbound Forwarded/X-Forwarded-* headers and reintroduces its
@@ -214,6 +215,20 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 	pr.SetURL(base)
 	pr.Out.URL.Path = base.Path + stripHostSegment(pr.In.URL.Path)
 	pr.Out.URL.RawPath = ""
+
+	// httputil.ReverseProxy only strips the small RFC hop-by-hop header
+	// set (Connection, Keep-Alive, Proxy-Authenticate,
+	// Proxy-Authorization, TE, Trailers, Transfer-Encoding, Upgrade) by
+	// default — Authorization is end-to-end, not hop-by-hop, so it would
+	// otherwise clone straight through to pr.Out. The client's
+	// Authorization here is the haybale auth token Authenticate just
+	// checked (Basic password or Bearer), never a credential the
+	// upstream git host understands; forwarding it verbatim would leak
+	// that token to anything with visibility into the upstream leg. M3
+	// will set a new upstream-appropriate Authorization here (an
+	// injected credential via CredentialSource) in this same spot; until
+	// then, deleting it is the entire fix.
+	pr.Out.Header.Del("Authorization")
 }
 
 // stripHostSegment removes the leading /{host} segment from an
