@@ -13,6 +13,8 @@ import (
 
 	"github.com/rxbynerd/haybale/internal/config"
 	"github.com/rxbynerd/haybale/internal/proxy"
+	"github.com/rxbynerd/haybale/internal/security"
+	"github.com/rxbynerd/haybale/internal/upstream"
 )
 
 // readHeaderTimeout bounds how long the server waits to read request
@@ -45,9 +47,15 @@ func runServe(cmd *cobra.Command, path string) error {
 		return err
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+	// ScrubHandler wraps the leaf text handler so any token or credential
+	// material that reaches a log call anywhere in haybale — a bug, since
+	// every call site should already pass only
+	// repo/owner/host/verb/identity — is redacted before it ever leaves
+	// the process, rather than relying solely on every call site getting
+	// that right.
+	logger := slog.New(security.NewScrubHandler(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: parseLogLevel(cfg.LogLevel),
-	}))
+	})))
 
 	upstreams, err := buildUpstreams(cfg)
 	if err != nil {
@@ -56,6 +64,14 @@ func runServe(cmd *cobra.Command, path string) error {
 		// config, so it is surfaced rather than silently ignored.
 		return fmt.Errorf("build upstreams: %w", err)
 	}
+	credentialSources, err := buildCredentialSources(cfg)
+	if err != nil {
+		// Validate() already confirmed every upstream's credential block
+		// built successfully; a failure here indicates a bug in that
+		// invariant rather than a bad config, so it is surfaced rather
+		// than silently ignored.
+		return fmt.Errorf("build credential sources: %w", err)
+	}
 
 	// Load already ran Validate(), which populates these from the
 	// identity/policy blocks — nil here would indicate a caller bug
@@ -63,7 +79,7 @@ func runServe(cmd *cobra.Command, path string) error {
 	// rejects a nil authenticator/policyEngine at construction, so that
 	// caller bug now surfaces here as an error rather than a panic on
 	// the first request.
-	p, err := proxy.New(upstreams, cfg.Identity.Authenticator(), cfg.Policy.Engine(), logger)
+	p, err := proxy.New(upstreams, credentialSources, cfg.Identity.Authenticator(), cfg.Policy.Engine(), logger)
 	if err != nil {
 		return fmt.Errorf("build proxy: %w", err)
 	}
@@ -99,6 +115,24 @@ func buildUpstreams(cfg *config.Config) (map[string]*url.URL, error) {
 		upstreams[u.Host] = parsed
 	}
 	return upstreams, nil
+}
+
+// buildCredentialSources converts config.Upstreams (already validated)
+// into the host->CredentialSource map internal/proxy.New expects,
+// reusing the exact upstream.CredentialSource Validate() already built
+// for each Upstream rather than rebuilding it a second time — the same
+// reuse-not-reparse pattern buildUpstreams already establishes for
+// BaseURL.
+func buildCredentialSources(cfg *config.Config) (map[string]upstream.CredentialSource, error) {
+	sources := make(map[string]upstream.CredentialSource, len(cfg.Upstreams))
+	for _, u := range cfg.Upstreams {
+		src := u.CredentialSource()
+		if src == nil {
+			return nil, fmt.Errorf("upstream %q: credential source was not validated (call Validate() before buildCredentialSources)", u.Host)
+		}
+		sources[u.Host] = src
+	}
+	return sources, nil
 }
 
 // parseLogLevel maps a validated config log level string to a

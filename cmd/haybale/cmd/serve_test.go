@@ -34,7 +34,14 @@ func TestParseLogLevel(t *testing.T) {
 	}
 }
 
-func TestBuildUpstreams(t *testing.T) {
+// buildTestConfig returns a *config.Config with two upstreams, each
+// carrying a "static" credential block that Validate() can build
+// successfully once tokenEnv's environment variable is set (see
+// t.Setenv in callers) — the shared fixture TestBuildUpstreams and
+// TestBuildCredentialSources both validate before exercising their
+// respective build function.
+func buildTestConfig(t *testing.T, tokenEnv string) *config.Config {
+	t.Helper()
 	dir := t.TempDir()
 	identityPath := filepath.Join(dir, "identities.yaml")
 	identityContent := "identities:\n  - id: run-1\n    tokenDigest: sha256:" + fakeTokenDigestHex + "\n"
@@ -46,15 +53,21 @@ func TestBuildUpstreams(t *testing.T) {
 		t.Fatalf("os.WriteFile(policy.yaml): %v", err)
 	}
 
-	cfg := &config.Config{
+	return &config.Config{
 		LogLevel: "info",
 		Identity: config.IdentityConfig{Type: "static-token-file", Path: identityPath},
 		Policy:   config.PolicyConfig{Path: policyPath},
 		Upstreams: []config.Upstream{
-			{Host: "github.com", BaseURL: "https://github.com"},
-			{Host: "git.internal.example", BaseURL: "https://git.internal.example:8443"},
+			{Host: "github.com", BaseURL: "https://github.com", Credential: config.CredentialConfig{Type: "static", TokenEnv: tokenEnv}},
+			{Host: "git.internal.example", BaseURL: "https://git.internal.example:8443", Credential: config.CredentialConfig{Type: "static", Username: "git", TokenEnv: tokenEnv}},
 		},
 	}
+}
+
+func TestBuildUpstreams(t *testing.T) {
+	const tokenEnv = "HAYBALE_SERVE_TEST_TOKEN"
+	t.Setenv(tokenEnv, "test-token-value")
+	cfg := buildTestConfig(t, tokenEnv)
 	// buildUpstreams reuses the *url.URL Validate() parsed onto each
 	// Upstream (R1) rather than re-parsing BaseURL itself, so Validate()
 	// must run first here — exactly as runServe already does via
@@ -75,5 +88,44 @@ func TestBuildUpstreams(t *testing.T) {
 	}
 	if got := upstreams["git.internal.example"].String(); got != "https://git.internal.example:8443" {
 		t.Errorf(`upstreams["git.internal.example"] = %q, want %q`, got, "https://git.internal.example:8443")
+	}
+}
+
+// TestBuildCredentialSources mirrors TestBuildUpstreams for the
+// credential-source map: buildCredentialSources must reuse the
+// upstream.CredentialSource Validate() already built for each Upstream,
+// keyed by the same host.
+func TestBuildCredentialSources(t *testing.T) {
+	const tokenEnv = "HAYBALE_SERVE_TEST_TOKEN"
+	t.Setenv(tokenEnv, "test-token-value")
+	cfg := buildTestConfig(t, tokenEnv)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+
+	sources, err := buildCredentialSources(cfg)
+	if err != nil {
+		t.Fatalf("buildCredentialSources: %v", err)
+	}
+	if len(sources) != 2 {
+		t.Fatalf("len(sources) = %d, want 2", len(sources))
+	}
+	for _, host := range []string{"github.com", "git.internal.example"} {
+		if sources[host] == nil {
+			t.Errorf("sources[%q] = nil, want a CredentialSource", host)
+		}
+	}
+}
+
+// TestBuildCredentialSourcesRejectsUnvalidatedConfig asserts
+// buildCredentialSources fails loudly (rather than building a map with a
+// nil entry) if handed a Config whose Upstreams never went through
+// Validate() — mirroring buildUpstreams' own ParsedBaseURL nil check.
+func TestBuildCredentialSourcesRejectsUnvalidatedConfig(t *testing.T) {
+	cfg := &config.Config{
+		Upstreams: []config.Upstream{{Host: "github.com", BaseURL: "https://github.com"}},
+	}
+	if _, err := buildCredentialSources(cfg); err == nil {
+		t.Fatal("buildCredentialSources() = nil error, want an error for an unvalidated config")
 	}
 }
