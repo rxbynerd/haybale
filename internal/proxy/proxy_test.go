@@ -20,6 +20,7 @@ import (
 
 	"github.com/rxbynerd/haybale/internal/gitproto"
 	"github.com/rxbynerd/haybale/internal/identity"
+	"github.com/rxbynerd/haybale/internal/observability"
 	"github.com/rxbynerd/haybale/internal/policy"
 	"github.com/rxbynerd/haybale/internal/upstream"
 )
@@ -99,7 +100,7 @@ func mustNew(t *testing.T, upstreams map[string]*url.URL, authenticator identity
 // assert against.
 func mustNewWithCredentials(t *testing.T, upstreams map[string]*url.URL, credentialSources map[string]upstream.CredentialSource, authenticator identity.Authenticator, policyEngine policy.Engine, logger *slog.Logger) *Proxy {
 	t.Helper()
-	p, err := New(upstreams, credentialSources, authenticator, policyEngine, logger)
+	p, err := New(upstreams, credentialSources, authenticator, policyEngine, logger, observability.NewNoopMetrics())
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -954,7 +955,7 @@ func TestPolicyDenialNeverReachesUpstream(t *testing.T) {
 // reaches it.
 func TestNewRejectsNilAuthenticator(t *testing.T) {
 	upstreams := newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"})
-	p, err := New(upstreams, credentialsForHosts(upstreams), nil, allowAllPolicy{}, discardLogger())
+	p, err := New(upstreams, credentialsForHosts(upstreams), nil, allowAllPolicy{}, discardLogger(), observability.NewNoopMetrics())
 	if err == nil {
 		t.Fatal("New() = nil error, want an error for a nil authenticator")
 	}
@@ -971,7 +972,7 @@ func TestNewRejectsNilAuthenticator(t *testing.T) {
 // policy.Engine must also fail at construction time.
 func TestNewRejectsNilPolicyEngine(t *testing.T) {
 	upstreams := newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"})
-	p, err := New(upstreams, credentialsForHosts(upstreams), allowAllAuthenticator{}, nil, discardLogger())
+	p, err := New(upstreams, credentialsForHosts(upstreams), allowAllAuthenticator{}, nil, discardLogger(), observability.NewNoopMetrics())
 	if err == nil {
 		t.Fatal("New() = nil error, want an error for a nil policyEngine")
 	}

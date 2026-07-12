@@ -27,6 +27,7 @@ tls: { ... }               # optional, see "TLS" below
 identity: { ... }          # required, see "Identity" below
 policy: { ... }            # required, see "Policy" below
 upstreams: [ ... ]         # required, at least one entry, see "Upstreams" below
+telemetry: { ... }         # optional, OpenTelemetry export, see "Telemetry" below
 ```
 
 | Field          | Default  | Notes                                                                                                |
@@ -119,6 +120,78 @@ operator-configured cutoff, not a crash — it logs a clear warning
 exits through a distinct path (exit code `3`, no `Error:` prefix)
 immediately, rather than force-closing connections itself or exiting
 exactly like a startup/runtime failure would (exit code `1`).
+
+## Telemetry
+
+```yaml
+telemetry:
+  endpoint: "otel-collector:4317"   # required to enable; empty disables telemetry
+  protocol: grpc                     # optional, default shown: grpc|http/protobuf
+  environment: prod                  # optional, sets deployment.environment
+  serviceNamespace: haybale          # optional, sets service.namespace
+  headersEnv: OTEL_EXPORTER_OTLP_HEADERS  # optional, env var naming OTLP headers
+```
+
+The `telemetry` block turns on OpenTelemetry export of traces, metrics, and
+logs to an OTLP collector. It is entirely optional: **leaving it out (or
+leaving `endpoint` empty) disables telemetry**, and haybale runs exactly as
+it did before — the metric instruments become no-ops, no OTLP connection is
+dialled, and per-request logging stays stderr-only. What the enabled
+pipeline emits is described in [`observability.md`](observability.md).
+
+| Field              | Default   | Notes                                                                                   |
+|--------------------|-----------|-----------------------------------------------------------------------------------------|
+| `endpoint`         | (unset)   | OTLP collector endpoint. Empty disables telemetry. See the endpoint forms below.        |
+| `protocol`         | `grpc`    | OTLP wire protocol: `grpc` or `http/protobuf`. Any other value fails startup.           |
+| `environment`      | `local`   | `deployment.environment` resource label. Falls back to `OTEL_DEPLOYMENT_ENVIRONMENT`.   |
+| `serviceNamespace` | `haybale` | `service.namespace` resource label. Falls back to `OTEL_SERVICE_NAMESPACE`.             |
+| `headersEnv`       | (unset)   | Name of an env var holding OTLP request headers (see "Authenticating to the collector").|
+
+`endpoint` forms, matching the two protocols:
+
+- **grpc** — a bare `host:port` (e.g. `otel-collector:4317`) dialled without
+  TLS (the local-collector default), or an explicit `https://host:port` URL
+  to keep TLS on. A plain `http://` URL is also dialled without TLS.
+- **http/protobuf** — a base URL ending in the collector's OTLP prefix (e.g.
+  `https://otlp.example.com/otlp`); haybale appends the per-signal
+  `/v1/traces`, `/v1/metrics`, `/v1/logs` segments itself. TLS is on for an
+  `https://` URL and off for a plain `http://` or scheme-less one.
+
+`environment` and `serviceNamespace` are bounded to a short, safe character
+set (`[A-Za-z0-9._-]`, up to 64 chars); a value outside it — or a hostile
+`OTEL_*` env-var value — falls back to the default rather than reaching an
+exported batch verbatim.
+
+### Authenticating to the collector
+
+A managed collector usually needs an `Authorization` bearer token. As with
+a credential's `tokenEnv`, that secret is **never written inline in the
+config file** — set `headersEnv` to the name of an environment variable
+holding an `OTEL_EXPORTER_OTLP_HEADERS`-style value (a comma-separated
+`key=value` list), and haybale reads and forwards it to every OTLP exporter:
+
+```yaml
+telemetry:
+  endpoint: "https://otlp.example.com/otlp"
+  protocol: http/protobuf
+  headersEnv: HAYBALE_OTLP_HEADERS
+```
+
+```sh
+export HAYBALE_OTLP_HEADERS="authorization=Bearer <token>,x-tenant=acme"
+```
+
+The value is read from the environment at startup; it is never logged, and
+haybale's log scrubber would redact it even if a bug tried to.
+
+### Shutdown
+
+On `SIGTERM`/`SIGINT`, the telemetry pipelines are flushed and shut down
+*after* in-flight requests have drained (see "Graceful drain"), so the final
+spans, metrics, and logs of a run reach the collector. This flush is bounded
+by a short, fixed backstop (5s) so a collector that has gone away can never
+hold process exit open — unlike the data path, which deliberately sets no
+transfer timeout.
 
 ## Identity
 

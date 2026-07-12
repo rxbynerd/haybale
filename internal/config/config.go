@@ -93,6 +93,11 @@ type Config struct {
 	// first path segment of the host-in-path URL scheme
 	// (/{host}/{owner}/{repo}.git/<endpoint>).
 	Upstreams []Upstream `yaml:"upstreams"`
+	// Telemetry optionally configures OpenTelemetry export (traces,
+	// metrics, logs) to an OTLP collector. Leaving it empty (no endpoint)
+	// disables telemetry entirely: haybale emits nothing over OTLP and the
+	// metric instruments become no-ops.
+	Telemetry TelemetryConfig `yaml:"telemetry"`
 
 	// parsedDrainTimeout caches the time.Duration Validate() parsed from
 	// DrainTimeout, for the same reuse-not-reparse reason
@@ -299,6 +304,75 @@ type CredentialConfig struct {
 	APIBaseURL string `yaml:"apiBaseURL"`
 }
 
+// otlpProtocolGRPC and otlpProtocolHTTP are the two OTLP wire protocols
+// Telemetry.Protocol accepts (an empty value means grpc). They are string
+// literals here rather than an import of internal/observability's own
+// ProtocolGRPC/ProtocolHTTP constants deliberately: keeping config free of
+// the OpenTelemetry SDK dependency means a production build of
+// internal/config — and every package that imports it — does not pull in
+// the otel module graph. cmd/haybale/cmd/serve.go is the single seam that
+// bridges this config into internal/observability. If these values ever
+// diverge from observability's ProtocolGRPC/ProtocolHTTP, the (test-only)
+// round-trip check TestOTLPProtocolConstantsMatchObservability in
+// telemetry_test.go fails.
+const (
+	otlpProtocolGRPC = "grpc"
+	otlpProtocolHTTP = "http/protobuf"
+)
+
+// TelemetryConfig configures haybale's OpenTelemetry (OTLP) export. It is
+// entirely optional: when Endpoint is empty the whole block is inert and
+// haybale runs exactly as it did before telemetry existed.
+type TelemetryConfig struct {
+	// Endpoint is the OTLP collector endpoint. For grpc it is a host:port
+	// (e.g. "localhost:4317") or an explicit http(s):// URL; for
+	// http/protobuf it is a base URL (e.g. "https://otlp.example.com/otlp").
+	// Empty disables telemetry.
+	Endpoint string `yaml:"endpoint"`
+	// Protocol selects the OTLP wire protocol: "grpc" (the default when
+	// empty) or "http/protobuf".
+	Protocol string `yaml:"protocol"`
+	// Environment sets deployment.environment on every exported span,
+	// metric, and log. Defaults (in internal/observability) to the
+	// OTEL_DEPLOYMENT_ENVIRONMENT env var, then to "local".
+	Environment string `yaml:"environment"`
+	// ServiceNamespace sets service.namespace. Defaults (in
+	// internal/observability) to the OTEL_SERVICE_NAMESPACE env var, then
+	// to "haybale".
+	ServiceNamespace string `yaml:"serviceNamespace"`
+	// HeadersEnv names an environment variable whose value is an
+	// OTEL_EXPORTER_OTLP_HEADERS-style comma-separated "key=value" list of
+	// OTLP request headers (typically an Authorization bearer token for a
+	// managed collector). Like a credential's tokenEnv, the secret is read
+	// from the environment, never written inline in this file — an inline
+	// Headers field is deliberately absent so a bearer token cannot end up
+	// committed to a config file. Empty means no OTLP headers.
+	HeadersEnv string `yaml:"headersEnv"`
+}
+
+// Enabled reports whether telemetry is configured at all (a non-empty
+// Endpoint).
+func (t TelemetryConfig) Enabled() bool { return t.Endpoint != "" }
+
+// validate fail-fasts on a telemetry block that names an unsupported
+// protocol, so a typo'd protocol is caught at startup rather than on the
+// first export attempt. A disabled block (empty Endpoint) is always valid;
+// Environment/ServiceNamespace are not rejected for bad characters here
+// (internal/observability sanitises them to the documented defaults), and
+// HeadersEnv is resolved in serve.go, so nothing else needs validating at
+// config time.
+func (t TelemetryConfig) validate() error {
+	if !t.Enabled() {
+		return nil
+	}
+	switch t.Protocol {
+	case "", otlpProtocolGRPC, otlpProtocolHTTP:
+	default:
+		return fmt.Errorf("telemetry: protocol %q is not supported (must be %q or %q)", t.Protocol, otlpProtocolGRPC, otlpProtocolHTTP)
+	}
+	return nil
+}
+
 // LoadOption customises the Config Load parses, applied after the YAML
 // file is unmarshalled but before applyDefaults/Validate run — the seam
 // a CLI flag uses to override a value that would otherwise come from the
@@ -491,6 +565,10 @@ func (c *Config) Validate() error {
 		return err
 	}
 	c.Policy.engine = engine
+
+	if err := c.Telemetry.validate(); err != nil {
+		return err
+	}
 
 	return nil
 }

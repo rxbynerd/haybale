@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/rxbynerd/haybale/internal/identity"
+	"github.com/rxbynerd/haybale/internal/observability"
 	"github.com/rxbynerd/haybale/internal/policy"
 	"github.com/rxbynerd/haybale/internal/proxy"
 	"github.com/rxbynerd/haybale/internal/upstream"
@@ -70,7 +71,7 @@ func repoKey(host, owner, name string) string {
 // this harness's other constructors.
 func mustNewProxy(t *testing.T, upstreams map[string]*url.URL, credentialSources map[string]upstream.CredentialSource, authenticator identity.Authenticator, policyEngine policy.Engine, logger *slog.Logger) *proxy.Proxy {
 	t.Helper()
-	p, err := proxy.New(upstreams, credentialSources, authenticator, policyEngine, logger)
+	p, err := proxy.New(upstreams, credentialSources, authenticator, policyEngine, logger, observability.NewNoopMetrics())
 	if err != nil {
 		t.Fatalf("proxy.New() error = %v", err)
 	}
