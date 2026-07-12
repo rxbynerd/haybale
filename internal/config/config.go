@@ -171,7 +171,7 @@ const credentialTypeStatic = "static"
 // that always errors (mapped to 502 by internal/proxy, same as any other
 // credential-source failure), rather than this package half-building
 // GitHubAppSource's mint/cache logic ahead of that milestone.
-const credentialTypeGitHubApp = "github-app"
+const credentialTypeGitHubApp = "github-app" //nolint:gosec // G101: this is a config-type discriminator string, not a credential value
 
 // defaultStaticUsername is the Basic-auth username a "static" credential
 // uses when Username is left empty in the YAML. x-access-token is

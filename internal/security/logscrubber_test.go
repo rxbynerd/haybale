@@ -24,7 +24,7 @@ func TestScrub(t *testing.T) {
 			wantGone: []string{"haybale-secret-token-value"},
 			wantKept: []string{"Authorization:"},
 		},
-		{
+		{ //nolint:gosec // G101: fake test fixture exercising Scrub's url_userinfo pattern, not a real credential
 			name:     "url with embedded userinfo",
 			input:    `cloning https://x-access-token:ghs_supersecrettoken@github.com/acme/widgets.git`,
 			wantGone: []string{"ghs_supersecrettoken", "x-access-token:ghs_supersecrettoken@"},
@@ -42,7 +42,7 @@ func TestScrub(t *testing.T) {
 			wantGone: []string{"ghs_abcdEFGH1234567890"},
 			wantKept: []string{"minted", "for repo"},
 		},
-		{
+		{ //nolint:gosec // G101: fake test fixture exercising Scrub's pem_private_key pattern, not a real key
 			name:     "pem private key",
 			input:    "-----BEGIN RSA PRIVATE KEY-----\nMIIBogIBAAJ...\n-----END RSA PRIVATE KEY-----",
 			wantGone: []string{"-----BEGIN RSA PRIVATE KEY-----"},

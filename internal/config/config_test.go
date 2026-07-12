@@ -24,7 +24,7 @@ const fakeTokenDigest = "sha256:" + "11" + "22" + "33" + "44" + "55" + "66" + "7
 // that needs Validate() (or Load()) to succeed sets it via t.Setenv, so
 // buildCredentialSource's "environment variable is unset or empty" check
 // passes without needing a real upstream credential.
-const testTokenEnv = "HAYBALE_CONFIG_TEST_TOKEN"
+const testTokenEnv = "HAYBALE_CONFIG_TEST_TOKEN" //nolint:gosec // G101: this is an environment-variable name, not a credential value
 
 // testTokenEnvValue is the value testTokenEnv is set to wherever a valid
 // static credential is needed; its exact contents are never asserted on.
@@ -272,7 +272,7 @@ func TestValidate(t *testing.T) {
 					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
 					Policy:   PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{
-						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
+						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{ //nolint:gosec // G101: TokenEnv below is an environment-variable name (deliberately never set), not a credential value
 							Type: credentialTypeStatic, TokenEnv: "HAYBALE_CONFIG_TEST_DEFINITELY_UNSET",
 						}},
 					},

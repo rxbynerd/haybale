@@ -65,7 +65,7 @@ func buildTestConfig(t *testing.T, tokenEnv string) *config.Config {
 }
 
 func TestBuildUpstreams(t *testing.T) {
-	const tokenEnv = "HAYBALE_SERVE_TEST_TOKEN"
+	const tokenEnv = "HAYBALE_SERVE_TEST_TOKEN" //nolint:gosec // G101: this is an environment-variable *name*, not a credential value — the actual test token is the separate, non-secret literal passed to t.Setenv below
 	t.Setenv(tokenEnv, "test-token-value")
 	cfg := buildTestConfig(t, tokenEnv)
 	// buildUpstreams reuses the *url.URL Validate() parsed onto each
@@ -96,7 +96,7 @@ func TestBuildUpstreams(t *testing.T) {
 // upstream.CredentialSource Validate() already built for each Upstream,
 // keyed by the same host.
 func TestBuildCredentialSources(t *testing.T) {
-	const tokenEnv = "HAYBALE_SERVE_TEST_TOKEN"
+	const tokenEnv = "HAYBALE_SERVE_TEST_TOKEN" //nolint:gosec // G101: this is an environment-variable *name*, not a credential value — the actual test token is the separate, non-secret literal passed to t.Setenv below
 	t.Setenv(tokenEnv, "test-token-value")
 	cfg := buildTestConfig(t, tokenEnv)
 	if err := cfg.Validate(); err != nil {

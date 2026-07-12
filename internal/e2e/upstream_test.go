@@ -17,7 +17,7 @@ import (
 // that happened to work because the upstream never checked anything.
 const (
 	upstreamBasicAuthUsername = "x-access-token"
-	upstreamBasicAuthToken    = "e2e-upstream-token"
+	upstreamBasicAuthToken    = "e2e-upstream-token" //nolint:gosec // G101: a fixed, fake test-only credential this package's own fake upstream requires — never a real secret
 )
 
 // headerRecorder captures headers seen on the first request the
