@@ -35,13 +35,19 @@ const defaultListen = ":8466"
 const defaultLogLevel = "info"
 
 // defaultDrainTimeout is used when DrainTimeout is left empty in the
-// YAML: a few minutes is generous for even a large git clone/push to
-// finish streaming once a graceful shutdown begins, while still giving
-// an operator a backstop against a connection that never completes on
-// its own (a stalled client, not a legitimate large transfer). An
-// operator who wants to wait indefinitely instead sets drainTimeout to
-// "0s" explicitly — see DrainTimeout's doc comment.
-const defaultDrainTimeout = "2m"
+// YAML: "0s", i.e. wait indefinitely. This matches the rest of the
+// server's own design — no read/write/idle timeout anywhere, because
+// pack transfers can run to gigabytes and take arbitrarily long (see
+// readHeaderTimeout's doc comment in cmd/haybale/cmd/serve.go) — so a
+// finite default here would silently reintroduce exactly the cap on
+// transfer duration the rest of the design deliberately avoids. An
+// operator who wants a backstop against a connection that never
+// completes on its own sets drainTimeout to a finite duration (e.g.
+// "2m") explicitly, accepting that it may cut off a legitimate
+// but-slower-than-that transfer — see DrainTimeout's doc comment and
+// cmd/haybale/cmd/serve.go's serveWithGracefulDrain for what happens
+// when that finite bound is reached.
+const defaultDrainTimeout = "0s"
 
 // validLogLevels is the closed set of log/slog levels haybale accepts.
 var validLogLevels = map[string]bool{
@@ -67,11 +73,16 @@ type Config struct {
 	TLS TLSConfig `yaml:"tls"`
 	// DrainTimeout bounds how long a graceful shutdown (SIGTERM/SIGINT)
 	// waits for in-flight requests — a large git clone/push in particular
-	// — to finish before the server forcibly closes them. A Go duration
-	// string, e.g. "2m". Defaults to defaultDrainTimeout when empty; set
-	// explicitly to "0s" for an unbounded wait (Shutdown blocks until
-	// every in-flight request finishes on its own, however long that
-	// takes).
+	// — to finish before the process exits anyway. A Go duration string,
+	// e.g. "2m". Defaults to "0s" (wait indefinitely — see
+	// defaultDrainTimeout) when left empty, matching the rest of the
+	// server's no-read/write/idle-timeout design. Set explicitly to a
+	// finite duration to instead give shutdown a deliberate backstop: if
+	// that bound is reached before every in-flight request finished on
+	// its own, cmd/haybale/cmd/serve.go's serveWithGracefulDrain treats
+	// it as an intentional, operator-configured cutoff (a distinct,
+	// clearly-logged exit path) rather than force-closing connections
+	// itself or crashing.
 	DrainTimeout string `yaml:"drainTimeout"`
 	// Identity configures how haybale authenticates inbound requests.
 	Identity IdentityConfig `yaml:"identity"`

@@ -22,18 +22,18 @@ listed here, haybale doesn't read it.
 ```yaml
 listen: ":8466"          # optional, default shown
 logLevel: info            # optional, default shown: debug|info|warn|error
-drainTimeout: 2m           # optional, default shown
+drainTimeout: 0s           # optional, default shown (0s = wait indefinitely)
 tls: { ... }               # optional, see "TLS" below
 identity: { ... }          # required, see "Identity" below
 policy: { ... }            # required, see "Policy" below
 upstreams: [ ... ]         # required, at least one entry, see "Upstreams" below
 ```
 
-| Field          | Default  | Notes                                                                                 |
-|----------------|----------|----------------------------------------------------------------------------------------|
-| `listen`       | `:8466`  | Address `net/http.Server` binds to.                                                     |
-| `logLevel`     | `info`   | One of `debug`, `info`, `warn`, `error` (case-insensitive).                             |
-| `drainTimeout` | `2m`     | Go duration string bounding graceful shutdown. `0s` explicitly means wait indefinitely. |
+| Field          | Default  | Notes                                                                                                |
+|----------------|----------|-------------------------------------------------------------------------------------------------------|
+| `listen`       | `:8466`  | Address `net/http.Server` binds to.                                                                   |
+| `logLevel`     | `info`   | One of `debug`, `info`, `warn`, `error` (case-insensitive).                                            |
+| `drainTimeout` | `0s`     | Go duration string bounding graceful shutdown. `0s` (the default) means wait indefinitely — see "Graceful drain" below. |
 
 `logLevel` controls the `log/slog` level haybale logs at. Every log line
 — including request logs and security events — passes through a
@@ -97,12 +97,23 @@ On either signal, haybale:
    still streaming in particular — finish completely, rather than
    cutting it off mid-transfer.
 
-`drainTimeout` bounds step 2 only. The default, `2m`, is generous for
-even a large clone/push to finish once shutdown begins while still
-giving a backstop against a connection that never completes on its own.
-Set `drainTimeout: 0s` explicitly to wait indefinitely instead (no
-backstop at all — Shutdown blocks until every in-flight request finishes
-on its own).
+`drainTimeout` bounds step 2 only. The default, `0s`, means **wait
+indefinitely**: `Shutdown` blocks until every in-flight request finishes
+on its own, however long that takes — matching haybale's own
+no-read/write/idle-timeout design (pack transfers can run to gigabytes
+and take arbitrarily long, so a finite default here would silently
+reintroduce exactly the cap that design otherwise avoids).
+
+Set `drainTimeout` to a finite duration (e.g. `2m`) to instead give
+shutdown a deliberate backstop against a connection that never completes
+on its own. Doing so accepts a real tradeoff: a legitimate transfer
+slower than that bound is cut off too. If the bound is reached before
+every in-flight request finished, haybale treats this as an intentional,
+operator-configured cutoff, not a crash — it logs a clear warning
+(`drainTimeout exceeded before every in-flight request finished...`) and
+exits through a distinct path (exit code `3`, no `Error:` prefix)
+immediately, rather than force-closing connections itself or exiting
+exactly like a startup/runtime failure would (exit code `1`).
 
 ## Identity
 
@@ -284,7 +295,7 @@ logLevel: info
 tls:
   certPath: /etc/haybale/tls/tls.crt
   keyPath: /etc/haybale/tls/tls.key
-drainTimeout: 2m
+drainTimeout: 2m   # optional; omit entirely to wait indefinitely instead (the default)
 
 identity:
   type: static-token-file

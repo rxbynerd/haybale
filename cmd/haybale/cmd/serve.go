@@ -50,7 +50,7 @@ func init() {
 	serveCmd.Flags().StringVar(&configPath, "config", "haybale.yaml", "path to haybale's YAML config file")
 	serveCmd.Flags().StringVar(&tlsCertPathFlag, "tls-cert-path", "", "path to a PEM certificate; overrides tls.certPath in the config file")
 	serveCmd.Flags().StringVar(&tlsKeyPathFlag, "tls-key-path", "", "path to the PEM private key matching --tls-cert-path; overrides tls.keyPath in the config file")
-	serveCmd.Flags().StringVar(&drainTimeoutFlag, "drain-timeout", "", `bounds how long graceful shutdown waits for in-flight requests to finish, e.g. "2m" ("0s" for unbounded); overrides drainTimeout in the config file`)
+	serveCmd.Flags().StringVar(&drainTimeoutFlag, "drain-timeout", "", `bounds how long graceful shutdown waits for in-flight requests to finish, e.g. "2m" ("0s", the default, waits indefinitely); overrides drainTimeout in the config file`)
 	rootCmd.AddCommand(serveCmd)
 }
 
@@ -181,6 +181,25 @@ func newServer(cfg *config.Config, handler http.Handler) (srv *http.Server, list
 	return srv, func() error { return srv.ListenAndServeTLS("", "") }, "https", nil
 }
 
+// ErrDrainTimeoutExceeded is returned by serveWithGracefulDrain (and so
+// propagates through runServe to Execute in root.go) when an operator
+// -configured, finite drainTimeout expires before every in-flight
+// request finished draining on its own. This is a deliberate, expected
+// consequence of that configuration choice — not a crash — so Execute
+// special-cases it: a distinct exit code and no "Error:" prefix, rather
+// than the generic startup/runtime-error path, so on-call tooling keyed
+// off either signal doesn't misread a configured cutoff as a failure.
+// The full detail (that the timeout fired, and its configured value) is
+// already logged as a Warn at the point serveWithGracefulDrain detects
+// it, since Execute has no logger of its own.
+//
+// Unreachable when drainTimeout is <= 0 (the default — see
+// defaultDrainTimeout in internal/config): srv.Shutdown is only ever
+// given a context.WithTimeout, and so can only return
+// context.DeadlineExceeded, when a finite drainTimeout was explicitly
+// configured.
+var ErrDrainTimeoutExceeded = errors.New("drain timeout exceeded before all in-flight requests finished")
+
 // serveWithGracefulDrain runs listenAndServe (srv.ListenAndServe or the
 // srv.ListenAndServeTLS closure runServe built, already bound to srv)
 // until either it returns on its own or ctx is done — a SIGTERM/SIGINT
@@ -189,14 +208,30 @@ func newServer(cfg *config.Config, handler http.Handler) (srv *http.Server, list
 // telling a load balancer to stop routing new traffic here), then calls
 // srv.Shutdown to stop accepting new connections while letting in-flight
 // requests — a large git clone/push in particular — finish streaming to
-// completion rather than being cut off mid-transfer. drainTimeout bounds
-// how long Shutdown waits for that; <= 0 means wait indefinitely, for
-// however long the slowest in-flight transfer takes to finish on its
-// own.
+// completion rather than being cut off mid-transfer.
+//
+// drainTimeout bounds how long Shutdown waits for that. <= 0 (the
+// default) means wait indefinitely, for however long the slowest
+// in-flight transfer takes to finish on its own — matching the rest of
+// the server's own no-read/write/idle-timeout design, since a finite
+// default here would silently reintroduce exactly the transfer-duration
+// cap that design otherwise avoids. When an operator has explicitly
+// configured a finite drainTimeout instead, and it is reached before
+// every in-flight request finished, that is treated as a deliberate,
+// operator-chosen cutoff: srv.Shutdown does not itself force-close the
+// connections still active at that point (it never has — see its own
+// doc comment), but this function does not wait any further either; it
+// logs a clear warning and returns ErrDrainTimeoutExceeded so the
+// process exits now, through Execute's own dedicated path for this
+// error, rather than looking like a crash. Any other, unexpected
+// Shutdown error (not a reached deadline) is still surfaced as a
+// generic error, since that is not a condition this function has a
+// deliberate story for.
 //
 // Extracted from runServe specifically so this logic is testable without
 // a real OS signal or a real TLS listener — see
-// TestServeWithGracefulDrainWaitsForInFlightRequest.
+// TestServeWithGracefulDrainWaitsForInFlightRequest/
+// TestServeWithGracefulDrainExceedsFiniteTimeout.
 func serveWithGracefulDrain(ctx context.Context, srv *http.Server, p *proxy.Proxy, drainTimeout time.Duration, listenAndServe func() error, logger *slog.Logger) error {
 	errCh := make(chan error, 1)
 	go func() { errCh <- listenAndServe() }()
@@ -218,7 +253,14 @@ func serveWithGracefulDrain(ctx context.Context, srv *http.Server, p *proxy.Prox
 			defer cancel()
 		}
 		shutdownErr := srv.Shutdown(shutdownCtx)
-		if shutdownErr != nil {
+		switch {
+		case shutdownErr == nil:
+			// Fully drained: every in-flight request finished on its own
+			// before drainTimeout (if any) elapsed.
+		case drainTimeout > 0 && errors.Is(shutdownErr, context.DeadlineExceeded):
+			logger.Warn("drainTimeout exceeded before every in-flight request finished; exiting now as a deliberate, operator-configured cutoff rather than waiting further — any connection still active will be terminated when the process exits", "drainTimeout", drainTimeout)
+			shutdownErr = ErrDrainTimeoutExceeded
+		default:
 			logger.Warn("graceful shutdown did not complete cleanly", "error", shutdownErr)
 		}
 

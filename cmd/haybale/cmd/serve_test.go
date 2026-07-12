@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -457,6 +458,138 @@ func TestServeWithGracefulDrainWaitsForInFlightRequest(t *testing.T) {
 	if conn, err := net.DialTimeout("tcp", ln.Addr().String(), time.Second); err == nil {
 		_ = conn.Close()
 		t.Error("net.DialTimeout succeeded after Shutdown returned, want connection refused")
+	}
+}
+
+// TestServeWithGracefulDrainExceedsFiniteTimeout exercises B1's
+// previously-untested branch: an operator-configured finite
+// drainTimeout reached before an in-flight request finishes on its own.
+// Before the fix, srv.Shutdown's context.DeadlineExceeded propagated
+// straight up through runServe to Execute's generic os.Exit(1),
+// hard-killing the process indistinguishably from a crash. Now,
+// serveWithGracefulDrain must instead log a clear warning and return
+// ErrDrainTimeoutExceeded promptly — not wait indefinitely for the
+// in-flight request, which is exactly the point of configuring a finite
+// timeout in the first place.
+func TestServeWithGracefulDrainExceedsFiniteTimeout(t *testing.T) {
+	release := make(chan struct{})
+	reachedUpstream := make(chan struct{})
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(reachedUpstream)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("partial-"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-release
+		_, _ = w.Write([]byte("rest"))
+	}))
+	defer upstreamSrv.Close()
+
+	upstreamURL, err := url.Parse(upstreamSrv.URL)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", upstreamSrv.URL, err)
+	}
+
+	const testID = "run-drain-timeout-test"
+	token, digestHex, err := identity.NewToken()
+	if err != nil {
+		t.Fatalf("identity.NewToken(): %v", err)
+	}
+	auth, err := identity.NewStaticTokenAuthenticator(map[string]string{testID: "sha256:" + digestHex})
+	if err != nil {
+		t.Fatalf("identity.NewStaticTokenAuthenticator(): %v", err)
+	}
+	eng, err := policy.NewGlobEngine([]policy.Rule{
+		{Identities: []string{testID}, Repos: []string{"host/owner/repo"}, Permissions: []policy.Permission{policy.PermissionRead}},
+	})
+	if err != nil {
+		t.Fatalf("policy.NewGlobEngine(): %v", err)
+	}
+	credSrc, err := upstream.NewStaticSource("x-access-token", "upstream-secret") //nolint:gosec // G101: fixed, fake test-only credential
+	if err != nil {
+		t.Fatalf("upstream.NewStaticSource(): %v", err)
+	}
+	p, err := proxy.New(map[string]*url.URL{"host": upstreamURL}, map[string]upstream.CredentialSource{"host": credSrc}, auth, eng, discardLogger())
+	if err != nil {
+		t.Fatalf("proxy.New(): %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	srv := &http.Server{Handler: p} //nolint:gosec // G112: same justification as TestServeWithGracefulDrainWaitsForInFlightRequest — this test's whole point is exercising Shutdown against a controlled localhost listener with a single client goroutine
+
+	// A real (non-discard) logger, mutex-free but safe here: only the
+	// serveWithGracefulDrain goroutine below ever writes to it, and this
+	// test only reads logBuf.String() after receiving from drainDone,
+	// which happens-after every log call serveWithGracefulDrain makes —
+	// see the log-buffer-race memory note for why that ordering matters.
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const shortDrainTimeout = 50 * time.Millisecond
+	drainDone := make(chan error, 1)
+	go func() {
+		drainDone <- serveWithGracefulDrain(ctx, srv, p, shortDrainTimeout, func() error { return srv.Serve(ln) }, logger)
+	}()
+
+	req, err := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/host/owner/repo.git/info/refs?service=git-upload-pack", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.SetBasicAuth("haybale-test", token)
+
+	reqDone := make(chan error, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			reqDone <- err
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		_, err = io.ReadAll(resp.Body)
+		reqDone <- err
+	}()
+
+	// Wait until the request is genuinely in flight, then simulate the
+	// SIGTERM/SIGINT runServe's signal.NotifyContext would have caught —
+	// exactly as TestServeWithGracefulDrainWaitsForInFlightRequest does.
+	// Unlike that test, release is never closed here before asserting on
+	// drainDone: the whole point of this test is that shortDrainTimeout
+	// elapses while the request is still genuinely stuck.
+	<-reachedUpstream
+	cancel()
+
+	select {
+	case err := <-drainDone:
+		if !errors.Is(err, ErrDrainTimeoutExceeded) {
+			t.Fatalf("serveWithGracefulDrain() error = %v, want ErrDrainTimeoutExceeded", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveWithGracefulDrain did not return within 5s of shortDrainTimeout elapsing — it must not wait indefinitely once a finite, configured drainTimeout is exceeded")
+	}
+
+	if !strings.Contains(logBuf.String(), "drainTimeout exceeded") {
+		t.Errorf("log output = %q, want a warning mentioning the exceeded drainTimeout", logBuf.String())
+	}
+
+	// Only now unblock the still-in-flight request: srv.Shutdown doesn't
+	// force-close it (see serveWithGracefulDrain's own doc comment), so
+	// it completes normally once release closes — proving
+	// ErrDrainTimeoutExceeded really was returned without waiting for
+	// it, not merely coincidentally soon before it finished anyway.
+	close(release)
+	select {
+	case err := <-reqDone:
+		if err != nil {
+			t.Errorf("in-flight request error = %v, want nil once unblocked", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("in-flight request did not complete after unblocking release")
 	}
 }
 
