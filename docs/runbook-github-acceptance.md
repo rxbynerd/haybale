@@ -90,7 +90,10 @@ The key at `HAYBALE_APP_KEY_PATH` must be `chmod 600` (see step 6 in
 [Section 1](#1-creating-a-github-app-for-this-skip-if-reusing-haybale-dev),
 which applies whether or not you created the App yourself) —
 `haybale serve` refuses to start otherwise (`internal/config.Validate()`,
-CWE-732).
+CWE-732). The script itself checks `just build`'s output, the container
+runtime, and `gh`'s presence/auth upfront, before minting a token or
+touching the scratch repo, so a missing precondition fails fast rather
+than after a real commit has already been pushed.
 
 ```
 HAYBALE_APP_KEY_PATH=/path/to/haybale-dev.private-key.pem just e2e-github

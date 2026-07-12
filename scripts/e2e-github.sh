@@ -25,6 +25,14 @@
 #      a channel entirely independent of haybale.
 #   5. Tears down haybale and the scratch config either way.
 #
+# Preconditions (checked upfront, before any side effect — minting a
+# token, starting haybale, or running the container): `just build` has
+# produced HAYBALE_BIN, a container runtime is on PATH (or podman's
+# known install location), and `gh` is on PATH and authenticated (used
+# only at step 4, but checked here so a missing/unauthenticated `gh`
+# fails fast instead of being discovered after a real commit has
+# already been pushed).
+#
 # Required env:
 #   HAYBALE_APP_KEY_PATH   path to the GitHub App's PEM private key.
 #
@@ -100,6 +108,20 @@ else
   exit 1
 fi
 echo "e2e-github: using container runtime: $runtime_bin"
+
+# gh is only actually used at the very end (step 4, the round-trip
+# confirmation independent of haybale), but checking it upfront, before
+# any side effect, means a missing/unauthenticated gh fails fast here
+# rather than being discovered only after a real commit has already
+# been minted-for and pushed to the real scratch repo.
+if ! command -v gh >/dev/null 2>&1; then
+  echo "e2e-github: 'gh' not found on PATH (needed for the round-trip confirmation in step 4)" >&2
+  exit 1
+fi
+if ! gh auth status >/dev/null 2>&1; then
+  echo "e2e-github: 'gh' is not authenticated (run 'gh auth login'); needed for the round-trip confirmation in step 4" >&2
+  exit 1
+fi
 
 repo_owner="${E2E_REPO%%/*}"
 repo_name="${E2E_REPO##*/}"
