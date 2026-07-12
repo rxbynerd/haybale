@@ -292,6 +292,25 @@ func TestValidate(t *testing.T) {
 			// minimal config" above, which leaves TLS entirely empty.
 		},
 		{
+			name: "tls keyPath is group/world readable",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				certPath, keyPath := writeTestTLSCertKeyFiles(t)
+				if err := os.Chmod(keyPath, 0o644); err != nil { //nolint:gosec // G302: deliberately group/world-readable — exercises checkKeyFileMode's rejection of exactly this mode
+					t.Fatalf("os.Chmod: %v", err)
+				}
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					TLS:       TLSConfig{CertPath: certPath, KeyPath: keyPath},
+					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "group- or world-readable",
+		},
+		{
 			name: "drainTimeout is not a valid duration",
 			cfg: func(t *testing.T) Config {
 				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
@@ -584,6 +603,28 @@ func TestValidate(t *testing.T) {
 			wantErr: "parse private key",
 		},
 		{
+			name: "credential github-app privateKeyPath is group/world readable",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				keyPath := writeTestRSAKeyFile(t)
+				if err := os.Chmod(keyPath, 0o644); err != nil { //nolint:gosec // G302: deliberately group/world-readable — exercises checkKeyFileMode's rejection of exactly this mode
+					t.Fatalf("os.Chmod: %v", err)
+				}
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:   PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{
+						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
+							Type: credentialTypeGitHubApp, AppID: 12345, PrivateKeyPath: keyPath,
+						}},
+					},
+				}
+			},
+			wantErr: "group- or world-readable",
+		},
+		{
 			name: "credential github-app valid shape",
 			cfg: func(t *testing.T) Config {
 				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
@@ -744,6 +785,38 @@ func TestValidate(t *testing.T) {
 				t.Fatalf("Validate() error = %q, want substring %q", err.Error(), tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestCheckKeyFileMode exercises checkKeyFileMode directly (in addition
+// to its two exercises through Validate() in TestValidate's "tls
+// keyPath is group/world readable" and "credential github-app
+// privateKeyPath is group/world readable" cases): a 0600 file passes, a
+// 0644 file is rejected (CWE-732), and a missing file is left for the
+// caller's own read/parse to report rather than reported here.
+func TestCheckKeyFileMode(t *testing.T) {
+	dir := t.TempDir()
+
+	ownerOnly := filepath.Join(dir, "owner-only.pem")
+	if err := os.WriteFile(ownerOnly, []byte("fake key material"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile: %v", err)
+	}
+	if err := checkKeyFileMode(ownerOnly); err != nil {
+		t.Errorf("checkKeyFileMode(0600 file) = %v, want nil", err)
+	}
+
+	worldReadable := filepath.Join(dir, "world-readable.pem")
+	if err := os.WriteFile(worldReadable, []byte("fake key material"), 0o644); err != nil { //nolint:gosec // G306: deliberately group/world-readable — exercises checkKeyFileMode's rejection of exactly this mode
+		t.Fatalf("os.WriteFile: %v", err)
+	}
+	if err := checkKeyFileMode(worldReadable); err == nil {
+		t.Error("checkKeyFileMode(0644 file) = nil, want an error")
+	} else if !strings.Contains(err.Error(), "group- or world-readable") {
+		t.Errorf("checkKeyFileMode(0644 file) error = %q, want substring %q", err.Error(), "group- or world-readable")
+	}
+
+	if err := checkKeyFileMode(filepath.Join(dir, "does-not-exist.pem")); err != nil {
+		t.Errorf("checkKeyFileMode(missing file) = %v, want nil (left to the caller's own read/parse to report)", err)
 	}
 }
 

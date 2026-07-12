@@ -75,6 +75,11 @@ is missing, unreadable, or the pair doesn't match. It then serves HTTPS
 (`http.Server.ListenAndServeTLS`) with `tls.Config.MinVersion` pinned to
 TLS 1.2.
 
+`keyPath` must not be group- or world-readable: Validate() also stats
+the key file and fails startup if its mode has any group or other
+permission bit set (CWE-732). `chmod 600` (owner read/write only) before
+pointing `keyPath` at it.
+
 TLS (or its absence) never changes the server's read/write timeout
 behaviour: haybale sets `ReadHeaderTimeout: 10s` (bounding only how long
 the server waits to read a request's headers) and deliberately no
@@ -272,7 +277,10 @@ per-request and scoped to the minimum needed:
 - `appID` (required): the GitHub App's ID.
 - `privateKeyPath` (required): path to the App's PEM-encoded RSA private
   key. Read and parsed once, at startup — a missing file or one that
-  isn't a valid RSA key fails startup immediately.
+  isn't a valid RSA key fails startup immediately. The file must not be
+  group- or world-readable either (same CWE-732 check `tls.keyPath`
+  gets, and for the same reason): `chmod 600` it before pointing
+  `privateKeyPath` at it.
 - `apiBaseURL` (optional, default `https://api.github.com`): override for
   a GitHub Enterprise Server instance, e.g. `https://ghe.example.com/api/v3`.
 

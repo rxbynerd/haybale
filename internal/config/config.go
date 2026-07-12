@@ -391,6 +391,13 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("tls: certPath and keyPath must both be set, or both left empty")
 	}
 	if c.TLS.CertPath != "" {
+		// Checked before the key is ever read: a private key file that's
+		// group- or world-readable is a misconfiguration (CWE-732) worth
+		// failing fast on, the same as a missing or malformed one — see
+		// checkKeyFileMode's doc comment.
+		if err := checkKeyFileMode(c.TLS.KeyPath); err != nil {
+			return fmt.Errorf("tls: keyPath: %w", err)
+		}
 		// Loaded (not merely stat'd) here, at Validate() time, for the
 		// same fail-fast-at-startup reason the github-app credential's
 		// privateKeyPath is read and parsed here rather than deferred to
@@ -488,6 +495,42 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// keyFileModeMask is the set of permission bits (group and other, all of
+// read/write/execute) that must all be unset on a private key file —
+// i.e. the file must be readable/writable by its owner only. 0600 and
+// 0400 both satisfy this; 0640, 0644, 0666, etc. do not.
+const keyFileModeMask = 0o077
+
+// checkKeyFileMode fail-fasts (CWE-732) if the file at path is group- or
+// world-readable (or writable/executable): a TLS private key or GitHub
+// App private key left at a permissive mode — e.g. a ConfigMap-as-file
+// mount's default, or an operator's stray `chmod 644` while debugging —
+// is exactly the class of misconfiguration this package's
+// fail-fast-at-startup philosophy exists to catch before haybale ever
+// serves traffic, the same way a missing or malformed key file already
+// does. This matters most ahead of M6, the first milestone where a real
+// GitHub App private key is used against a live GitHub App.
+//
+// A file that doesn't exist or can't be stat'd is not reported here —
+// that error is left to the caller's own subsequent read/parse of the
+// file, which already produces an established, tested error message for
+// that case; this check only adds a new failure mode for a file that
+// exists but is too permissive.
+//
+// This is a POSIX permission-bits check; haybale targets Linux/container
+// deployments (see Dockerfile), so no Windows-specific fallback is
+// implemented.
+func checkKeyFileMode(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil //nolint:nilerr // intentional: see doc comment above
+	}
+	if perm := info.Mode().Perm(); perm&keyFileModeMask != 0 {
+		return fmt.Errorf("%q has mode %04o, which is group- or world-readable; chmod 600 (owner read/write only) before starting haybale", path, perm)
+	}
+	return nil
+}
+
 // buildCredentialSource validates u.Credential and, on success, builds
 // the upstream.CredentialSource it describes into u.credentialSource.
 // i is the upstream's index, used only to prefix error messages the same
@@ -533,6 +576,14 @@ func buildCredentialSource(i int, u *Upstream) error {
 		}
 		if u.Credential.PrivateKeyPath == "" {
 			return fmt.Errorf("%s: privateKeyPath is required for type %q", prefix, credentialTypeGitHubApp)
+		}
+		// Checked before the key is ever read, for the same CWE-732
+		// reason the TLS key path is checked in Validate() — see
+		// checkKeyFileMode's doc comment. Worth having in place before
+		// M6, the first milestone that mints real GitHub tokens from
+		// this file.
+		if err := checkKeyFileMode(u.Credential.PrivateKeyPath); err != nil {
+			return fmt.Errorf("%s: privateKeyPath: %w", prefix, err)
 		}
 		// The private key is read and parsed here, at Validate() time,
 		// rather than deferred to the first mint attempt: a missing file
