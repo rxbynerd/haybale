@@ -87,6 +87,14 @@ func TestNewStaticTokenAuthenticator(t *testing.T) {
 			digests: map[string]string{"run-1": "sha256:deadbeef"},
 			wantErr: "must be a sha256 digest",
 		},
+		{
+			name: "duplicate digest across different identities",
+			digests: map[string]string{
+				"run-1": validDigest,
+				"run-2": validDigest,
+			},
+			wantErr: "already used by identity",
+		},
 	}
 
 	for _, tt := range tests {
@@ -185,6 +193,16 @@ func TestLoadStaticTokenAuthenticator(t *testing.T) {
 		_, err := LoadStaticTokenAuthenticator(path)
 		if err == nil || !strings.Contains(err.Error(), "must be prefixed") {
 			t.Fatalf("LoadStaticTokenAuthenticator() error = %v, want substring %q", err, "must be prefixed")
+		}
+	})
+
+	t.Run("duplicate tokenDigest across different ids", func(t *testing.T) {
+		digest := digestFor("shared-token")
+		path := write(t, "identities:\n  - id: run-1\n    tokenDigest: "+digest+
+			"\n  - id: run-2\n    tokenDigest: "+digest+"\n")
+		_, err := LoadStaticTokenAuthenticator(path)
+		if err == nil || !strings.Contains(err.Error(), "already used by identity") {
+			t.Fatalf("LoadStaticTokenAuthenticator() error = %v, want substring %q", err, "already used by identity")
 		}
 	})
 }

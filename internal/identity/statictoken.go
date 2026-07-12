@@ -58,12 +58,22 @@ type StaticTokenAuthenticator struct {
 // "sha256:<hex>" form identities.yaml stores. It validates every digest
 // decodes to exactly a SHA-256-sized digest, failing fast on a
 // malformed entry rather than deferring the error to the first
-// authentication attempt that happens to reach it.
+// authentication attempt that happens to reach it. It also rejects two
+// identities sharing the same digest: Authenticate resolves a presented
+// token by ranging over a map (randomized iteration order), so a
+// duplicate digest would otherwise make identity resolution — and every
+// policy/audit decision downstream of it — nondeterministic across
+// requests for the same physical credential.
 func NewStaticTokenAuthenticator(digestsByID map[string]string) (*StaticTokenAuthenticator, error) {
 	if len(digestsByID) == 0 {
 		return nil, fmt.Errorf("identity: at least one identity is required")
 	}
 	digests := make(map[string][]byte, len(digestsByID))
+	// seenBy maps a digest's hex encoding to the first identity ID that
+	// claimed it, so a later collision can name both sides in the error
+	// without ever storing or logging the raw token that produced the
+	// digest.
+	seenBy := make(map[string]string, len(digestsByID))
 	for id, raw := range digestsByID {
 		if id == "" {
 			return nil, fmt.Errorf("identity: id is required")
@@ -72,6 +82,11 @@ func NewStaticTokenAuthenticator(digestsByID map[string]string) (*StaticTokenAut
 		if err != nil {
 			return nil, fmt.Errorf("identity: id %q: %w", id, err)
 		}
+		digestHex := hex.EncodeToString(digest)
+		if owner, dup := seenBy[digestHex]; dup {
+			return nil, fmt.Errorf("identity: id %q: tokenDigest %s%s already used by identity %q", id, digestPrefix, digestHex, owner)
+		}
+		seenBy[digestHex] = id
 		digests[id] = digest
 	}
 	return &StaticTokenAuthenticator{digests: digests}, nil
