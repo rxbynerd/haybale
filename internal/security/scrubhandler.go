@@ -63,10 +63,21 @@ func (h *ScrubHandler) WithGroup(name string) slog.Handler {
 	return &ScrubHandler{inner: h.inner.WithGroup(name)}
 }
 
-// scrubAttr scrubs a's value when it's a string, recursing into group
-// attrs; every other Kind (int, bool, time, ...) is returned unchanged,
-// since Scrub only ever operates on strings.
+// scrubAttr scrubs a's value when it's a string, recurses into group
+// attrs, and scrubs the string form of a KindAny value (e.g. a raw
+// `error` passed as a log attribute, whose secret-bearing Error() text
+// would otherwise reach the sink untouched via the underlying handler's
+// %v-equivalent rendering). A slog.KindLogValuer value is resolved via
+// Value.Resolve() before any of the above runs, so a LogValuer can't
+// smuggle a secret past the scrubber by deferring its own string
+// conversion — Resolve() recurses until the concrete Kind is known,
+// exactly like slog's own handlers do internally.
+//
+// Every remaining Kind (int, bool, time, duration, ...) is returned
+// unchanged, since Scrub only ever operates on strings and none of these
+// kinds can carry one.
 func scrubAttr(a slog.Attr) slog.Attr {
+	a.Value = a.Value.Resolve()
 	switch a.Value.Kind() {
 	case slog.KindString:
 		return slog.Attr{Key: a.Key, Value: slog.StringValue(Scrub(a.Value.String()))}
@@ -77,6 +88,8 @@ func scrubAttr(a slog.Attr) slog.Attr {
 			scrubbed[i] = scrubAttr(ga)
 		}
 		return slog.Attr{Key: a.Key, Value: slog.GroupValue(scrubbed...)}
+	case slog.KindAny:
+		return slog.Attr{Key: a.Key, Value: slog.StringValue(Scrub(a.Value.String()))}
 	default:
 		return a
 	}

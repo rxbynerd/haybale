@@ -3,6 +3,7 @@ package security
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -81,6 +82,58 @@ func TestScrubHandlerLeavesNonStringAttrsUnchanged(t *testing.T) {
 	}
 	if !strings.Contains(line, `"bytesIn":4096`) {
 		t.Errorf("log line = %q, want numeric bytesIn preserved", line)
+	}
+}
+
+// TestScrubHandlerRedactsRawErrorAttr exercises the H3 fix: a raw error
+// passed as a log attribute (rather than err.Error()) has slog.Kind
+// KindAny, which scrubAttr previously returned unmodified — the
+// underlying handler still renders it via its %v-equivalent path, so any
+// secret in the error's string form reached the sink unredacted. A
+// future contributor reaching for `"err", err` out of habit (e.g. in
+// M4's GitHubAppSource, wrapping a ghinstallation/HTTP error from a real
+// GitHub API call) must not bypass the scrubber this way.
+func TestScrubHandlerRedactsRawErrorAttr(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(NewScrubHandler(slog.NewJSONHandler(&buf, nil)))
+
+	logger.Warn("mint failed", "err", fmt.Errorf("upstream said: %s", "ghs_abc123leaked"))
+
+	line := buf.String()
+	if strings.Contains(line, "ghs_abc123leaked") {
+		t.Errorf("log line = %q, must not contain the raw token from a logged error's Error() text", line)
+	}
+	if !strings.Contains(line, "[REDACTED]") {
+		t.Errorf("log line = %q, want the redaction placeholder", line)
+	}
+}
+
+// secretLogValuer is a minimal slog.LogValuer whose LogValue() returns a
+// secret-bearing string, standing in for a hypothetical type that defers
+// its own string rendering until logging time.
+type secretLogValuer struct{ secret string }
+
+func (v secretLogValuer) LogValue() slog.Value {
+	return slog.StringValue("token=" + v.secret)
+}
+
+// TestScrubHandlerRedactsLogValuer exercises the other half of the H3
+// fix: an attribute built from a slog.LogValuer has Kind() ==
+// KindLogValuer until resolved, which also fell through scrubAttr's
+// default branch unscrubbed before this fix. scrubAttr must resolve it
+// via Value.Resolve() before deciding how to scrub it.
+func TestScrubHandlerRedactsLogValuer(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(NewScrubHandler(slog.NewJSONHandler(&buf, nil)))
+
+	logger.Warn("minted", "cred", secretLogValuer{secret: "ghp_abcdEFGH1234567890"})
+
+	line := buf.String()
+	if strings.Contains(line, "ghp_abcdEFGH1234567890") {
+		t.Errorf("log line = %q, must not contain the raw token from an unresolved LogValuer", line)
+	}
+	if !strings.Contains(line, "[REDACTED]") {
+		t.Errorf("log line = %q, want the redaction placeholder", line)
 	}
 }
 
