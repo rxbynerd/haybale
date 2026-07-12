@@ -242,35 +242,43 @@ process.
 
 ```
 e2e-github: using container runtime: podman
-e2e-github: minting identity token for run-e2e-1783866764-70240
-e2e-github: starting haybale serve on :8466
-e2e-github: haybale is healthy (pid 70271)
+e2e-github: minting identity token for run-e2e-1783869513-82250
+e2e-github: starting haybale serve on :8650
+e2e-github: haybale is healthy (pid 82270)
 e2e-github: running credential-less container (podman, image docker.io/alpine/git)
 == container: git version ==
 git version 2.54.0
 == container: configuring git via env only (nothing written to disk) ==
 == container: git clone https://github.com/rxbynerd/haybale-e2e.git (rewritten through haybale) ==
 Cloning into '/tmp/work'...
-== container: pushing commit 3ea35ae81cffe9fe74531c9070ec149b0a9431c9 ==
-To http://host.containers.internal:8466/github.com/rxbynerd/haybale-e2e.git
-   b82e7a6..3ea35ae  HEAD -> main
-PUSHED_SHA:3ea35ae81cffe9fe74531c9070ec149b0a9431c9
+== container: pushing commit e58acb2b58e7d87274d50ff63f22ddcd2eaf0486 ==
+To http://host.containers.internal:8650/github.com/rxbynerd/haybale-e2e.git
+   93ea12c..e58acb2  HEAD -> main
+PUSHED_SHA:e58acb2b58e7d87274d50ff63f22ddcd2eaf0486
 == container: credential-less check ==
 CREDENTIAL_CHECK: PASS
-e2e-github: container pushed commit 3ea35ae81cffe9fe74531c9070ec149b0a9431c9
+e2e-github: container pushed commit e58acb2b58e7d87274d50ff63f22ddcd2eaf0486
 e2e-github: confirming round-trip via gh api (bypasses haybale entirely)
-e2e-github: github.com HEAD of rxbynerd/haybale-e2e@main is 3ea35ae81cffe9fe74531c9070ec149b0a9431c9
-e2e-github: round-trip CONFIRMED: 3ea35ae81cffe9fe74531c9070ec149b0a9431c9 is HEAD of rxbynerd/haybale-e2e@main
+e2e-github: github.com HEAD of rxbynerd/haybale-e2e@main is e58acb2b58e7d87274d50ff63f22ddcd2eaf0486
+e2e-github: round-trip CONFIRMED: e58acb2b58e7d87274d50ff63f22ddcd2eaf0486 is HEAD of rxbynerd/haybale-e2e@main
 e2e-github: haybale security/audit log excerpt for this run:
-time=2026-07-12T15:32:52.307+01:00 level=WARN msg="security event" event=token_minted host=github.com owner=rxbynerd repo=haybale-e2e verb=read appID=4278664 installationID=146047506
-time=2026-07-12T15:32:52.580+01:00 level=INFO msg="proxied request" identity=run-e2e-1783866764-70240 host=github.com owner=rxbynerd repo=haybale-e2e verb=read status=200 bytesIn=0 bytesOut=191 durationMs=273
-time=2026-07-12T15:32:52.734+01:00 level=INFO msg="proxied request" identity=run-e2e-1783866764-70240 host=github.com owner=rxbynerd repo=haybale-e2e verb=read status=200 bytesIn=181 bytesOut=145 durationMs=151
-time=2026-07-12T15:32:52.884+01:00 level=INFO msg="proxied request" identity=run-e2e-1783866764-70240 host=github.com owner=rxbynerd repo=haybale-e2e verb=read status=200 bytesIn=223 bytesOut=1320 durationMs=147
-time=2026-07-12T15:32:53.100+01:00 level=WARN msg="security event" event=token_minted host=github.com owner=rxbynerd repo=haybale-e2e verb=write appID=4278664 installationID=146047506
-time=2026-07-12T15:32:53.318+01:00 level=INFO msg="proxied request" identity=run-e2e-1783866764-70240 host=github.com owner=rxbynerd repo=haybale-e2e verb=write status=200 bytesIn=0 bytesOut=334 durationMs=217
-time=2026-07-12T15:32:53.969+01:00 level=INFO msg="proxied request" identity=run-e2e-1783866764-70240 host=github.com owner=rxbynerd repo=haybale-e2e verb=write status=200 bytesIn=590 bytesOut=66 durationMs=646
+time=2026-07-12T16:18:40.962+01:00 level=WARN msg="security event" event=token_minted host=github.com owner=rxbynerd repo=haybale-e2e verb=read appID=4278664 installationID=146047506
+time=2026-07-12T16:18:41.247+01:00 level=INFO msg="proxied request" identity=run-e2e-1783869513-82250 host=github.com owner=rxbynerd repo=haybale-e2e verb=read status=200 bytesIn=0 bytesOut=191 durationMs=285
+time=2026-07-12T16:18:41.389+01:00 level=INFO msg="proxied request" identity=run-e2e-1783869513-82250 host=github.com owner=rxbynerd repo=haybale-e2e verb=read status=200 bytesIn=181 bytesOut=145 durationMs=138
+time=2026-07-12T16:18:41.546+01:00 level=INFO msg="proxied request" identity=run-e2e-1783869513-82250 host=github.com owner=rxbynerd repo=haybale-e2e verb=read status=200 bytesIn=223 bytesOut=1895 durationMs=152
+time=2026-07-12T16:18:41.774+01:00 level=WARN msg="security event" event=token_minted host=github.com owner=rxbynerd repo=haybale-e2e verb=write appID=4278664 installationID=146047506
+time=2026-07-12T16:18:42.007+01:00 level=INFO msg="proxied request" identity=run-e2e-1783869513-82250 host=github.com owner=rxbynerd repo=haybale-e2e verb=write status=200 bytesIn=0 bytesOut=334 durationMs=233
+time=2026-07-12T16:18:42.680+01:00 level=INFO msg="proxied request" identity=run-e2e-1783869513-82250 host=github.com owner=rxbynerd repo=haybale-e2e verb=write status=200 bytesIn=594 bytesOut=66 durationMs=669
 e2e-github: ALL CHECKS PASSED
 ```
+
+This run post-dates the M6 remediation pass (bounded/escalated teardown,
+backgrounded container step, the all-mounts content-aware credential
+scan, upfront `gh` preconditions, and PID-derived scratch dir/port
+defaults) and confirms none of it regressed the acceptance — note the
+listen port (`8650`) is the PID-derived default described above in
+action, not a fixed value; a different invocation will show a different
+port.
 
 ### Reading the credential lifecycle out of this log
 
@@ -301,7 +309,7 @@ e2e-github: ALL CHECKS PASSED
 
 This same run's independent `gh api` check (bypassing haybale entirely,
 using the operator's own `gh` credentials) confirmed
-`3ea35ae81cffe9fe74531c9070ec149b0a9431c9` — the exact SHA the container
+`e58acb2b58e7d87274d50ff63f22ddcd2eaf0486` — the exact SHA the container
 reported pushing — as `HEAD` of `rxbynerd/haybale-e2e`'s `main` branch,
 closing the loop: the commit that left the credential-less container
 really did land on the real, private GitHub repository, having never
