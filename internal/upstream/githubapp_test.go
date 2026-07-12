@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -457,6 +459,34 @@ func TestCredentialsHonorsContextDeadline(t *testing.T) {
 	}
 }
 
+// TestCredentialsHonorsClientTimeoutWithNoCallerDeadline asserts the
+// http.Client-level appHTTPClientTimeout backstop fires even when the
+// caller itself sets no deadline (context.Background()) — the gap
+// TestCredentialsHonorsContextDeadline above does not cover, since that
+// test only proves a caller-supplied deadline is honored. Without B1(a)'s
+// client Timeout, this call would hang for the fake's full delay (and, in
+// production, indefinitely against a genuinely hung upstream).
+func TestCredentialsHonorsClientTimeoutWithNoCallerDeadline(t *testing.T) {
+	orig := appHTTPClientTimeout
+	appHTTPClientTimeout = 100 * time.Millisecond
+	defer func() { appHTTPClientTimeout = orig }()
+
+	fake := newGitHubFake(1)
+	fake.mintDelay = 2 * time.Second
+	src := newTestSource(t, fake)
+
+	start := time.Now()
+	_, err := src.Credentials(context.Background(), gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}, gitproto.Read)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Credentials() = nil error, want an error from the client-level timeout backstop")
+	}
+	if elapsed > time.Second {
+		t.Errorf("Credentials() took %v to return, want it to honor the ~100ms client timeout instead of the fake's 2s delay", elapsed)
+	}
+}
+
 // TestTokenMintedEventLogged asserts a successful mint emits
 // security.EventTokenMinted with host/owner/repo/verb/installation
 // context and, critically, never the minted token itself anywhere in
@@ -538,5 +568,89 @@ func TestGitHubAppSourceSingleflightCollapsesConcurrentMints(t *testing.T) {
 	}
 	if fake.mintCallCount() != 1 {
 		t.Fatalf("mint calls = %d, want exactly 1 for %d concurrent Credentials() calls sharing the same key", fake.mintCallCount(), n)
+	}
+}
+
+// gatedInstallationServer is a minimal httptest-backed
+// GET .../installation fake, deliberately separate from githubFake: it
+// exists only so installationLookup.get can be exercised directly (per
+// H1/B1(b)'s "bypass NewGitHubAppSource entirely" approach) with a
+// handler that blocks until released, which githubFake's installation
+// endpoint does not support.
+type gatedInstallationServer struct {
+	calls   atomic.Int64
+	release chan struct{}
+}
+
+func newGatedInstallationServer() *gatedInstallationServer {
+	return &gatedInstallationServer{release: make(chan struct{})}
+}
+
+func (s *gatedInstallationServer) start(t *testing.T) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.calls.Add(1)
+		select {
+		case <-s.release:
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id": 7}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// TestInstallationLookupFollowerHonorsOwnContextDeadline is B1(b)'s
+// installationLookup-side counterpart to
+// TestGitHubAppSourceSingleflightCollapsesConcurrentMints: it constructs
+// an installationLookup directly (bypassing GitHubAppSource, the same
+// approach H1 uses) and asserts a concurrent caller sharing an in-flight
+// lookup for the same owner/repo ("follower") returns its own ctx error
+// as soon as its own deadline fires, rather than blocking until the
+// in-flight lookup (the "leader"'s) completes. Without the
+// Group.Do -> Group.DoChan+select change, this test hangs until the
+// gate is released, well past the follower's ~50ms deadline.
+func TestInstallationLookupFollowerHonorsOwnContextDeadline(t *testing.T) {
+	gated := newGatedInstallationServer()
+	baseURL := gated.start(t)
+
+	lookup := newInstallationLookup(time.Now)
+	client := &http.Client{}
+
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		_, _ = lookup.get(context.Background(), client, baseURL, "acme", "widgets")
+	}()
+
+	// Give the leader goroutine a chance to actually reach the gated
+	// handler (and thus register the singleflight key) before the
+	// follower call below piles into the same key.
+	deadline := time.Now().Add(2 * time.Second)
+	for gated.calls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := lookup.get(ctx, client, baseURL, "acme", "widgets")
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("get() follower error = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed > time.Second {
+		t.Errorf("get() follower took %v to return, want it to honor its own ~50ms deadline instead of waiting on the in-flight lookup", elapsed)
+	}
+
+	close(gated.release)
+	<-leaderDone
+
+	if gated.calls.Load() != 1 {
+		t.Fatalf("installation lookup calls = %d, want exactly 1 (the follower giving up early must not trigger a second lookup)", gated.calls.Load())
 	}
 }

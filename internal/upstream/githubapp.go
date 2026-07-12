@@ -32,6 +32,23 @@ const defaultGitHubAPIBaseURL = "https://api.github.com"
 // tokenCache — see GitHubAppSource's doc comment.
 const installationCacheTTL = time.Hour
 
+// appHTTPClientTimeout bounds every GitHub API call GitHubAppSource makes
+// (the installation lookup GET and the token mint POST). Both are short,
+// bounded control-plane REST calls — entirely distinct from the proxy's
+// own GB-scale git data stream, which intentionally sets no read/write/
+// idle timeout of its own (see internal/proxy and the CredentialSource
+// interface doc comment). Without this, a hung or slow-responding
+// GitHub/GHES endpoint pins the serving goroutine indefinitely, since the
+// proxy forwards the inbound request's context unmodified with no bound
+// of its own.
+//
+// 30s is generous for a REST call this small (a mint/lookup response is a
+// few hundred bytes) while still giving an operator a hard backstop
+// instead of an unbounded hang. A package-level var, not a const, so
+// tests can shrink it to exercise the backstop deterministically instead
+// of a real 30s sleep; production code never reassigns it.
+var appHTTPClientTimeout = 30 * time.Second
+
 // GitHubAppConfig configures a GitHubAppSource.
 type GitHubAppConfig struct {
 	// AppID is the GitHub App's ID, used to sign the JWT GitHubAppSource
@@ -122,7 +139,7 @@ func NewGitHubAppSource(cfg GitHubAppConfig) (*GitHubAppSource, error) {
 	src := &GitHubAppSource{
 		appID:         cfg.AppID,
 		apiBaseURL:    strings.TrimRight(apiBaseURL, "/"),
-		httpClient:    &http.Client{Transport: appsTransport},
+		httpClient:    &http.Client{Transport: appsTransport, Timeout: appHTTPClientTimeout},
 		installations: newInstallationLookup(time.Now),
 		cache:         newTokenCache(time.Now),
 	}
@@ -149,11 +166,17 @@ func (s *GitHubAppSource) SetLogger(logger *slog.Logger) {
 // credential when one exists (tokenCache.get, including its
 // write-satisfies-read rule) or mints a fresh one scoped to repo and verb.
 //
-// ctx is passed through unmodified to every network call this makes (the
-// installation lookup and the mint POST both use
-// http.NewRequestWithContext), honoring whatever deadline the caller set
-// — see the CredentialSource interface doc comment for why that matters
-// here: the proxy imposes no timeout of its own.
+// ctx bounds how long this call itself will wait. The installation lookup
+// GET and the mint POST both use http.NewRequestWithContext with whichever
+// caller's ctx first triggered that particular upstream call, and
+// s.httpClient additionally enforces appHTTPClientTimeout as a backstop
+// for a caller who sets no deadline of their own. A caller that instead
+// arrives while an identical lookup or mint is already in flight (a
+// singleflight "follower" — see tokenCache.get / installationLookup.get)
+// returns as soon as ITS OWN ctx is done, even though the shared upstream
+// call keeps running to completion for whichever caller is still waiting
+// on it — see the CredentialSource interface doc comment for why bounding
+// this matters here: the proxy imposes no timeout of its own.
 func (s *GitHubAppSource) Credentials(ctx context.Context, repo gitproto.Repo, verb gitproto.Verb) (BasicAuth, error) {
 	return s.cache.get(ctx, repo, verb, s.mint)
 }
@@ -275,7 +298,10 @@ type installationEntry struct {
 // installation owns a repo is stable, so this is a much longer-lived,
 // lower-risk cache than tokenCache's minted tokens. Concurrent lookups
 // for the same repo collapse into a single upstream call via
-// singleflight, the same pattern tokenCache uses for mints.
+// singleflight, the same pattern tokenCache uses for mints — including
+// each caller honoring its own ctx while waiting rather than the
+// in-flight call's leader ctx; see get's doc comment and tokenCache.get's
+// doc comment for the shared DoChan/select reasoning.
 type installationLookup struct {
 	now func() time.Time
 
@@ -297,7 +323,10 @@ func newInstallationLookup(now func() time.Time) *installationLookup {
 // get returns the cached installation ID for (host is implicit in
 // client/apiBaseURL, owner, repo) if still fresh, otherwise resolves and
 // caches it via a single upstream GET, shared across any concurrent get
-// call for the same owner/repo.
+// call for the same owner/repo. A follower sharing an in-flight lookup
+// returns as soon as its own ctx is done rather than waiting on the
+// leader's — see tokenCache.get's doc comment for why DoChan/select
+// rather than Do is used here.
 func (l *installationLookup) get(ctx context.Context, client *http.Client, apiBaseURL, owner, repo string) (int64, error) {
 	key := installationKey{host: apiBaseURL, owner: owner, repo: repo}
 	now := l.now()
@@ -310,7 +339,7 @@ func (l *installationLookup) get(ctx context.Context, client *http.Client, apiBa
 	l.mu.Unlock()
 
 	sfKey := owner + "/" + repo
-	v, err, _ := l.group.Do(sfKey, func() (any, error) {
+	ch := l.group.DoChan(sfKey, func() (any, error) {
 		id, fetchErr := fetchInstallationID(ctx, client, apiBaseURL, owner, repo)
 		if fetchErr != nil {
 			return int64(0), fetchErr
@@ -320,10 +349,20 @@ func (l *installationLookup) get(ctx context.Context, client *http.Client, apiBa
 		l.mu.Unlock()
 		return id, nil
 	})
-	if err != nil {
-		return 0, err
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return 0, res.Err
+		}
+		return res.Val.(int64), nil
+	case <-ctx.Done():
+		// The closure above belongs to whichever caller's Do/DoChan call
+		// first registered this key — not necessarily this caller — and
+		// keeps running to completion for whoever else is still waiting on
+		// it; this caller simply stops waiting and honors its own ctx, per
+		// the CredentialSource contract.
+		return 0, ctx.Err()
 	}
-	return v.(int64), nil
 }
 
 // fetchInstallationID performs the GET /repos/{owner}/{repo}/installation

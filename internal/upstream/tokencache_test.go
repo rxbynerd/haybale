@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -247,5 +248,62 @@ func TestTokenCacheSingleflightCollapsesConcurrentMints(t *testing.T) {
 		if results[i].Password != "shared-token" {
 			t.Errorf("get() goroutine %d = %+v, want the shared minted credential", i, results[i])
 		}
+	}
+}
+
+// TestTokenCacheFollowerHonorsOwnContextDeadline is B1(b): a singleflight
+// "follower" — a Get call for a key that already has a mint in flight —
+// must return its OWN ctx error as soon as its own deadline fires,
+// instead of blocking until the in-flight ("leader") mint completes.
+// Before the Group.Do -> Group.DoChan+select fix, Do's follower path has
+// no reference to the follower's ctx at all, so this test would hang
+// until release is closed, well past the follower's ~50ms deadline.
+func TestTokenCacheFollowerHonorsOwnContextDeadline(t *testing.T) {
+	clock := newFakeClock(time.Unix(0, 0))
+	cache := newTokenCache(clock.Now)
+	repo := gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}
+
+	var calls atomic.Int64
+	release := make(chan struct{})
+	mint := func(_ context.Context, _ gitproto.Repo, _ gitproto.Verb) (BasicAuth, time.Time, error) {
+		calls.Add(1)
+		<-release
+		return BasicAuth{Username: "x-access-token", Password: "shared-token"}, clock.Now().Add(time.Hour), nil
+	}
+
+	// Start the leader in the background; it blocks on release until the
+	// follower assertion below has run.
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		_, _ = cache.get(context.Background(), repo, gitproto.Read, mint)
+	}()
+
+	// Give the leader goroutine a chance to actually register the
+	// singleflight key before the follower below piles into it.
+	deadline := time.Now().Add(2 * time.Second)
+	for calls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := cache.get(ctx, repo, gitproto.Read, mint)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("get() follower error = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed > time.Second {
+		t.Errorf("get() follower took %v to return, want it to honor its own ~50ms deadline instead of waiting on the in-flight mint", elapsed)
+	}
+
+	close(release)
+	<-leaderDone
+
+	if calls.Load() != 1 {
+		t.Fatalf("mint calls = %d, want exactly 1 (the follower giving up early must not trigger a second mint, and the leader's mint must still complete for anyone still waiting)", calls.Load())
 	}
 }

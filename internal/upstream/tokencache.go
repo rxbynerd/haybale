@@ -59,8 +59,9 @@ func (t cachedToken) needsRefresh(now time.Time) bool {
 //     since a write-scoped token is always sufficient for a read. A
 //     cached READ credential never satisfies a WRITE request;
 //   - concurrent Get calls for the same (host, owner, repo, verb)
-//     collapse into a single mint call via singleflight — the rest wait
-//     and share the result.
+//     collapse into a single mint call via singleflight; each waiting
+//     caller still honors its own ctx (see get's doc comment) rather than
+//     blocking on whichever caller's call actually ends up in flight.
 //
 // now is an injected clock (defaulting to time.Now in production) so
 // tests can exercise expiry and the early-refresh boundary
@@ -89,6 +90,16 @@ func newTokenCache(now func() time.Time) *tokenCache {
 // not due for refresh, otherwise it mints a fresh one via mint (a single
 // call, shared across any concurrent Get for the same key) and caches
 // the result before returning it.
+//
+// A concurrent caller that arrives while a mint for the same key is
+// already in flight ("follower") uses singleflight.Group.DoChan and
+// selects on the shared result versus its OWN ctx.Done, so it honors its
+// own deadline/cancellation instead of blocking on the in-flight call's
+// ctx (Group.Do's follower path has no reference to a follower's ctx at
+// all). Giving up does not cancel the in-flight mint itself — it keeps
+// running to completion for whoever else is still waiting on it — this
+// only fixes "a follower honors its own deadline," which is the
+// documented CredentialSource contract.
 func (c *tokenCache) get(ctx context.Context, repo gitproto.Repo, verb gitproto.Verb, mint mintFunc) (BasicAuth, error) {
 	key := repoKey{host: repo.Host, owner: repo.Owner, repo: repo.Name}
 	now := c.now()
@@ -102,7 +113,7 @@ func (c *tokenCache) get(ctx context.Context, repo gitproto.Repo, verb gitproto.
 	// collapse into each other's result, only requests sharing the exact
 	// same (key, verb) do.
 	sfKey := fmt.Sprintf("%s/%s/%s/%s", key.host, key.owner, key.repo, verb.String())
-	v, err, _ := c.group.Do(sfKey, func() (any, error) {
+	ch := c.group.DoChan(sfKey, func() (any, error) {
 		cred, expiresAt, mintErr := mint(ctx, repo, verb)
 		if mintErr != nil {
 			return BasicAuth{}, mintErr
@@ -110,14 +121,19 @@ func (c *tokenCache) get(ctx context.Context, repo gitproto.Repo, verb gitproto.
 		c.store(key, verb, cachedToken{cred: cred, expiresAt: expiresAt})
 		return cred, nil
 	})
-	if err != nil {
-		return BasicAuth{}, err
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return BasicAuth{}, res.Err
+		}
+		// The closure above only ever returns (BasicAuth, nil) on its
+		// success path, so this type assertion cannot fail for any
+		// res.Err == nil result DoChan hands back — including to a
+		// follower that shared the leader's call.
+		return res.Val.(BasicAuth), nil
+	case <-ctx.Done():
+		return BasicAuth{}, ctx.Err()
 	}
-	// The closure above only ever returns (BasicAuth, nil) on its
-	// success path, so this type assertion cannot fail for any err == nil
-	// result singleflight.Do hands back — including to a follower that
-	// shared the leader's call.
-	return v.(BasicAuth), nil
 }
 
 // lookup checks for a still-valid cached credential for key/verb,
