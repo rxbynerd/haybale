@@ -260,9 +260,14 @@ client presented to haybale, which is discarded immediately after
 **`type: static`** — a single, fixed Basic-auth credential:
 
 - `username` (optional, default `x-access-token`): the Basic-auth
-  username presented upstream. Most git hosts (including
-  `git-http-backend`) ignore the username entirely and check only the
-  password, so the default works for authenticating with just a token.
+  username presented upstream. Many token-based git hosts — GitHub.com
+  in particular — ignore the Basic-auth username and check only the
+  password, so the default works well for authenticating with just a
+  token there. `git-http-backend` itself performs no HTTP authentication
+  at all; whether an internal `git-http-backend` deployment also ignores
+  the username depends entirely on whatever fronts it and actually
+  checks the credential (see `internal/e2e/upstream_test.go`'s fake
+  upstream, which checks both).
 - `tokenEnv` (required): the name of an environment variable haybale
   reads the secret from, at startup. **The token must never be written
   inline in the YAML file** — a `token:` field set directly in the
