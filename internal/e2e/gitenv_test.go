@@ -64,7 +64,7 @@ func isolatedGitEnv(home string) []string {
 // environment, failing the test with the combined output on error.
 func runGit(t *testing.T, gitPath, dir string, env []string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command(gitPath, args...)
+	cmd := exec.Command(gitPath, args...) //nolint:gosec // this harness's entire purpose is running a real git subprocess; gitPath comes from requireGit's exec.LookPath, args are test-fixed strings, never external input
 	cmd.Dir = dir
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()

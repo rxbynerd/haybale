@@ -117,7 +117,7 @@ func TestPushThroughProxy(t *testing.T) {
 	runGit(t, gitPath, t.TempDir(), clientEnv, "clone", "--quiet", cloneURL, cloneDir)
 
 	newFile := filepath.Join(cloneDir, "NEWFILE.md")
-	if err := os.WriteFile(newFile, []byte("pushed through the haybale e2e harness\n"), 0o644); err != nil {
+	if err := os.WriteFile(newFile, []byte("pushed through the haybale e2e harness\n"), 0o600); err != nil {
 		t.Fatalf("write NEWFILE.md: %v", err)
 	}
 	runGit(t, gitPath, cloneDir, clientEnv, "add", "NEWFILE.md")

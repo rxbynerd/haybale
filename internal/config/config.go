@@ -80,7 +80,7 @@ func (u Upstream) ParsedBaseURL() *url.URL {
 // validates the result. It returns an error immediately if the config is
 // invalid — callers should treat any error here as fatal at startup.
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // path is the operator-supplied --config flag value, not attacker input
 	if err != nil {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}

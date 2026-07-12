@@ -2,7 +2,7 @@ package e2e
 
 import (
 	"net/http"
-	"net/http/cgi"
+	"net/http/cgi" //nolint:gosec // G504: the CVE this flags (httpoxy, CVE-2016-5386) was fixed in Go 1.6.3; go.mod requires go 1.26.1, and this is a test-only CGI upstream, not internet-facing
 	"net/http/httptest"
 	"sync"
 	"testing"

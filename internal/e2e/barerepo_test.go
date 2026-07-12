@@ -23,7 +23,7 @@ func newBareRepoWithCommit(t *testing.T, gitPath, projectRoot, owner, name strin
 	runGit(t, gitPath, workDir, env, "init", "--quiet", "-b", "main")
 
 	readme := filepath.Join(workDir, "README.md")
-	if err := os.WriteFile(readme, []byte("hello from the haybale e2e harness\n"), 0o644); err != nil {
+	if err := os.WriteFile(readme, []byte("hello from the haybale e2e harness\n"), 0o600); err != nil {
 		t.Fatalf("write README.md: %v", err)
 	}
 	runGit(t, gitPath, workDir, env, "add", "README.md")
@@ -31,7 +31,7 @@ func newBareRepoWithCommit(t *testing.T, gitPath, projectRoot, owner, name strin
 	headSHA = strings.TrimSpace(runGit(t, gitPath, workDir, env, "rev-parse", "HEAD"))
 
 	ownerDir := filepath.Join(projectRoot, owner)
-	if err := os.MkdirAll(ownerDir, 0o755); err != nil {
+	if err := os.MkdirAll(ownerDir, 0o750); err != nil {
 		t.Fatalf("mkdir %s: %v", ownerDir, err)
 	}
 	bareDir = filepath.Join(ownerDir, name+".git")

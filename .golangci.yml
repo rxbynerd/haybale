@@ -1,5 +1,16 @@
 version: "2"
 
+linters:
+  enable:
+    # gitproto is the package doc's own words "the security-load-bearing
+    # seam M2's policy engine and M3's credential injection build on";
+    # golangci-lint v2's default set (errcheck, govet, ineffassign,
+    # staticcheck, unused) has no security-focused linter. Add gosec now,
+    # while the codebase is small enough that findings are cheap to
+    # triage, ahead of M2/M3 landing credential injection and policy
+    # enforcement on top of this seam.
+    - gosec
+
 formatters:
   enable:
     - gci
