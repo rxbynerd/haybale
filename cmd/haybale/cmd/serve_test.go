@@ -352,7 +352,7 @@ func TestServeWithGracefulDrainWaitsForInFlightRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("net.Listen: %v", err)
 	}
-	srv := &http.Server{Handler: p}
+	srv := &http.Server{Handler: p} //nolint:gosec // G112: this test's whole point is exercising Shutdown against a controlled localhost listener with a single client goroutine, not an internet-facing server — a ReadHeaderTimeout is production's own newServer's job (see TestNewServerPlainHTTP/TestNewServerTLSEnabled)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	drainDone := make(chan error, 1)
