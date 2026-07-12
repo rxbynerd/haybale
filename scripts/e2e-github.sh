@@ -23,7 +23,9 @@
 #      environment for git-host credential material.
 #   4. Confirms the pushed commit landed on the real repo via `gh api`,
 #      a channel entirely independent of haybale.
-#   5. Tears down haybale and the scratch config either way.
+#   5. Tears down: escalates SIGTERM -> SIGKILL (bounded) for both the
+#      haybale process and the container run, and unconditionally
+#      removes the scratch config either way.
 #
 # Preconditions (checked upfront, before any side effect — minting a
 # token, starting haybale, or running the container): `just build` has
@@ -137,19 +139,58 @@ fi
 # (default includes this script's PID — see the header comment), which
 # is .gitignore'd (see .gitignore's `.e2e-github*/`) and removed on
 # every exit path (success, failure, or interrupt) so nothing it
-# contains ever has a chance to end up committed.
+# contains ever has a chance to end up committed or leak past this run.
 
 rm -rf "$SCRATCH_DIR"
 mkdir -p "$SCRATCH_DIR"
 SCRATCH_ABS="$(cd "$SCRATCH_DIR" && pwd)"
 
 HAYBALE_PID=""
+CONTAINER_PID=""
+# Run-scoped name for the container step (see step 3 below), so cleanup()
+# can ask the runtime to kill it directly by name. Verified empirically
+# on this dev machine's rootless podman-machine setup: the container
+# process runs inside podman's VM, decoupled from the `podman run`
+# client on the host, so signaling (even SIGKILL-ing) the client PID
+# alone does *not* stop the container early — it keeps running until
+# its own command finishes. `podman kill <name>` (or `docker kill`),
+# which asks the runtime itself to stop the named container, does.
+CONTAINER_NAME="haybale-e2e-$$"
+
+# terminate_pid escalates SIGTERM -> a short bounded poll -> SIGKILL, so
+# cleanup() below can never block indefinitely on a stuck child — e.g. a
+# connection genuinely wedged at teardown time — regardless of why it
+# won't exit on its own. Idempotent/safe to call on an already-dead pid.
+terminate_pid() {
+  local pid="$1" label="$2" waited=0
+  if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null && ((waited < 5)); do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "e2e-github: $label (pid $pid) still alive ${waited}s after SIGTERM; sending SIGKILL" >&2
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
+# cleanup is bounded by construction (terminate_pid above never blocks
+# indefinitely, and killing the container by name is near-instant), so
+# the scratch-dir removal below always runs — it is never gated behind
+# a hang. Covers EXIT/INT/TERM: a normal exit, an interactive Ctrl-C,
+# and an external `kill -TERM` all reach it.
 cleanup() {
   local status=$?
-  if [[ -n "$HAYBALE_PID" ]] && kill -0 "$HAYBALE_PID" 2>/dev/null; then
-    kill "$HAYBALE_PID" 2>/dev/null || true
-    wait "$HAYBALE_PID" 2>/dev/null || true
+  if [[ -n "$CONTAINER_NAME" ]]; then
+    "$runtime_bin" kill "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    "$runtime_bin" rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
+  terminate_pid "$CONTAINER_PID" "container run"
+  terminate_pid "$HAYBALE_PID" "haybale serve"
   rm -rf "$SCRATCH_DIR"
   exit "$status"
 }
@@ -197,9 +238,17 @@ upstreams:
 EOF
 
 # ---- 2. start haybale, wait for /healthz -------------------------------
+#
+# --drain-timeout bounds how long haybale itself waits, on its own
+# SIGTERM handling, for in-flight requests to finish draining. This is a
+# test harness, not production — production's own default (0, wait
+# indefinitely — see cmd/haybale/cmd/serve.go) is the deliberately
+# correct choice there, but a bounded value here means teardown can't
+# hang on this process even before cleanup()'s own SIGTERM/SIGKILL
+# escalation ever gets involved.
 
 echo "e2e-github: starting haybale serve on :$E2E_PORT"
-"$HAYBALE_BIN" serve --config "$SCRATCH_ABS/haybale.yaml" > "$SCRATCH_ABS/haybale.log" 2>&1 &
+"$HAYBALE_BIN" serve --config "$SCRATCH_ABS/haybale.yaml" --drain-timeout 5s > "$SCRATCH_ABS/haybale.log" 2>&1 &
 HAYBALE_PID=$!
 
 healthy=""
@@ -320,15 +369,30 @@ container_script="${container_script//__REPO__/$repo_name}"
 
 echo "e2e-github: running credential-less container ($runtime_bin, image $CONTAINER_IMAGE)"
 container_log="$SCRATCH_ABS/container.log"
-set +e
+
+# Backgrounded and waited on, rather than run as a single blocking
+# foreground command: bash only checks for a trapped signal between
+# commands, and a foreground child is one long uninterruptible "command"
+# from the trap's point of view for as long as it runs -- an external
+# `kill -TERM` followed by a `kill -KILL` (the common CI-cancellation
+# shape) can land entirely inside that window and skip cleanup()
+# altogether. `wait` on a background job, by contrast, is interruptible:
+# bash's own docs are explicit that a trapped signal received while
+# waiting causes `wait` to return immediately so the trap can run, which
+# is exactly the promptness this step needs during the long clone/push.
 "$runtime_bin" run --rm \
+  --name "$CONTAINER_NAME" \
   --env "HAYBALE_URL=$haybale_url" \
   --env "HAYBALE_TOKEN=$raw_token" \
   --entrypoint sh \
   "$CONTAINER_IMAGE" \
-  -c "$container_script" > "$container_log" 2>&1
-container_status=$?
-set -e
+  -c "$container_script" > "$container_log" 2>&1 &
+CONTAINER_PID=$!
+
+container_status=0
+wait "$CONTAINER_PID" || container_status=$?
+CONTAINER_PID=""
+CONTAINER_NAME=""
 
 cat "$container_log"
 

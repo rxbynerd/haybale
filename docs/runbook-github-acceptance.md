@@ -147,9 +147,16 @@ for the full list):
    `main` branch via `gh api` — a channel entirely independent of
    haybale, run from the host with the operator's own `gh` credentials,
    not anything haybale minted.
-5. Tears down: kills the `haybale serve` process and removes the scratch
-   dir, via a `trap` that fires on success, failure, or interruption —
-   safely re-runnable any number of times.
+5. Tears down: escalates shutdown of both the `haybale serve` process and
+   the container run — `SIGTERM`, then a bounded few-second poll, then
+   `SIGKILL` as a last resort — and unconditionally removes the scratch
+   dir, via a `trap` that fires on success, failure, or interruption.
+   `haybale serve` itself runs with a finite `--drain-timeout` for this
+   test harness (unlike production's own indefinite-by-default drain —
+   see `cmd/haybale/cmd/serve.go`), so teardown is bounded even before
+   the trap's own escalation is needed. Safely re-runnable any number of
+   times, including concurrently (see `HAYBALE_E2E_PORT`/
+   `HAYBALE_E2E_SCRATCH` above).
 
 ### Credential-less assertion
 
