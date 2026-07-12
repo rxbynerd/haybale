@@ -7,12 +7,14 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1098,6 +1100,94 @@ func TestPostInjectionUpstream401Maps502AndStripsWWWAuthenticate(t *testing.T) {
 	}
 	if strings.Contains(string(body), "upstream error body") {
 		t.Errorf("response body = %q, must not contain the upstream's own error body", body)
+	}
+}
+
+// TestPostInjectionUpstream401StripsAllUpstreamHeaders exercises the H1
+// hardening: modifyResponse must not merely delete WWW-Authenticate from
+// the upstream's 401 response, it must reset the client-visible headers
+// to a minimal known-safe set. A compromised, misconfigured, or
+// lookalike upstream could set Set-Cookie or any other header on its
+// 401/403 page; none of it may survive onto the synthetic 502.
+func TestPostInjectionUpstream401StripsAllUpstreamHeaders(t *testing.T) {
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="upstream"`)
+		w.Header().Set("Set-Cookie", "session=upstream-secret-cookie; Path=/")
+		w.Header().Set("X-Upstream-Custom", "must-not-leak")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("upstream error body containing details that must never reach the client"))
+	}))
+	defer upstreamSrv.Close()
+
+	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadGateway)
+	}
+	for _, h := range []string{"WWW-Authenticate", "Set-Cookie", "X-Upstream-Custom"} {
+		if got := resp.Header.Get(h); got != "" {
+			t.Errorf("%s = %q, want it stripped from the synthetic 502 (headers must be reset wholesale, not selectively deleted)", h, got)
+		}
+	}
+	if strings.Contains(string(body), "upstream error body") || strings.Contains(string(body), "must-not-leak") {
+		t.Errorf("response body = %q, must not contain any upstream-controlled content", body)
+	}
+}
+
+// TestPostInjectionUpstream401DrainsBodyForConnectionReuse exercises the
+// other half of H1: the discarded upstream 401 body must be drained to
+// EOF before its reader is closed, so the proxy's Transport can return
+// the proxy->upstream connection to its keep-alive pool. net/http's
+// Transport treats a response body that is closed before being read to
+// completion as unreusable and redials on the next request — a bad or
+// expired credential is a sustained failure mode (every request to this
+// upstream repeats it), so this matters most exactly when it's least
+// convenient. This is verified indirectly: the upstream's ConnState hook
+// counts how many distinct TCP connections it accepts across two
+// sequential requests through the same Proxy (and therefore the same
+// underlying http.Transport) — one connection for two requests proves
+// the body was drained, not merely that nothing panicked.
+func TestPostInjectionUpstream401DrainsBodyForConnectionReuse(t *testing.T) {
+	var newConns atomic.Int32
+	upstreamSrv := httptest.NewUnstartedServer(respondingUpstreamHandler(http.StatusUnauthorized, true))
+	upstreamSrv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			newConns.Add(1)
+		}
+	}
+	upstreamSrv.Start()
+	defer upstreamSrv.Close()
+
+	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	for i := 0; i < 2; i++ {
+		resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
+		if err != nil {
+			t.Fatalf("GET %d: %v", i, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("request %d status = %d, want %d", i, resp.StatusCode, http.StatusBadGateway)
+		}
+	}
+
+	if got := newConns.Load(); got != 1 {
+		t.Errorf("upstream accepted %d new TCP connections for 2 sequential requests, want 1 — the discarded 401 body must be drained to EOF so the proxy's Transport can reuse the connection instead of redialing", got)
 	}
 }
 

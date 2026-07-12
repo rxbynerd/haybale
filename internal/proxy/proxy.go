@@ -132,7 +132,9 @@ func New(upstreams map[string]*url.URL, credentialSources map[string]upstream.Cr
 		},
 		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError),
 		// ModifyResponse maps a post-injection upstream 401/403 to a 502
-		// and strips WWW-Authenticate — see modifyResponse's doc comment
+		// and resets the response headers to a minimal known-safe set
+		// (so WWW-Authenticate and anything else upstream-controlled
+		// never reaches the client) — see modifyResponse's doc comment
 		// for the security invariant this enforces.
 		ModifyResponse: p.modifyResponse,
 	}
@@ -377,8 +379,14 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 // Treating it as an ordinary passthrough 401 would make git re-prompt
 // the client for a credential it has no way to supply (the sandbox has
 // no real git credentials — that's the entire premise of haybale
-// existing); this maps it to 502 instead and strips WWW-Authenticate so
-// git never even considers re-prompting.
+// existing); this maps it to 502 instead and resets the response headers
+// to a minimal known-safe set so git never even considers re-prompting
+// and no upstream-controlled header (WWW-Authenticate, Set-Cookie, or
+// anything else) reaches the client. The discarded upstream body is
+// drained to EOF before its reader is closed, so the connection this
+// response arrived on can be reused for the next request to the same
+// upstream — a bad credential is a sustained failure mode, so every
+// subsequent request hits this same path until it's fixed.
 //
 // Every other status (success or any other error) is streamed through
 // completely unmodified — this function must never rewrite a genuine
@@ -393,22 +401,36 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 		"host", cc.repo.Host, "owner", cc.repo.Owner, "repo", cc.repo.Name, "verb", cc.verb.String(),
 		"upstreamStatus", resp.StatusCode, "reason", "upstream rejected injected credential")
 
-	// The original body is discarded (and its reader closed here, since
-	// ReverseProxy only closes whatever Body is set on resp when this
-	// function returns, not one that was replaced and abandoned) — an
-	// upstream error page for a 401/403 is not something haybale can
-	// vouch for the contents of, and there is no reason to give the
-	// client anything more than a fixed, safe message.
+	// The original body is drained to EOF before being closed (not merely
+	// closed) so the Transport can return the underlying connection to
+	// its keep-alive pool instead of being forced to discard it — a
+	// closed-but-unread body makes net/http treat the connection as
+	// unreusable. A bad or expired credential is a sustained failure
+	// mode: every subsequent request to this upstream hits this same
+	// path, so without draining, an incident becomes "redial upstream on
+	// every single request" at the worst possible time. The drained bytes
+	// are discarded, never inspected: an upstream error page for a
+	// 401/403 is not something haybale can vouch for the contents of, and
+	// there is no reason to give the client anything more than a fixed,
+	// safe message.
+	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
 	body := []byte(http.StatusText(http.StatusBadGateway) + "\n")
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	resp.ContentLength = int64(len(body))
+	// The client-visible headers are replaced wholesale with a minimal,
+	// known-safe set, rather than merely deleting WWW-Authenticate —
+	// this is what actually stops Set-Cookie, a bespoke challenge header,
+	// or anything else a compromised, misconfigured, or lookalike
+	// upstream's 401/403 page happens to set from streaming through on
+	// this synthetic 502. WWW-Authenticate in particular must never
+	// survive: without stripping it, a git client sees it on what looks
+	// like a 401 and re-prompts for credentials the sandbox cannot
+	// supply — the wholesale reset below covers that case too, so no
+	// separate Header.Del("WWW-Authenticate") call is needed.
+	resp.Header = http.Header{}
 	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	resp.Header.Set("Content-Type", "text/plain; charset=utf-8")
-	// The one header this entire function exists to strip: without this,
-	// a git client sees WWW-Authenticate on what looks like a 401 and
-	// re-prompts for credentials the sandbox cannot supply.
-	resp.Header.Del("WWW-Authenticate")
 	resp.StatusCode = http.StatusBadGateway
 	resp.Status = fmt.Sprintf("%d %s", http.StatusBadGateway, http.StatusText(http.StatusBadGateway))
 	return nil
