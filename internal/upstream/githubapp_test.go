@@ -654,3 +654,55 @@ func TestInstallationLookupFollowerHonorsOwnContextDeadline(t *testing.T) {
 		t.Fatalf("installation lookup calls = %d, want exactly 1 (the follower giving up early must not trigger a second lookup)", gated.calls.Load())
 	}
 }
+
+// TestInstallationLookupTTLBoundary is H1: it exercises installationLookup
+// directly via newInstallationLookup(fakeClock.Now) — the type already
+// accepts an injectable clock, so no production code change is needed —
+// and asserts the exact installationCacheTTL (1h) boundary: still cached
+// one nanosecond before it, re-fetched exactly at it. Mirrors
+// TestTokenCacheEarlyRefreshBoundary's precision for tokenCache's sibling
+// cache.
+func TestInstallationLookupTTLBoundary(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id": 7}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	start := time.Unix(0, 0)
+	clock := newFakeClock(start)
+	lookup := newInstallationLookup(clock.Now)
+	client := &http.Client{}
+
+	id, err := lookup.get(context.Background(), client, srv.URL, "acme", "widgets")
+	if err != nil {
+		t.Fatalf("get() unexpected error: %v", err)
+	}
+	if id != 7 {
+		t.Fatalf("get() = %d, want 7", id)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("lookup calls = %d, want 1 after the first get", calls.Load())
+	}
+
+	// One nanosecond before the 1h TTL boundary: still cached, no
+	// second lookup.
+	clock.Set(start.Add(installationCacheTTL - time.Nanosecond))
+	if _, err := lookup.get(context.Background(), client, srv.URL, "acme", "widgets"); err != nil {
+		t.Fatalf("get() unexpected error: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("lookup calls = %d, want still 1 (one nanosecond before the TTL boundary must still be cached)", calls.Load())
+	}
+
+	// Exactly at the TTL boundary: must re-fetch.
+	clock.Set(start.Add(installationCacheTTL))
+	if _, err := lookup.get(context.Background(), client, srv.URL, "acme", "widgets"); err != nil {
+		t.Fatalf("get() unexpected error: %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("lookup calls = %d, want 2 (exactly at the TTL boundary must trigger a re-fetch)", calls.Load())
+	}
+}
