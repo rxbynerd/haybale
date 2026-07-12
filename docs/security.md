@@ -37,6 +37,25 @@ inspection or ref-level push rules; the dumb git protocol (rejected
 outright, see below); SSH transport; a compromised upstream git host
 itself; an operator who mis-scopes policy.yaml.
 
+- **Connection/resource exhaustion (slow-loris-shaped or otherwise).**
+  `newServer` (`cmd/haybale/cmd/serve.go`) sets `ReadHeaderTimeout: 10s`
+  and deliberately no `ReadTimeout`/`WriteTimeout`/`IdleTimeout`, no
+  `MaxHeaderBytes` override, and no cap on concurrent connections — a
+  direct, load-bearing consequence of pack transfers legitimately
+  running to gigabytes and taking arbitrarily long (see "Streaming, not
+  buffering" below). An authenticated-but-slow caller, or one that opens
+  many connections and trickles data indefinitely, can tie up server
+  resources for as long as it keeps doing so; nothing in haybale itself
+  bounds that. `ReadHeaderTimeout` is the one exception: it still bounds
+  how long a connection can sit open *before* sending a complete request
+  line, so it does guard against the narrowest slow-loris shape (a
+  connection that never finishes its headers at all).
+  Rate limiting and connection-count limits are an explicit v0.1
+  non-goal (see the project plan) — this tradeoff is deliberate, not an
+  oversight, and is expected to be enforced at the ingress/load-balancer
+  layer in front of haybale if it's a concern for a given deployment, not
+  inside haybale itself.
+
 ## Sandbox token never forwarded upstream
 
 The caller's own credential (its haybale token, presented as an HTTP
