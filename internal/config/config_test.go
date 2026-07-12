@@ -2,12 +2,21 @@ package config
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rxbynerd/haybale/internal/gitproto"
+	"github.com/rxbynerd/haybale/internal/upstream"
 )
 
 // fakeTokenDigest is a structurally valid "sha256:<hex>" tokenDigest
@@ -57,6 +66,52 @@ func writeValidIdentityAndPolicyFiles(t *testing.T) (identityPath, policyPath st
 	}
 
 	return identityPath, policyPath
+}
+
+// writeTestRSAKeyFile generates a throwaway RSA private key (never
+// committed anywhere — generated fresh every test run) and writes it PEM
+// -encoded to a file under t.TempDir(), returning its path. Good enough
+// to exercise "github-app" credential validation, which only cares that
+// the file exists and parses as an RSA key.
+func writeTestRSAKeyFile(t *testing.T) string {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey: %v", err)
+	}
+	der := x509.MarshalPKCS1PrivateKey(key)
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: der})
+
+	path := filepath.Join(t.TempDir(), "app.pem")
+	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+		t.Fatalf("os.WriteFile(app.pem): %v", err)
+	}
+	return path
+}
+
+// newFakeGitHubAppServer stands up a minimal httptest stand-in for the
+// two GitHub REST endpoints upstream.GitHubAppSource calls: installation
+// lookup and scoped-token mint. It always resolves to installationID and
+// always mints token, regardless of the requested repo/permissions —
+// good enough to prove Validate() wires a github-app credential block
+// into a CredentialSource that actually mints, not to re-test
+// GitHubAppSource's own least-privilege scoping (internal/upstream's own
+// tests already cover that in depth).
+func newFakeGitHubAppServer(t *testing.T, installationID int64, token string) string {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id": %d}`, installationID)
+	})
+	mux.HandleFunc("/app/installations/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = fmt.Fprintf(w, `{"token": %q, "expires_at": %q}`, token, time.Now().Add(time.Hour).Format(time.RFC3339))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv.URL
 }
 
 func TestValidate(t *testing.T) {
@@ -317,6 +372,46 @@ func TestValidate(t *testing.T) {
 			wantErr: "privateKeyPath is required",
 		},
 		{
+			name: "credential github-app privateKeyPath does not exist",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:   PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{
+						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
+							Type: credentialTypeGitHubApp, AppID: 12345, PrivateKeyPath: "/tmp/haybale-config-test-does-not-exist.pem",
+						}},
+					},
+				}
+			},
+			wantErr: "read privateKeyPath",
+		},
+		{
+			name: "credential github-app privateKeyPath is not a valid RSA key",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				badKeyPath := filepath.Join(t.TempDir(), "not-a-key.pem")
+				if err := os.WriteFile(badKeyPath, []byte("this is not a PEM-encoded key"), 0o600); err != nil {
+					t.Fatalf("os.WriteFile: %v", err)
+				}
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:   PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{
+						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
+							Type: credentialTypeGitHubApp, AppID: 12345, PrivateKeyPath: badKeyPath,
+						}},
+					},
+				}
+			},
+			wantErr: "parse private key",
+		},
+		{
 			name: "credential github-app valid shape",
 			cfg: func(t *testing.T) Config {
 				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
@@ -327,13 +422,15 @@ func TestValidate(t *testing.T) {
 					Policy:   PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{
 						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
-							Type: credentialTypeGitHubApp, AppID: 12345, PrivateKeyPath: "/tmp/app.pem",
+							Type: credentialTypeGitHubApp, AppID: 12345, PrivateKeyPath: writeTestRSAKeyFile(t),
 						}},
 					},
 				}
 			},
-			// Structurally valid: Validate() succeeds even though no
-			// CredentialSource actually mints anything until M4.
+			// A real (throwaway, in-test-generated) RSA key: Validate()
+			// both reads the file and builds a working GitHubAppSource
+			// from it — see TestValidatePopulatesGitHubAppCredentialSource
+			// below for the fuller "it actually mints" assertion.
 		},
 		{
 			name: "identity type empty",
@@ -563,12 +660,18 @@ func TestValidatePopulatesCredentialSource(t *testing.T) {
 	}
 }
 
-// TestValidateGitHubAppCredentialSourceStubErrors asserts the
-// credentialTypeGitHubApp stub's contract: Validate() accepts the
-// structurally-valid shape, but the CredentialSource it builds always
-// errors — never mints a real token — until M4 replaces it.
-func TestValidateGitHubAppCredentialSourceStubErrors(t *testing.T) {
+// TestValidatePopulatesGitHubAppCredentialSource mirrors
+// TestValidatePopulatesCredentialSource for the "github-app" discriminator:
+// Validate() must build a genuine upstream.GitHubAppSource that mints a
+// real (fake-upstream-backed) installation token, not merely accept the
+// config shape structurally. APIBaseURL points at a local httptest fake
+// standing in for the GitHub REST API — internal/upstream's own tests
+// cover GitHubAppSource's least-privilege scoping and cache behavior in
+// depth; this test only proves config.Validate() wires everything
+// together correctly.
+func TestValidatePopulatesGitHubAppCredentialSource(t *testing.T) {
 	identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+	fakeURL := newFakeGitHubAppServer(t, 999, "fake-minted-installation-token")
 	cfg := Config{
 		Listen:   ":8466",
 		LogLevel: "info",
@@ -576,7 +679,7 @@ func TestValidateGitHubAppCredentialSourceStubErrors(t *testing.T) {
 		Policy:   PolicyConfig{Path: policyPath},
 		Upstreams: []Upstream{
 			{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
-				Type: credentialTypeGitHubApp, AppID: 12345, PrivateKeyPath: "/tmp/app.pem",
+				Type: credentialTypeGitHubApp, AppID: 12345, PrivateKeyPath: writeTestRSAKeyFile(t), APIBaseURL: fakeURL,
 			}},
 		},
 	}
@@ -588,12 +691,18 @@ func TestValidateGitHubAppCredentialSourceStubErrors(t *testing.T) {
 	if src == nil {
 		t.Fatal("CredentialSource() = nil after successful Validate()")
 	}
-	_, err := src.Credentials(context.Background(), gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}, gitproto.Read)
-	if err == nil {
-		t.Fatal("Credentials() = nil error, want an error from the not-yet-implemented stub")
+	if _, ok := src.(*upstream.GitHubAppSource); !ok {
+		t.Fatalf("CredentialSource() = %T, want *upstream.GitHubAppSource", src)
 	}
-	if !strings.Contains(err.Error(), "not yet implemented") {
-		t.Errorf("Credentials() error = %q, want it to mention \"not yet implemented\"", err.Error())
+	cred, err := src.Credentials(context.Background(), gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}, gitproto.Read)
+	if err != nil {
+		t.Fatalf("Credentials() unexpected error: %v", err)
+	}
+	if cred.Username != "x-access-token" {
+		t.Errorf("Credentials().Username = %q, want %q", cred.Username, "x-access-token")
+	}
+	if cred.Password != "fake-minted-installation-token" {
+		t.Errorf("Credentials().Password = %q, want the fake's minted token", cred.Password)
 	}
 }
 

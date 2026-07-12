@@ -14,8 +14,6 @@
 package config
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -23,7 +21,6 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/rxbynerd/haybale/internal/gitproto"
 	"github.com/rxbynerd/haybale/internal/identity"
 	"github.com/rxbynerd/haybale/internal/policy"
 	"github.com/rxbynerd/haybale/internal/upstream"
@@ -163,14 +160,12 @@ func (u Upstream) CredentialSource() upstream.CredentialSource {
 const credentialTypeStatic = "static"
 
 // credentialTypeGitHubApp selects a GitHub App installation-token
-// credential. The config shape (AppID, PrivateKeyPath, APIBaseURL) is
-// validated structurally here in M3 so operators can write a
-// forward-compatible haybale.yaml now, but no upstream.CredentialSource
-// actually mints installation tokens yet — that's M4's GitHubAppSource.
-// Until M4 lands, a "github-app" upstream's CredentialSource is a stub
-// that always errors (mapped to 502 by internal/proxy, same as any other
-// credential-source failure), rather than this package half-building
-// GitHubAppSource's mint/cache logic ahead of that milestone.
+// credential (upstream.GitHubAppSource): PrivateKeyPath is read and
+// parsed as an RSA private key here, at Validate() time (fail-fast,
+// same as identity/policy's own file loads), and AppID/PrivateKeyPEM/
+// APIBaseURL are handed to upstream.NewGitHubAppSource to build the
+// CredentialSource that actually mints a scoped installation token per
+// repo/verb — see buildCredentialSource.
 const credentialTypeGitHubApp = "github-app" //nolint:gosec // G101: this is a config-type discriminator string, not a credential value
 
 // defaultStaticUsername is the Basic-auth username a "static" credential
@@ -201,15 +196,16 @@ type CredentialConfig struct {
 	// never committed to a config file.
 	Token string `yaml:"token"`
 	// AppID is the GitHub App ID a "github-app" credential authenticates
-	// as. Structurally validated in M3; not yet used to mint anything.
+	// as.
 	AppID int64 `yaml:"appID"`
 	// PrivateKeyPath is the path to the GitHub App's PEM private key.
-	// Structurally validated in M3; not yet used to mint anything.
+	// Validate() reads and parses this file at startup — a missing file
+	// or one that isn't a valid RSA private key fails Validate()
+	// immediately rather than the first mint attempt.
 	PrivateKeyPath string `yaml:"privateKeyPath"`
 	// APIBaseURL overrides the GitHub API base URL for GHES deployments,
 	// e.g. "https://ghe.example.com/api/v3". Defaults to
-	// "https://api.github.com" when empty. Structurally validated in M3;
-	// not yet used to mint anything.
+	// "https://api.github.com" when empty.
 	APIBaseURL string `yaml:"apiBaseURL"`
 }
 
@@ -367,15 +363,27 @@ func buildCredentialSource(i int, u *Upstream) error {
 		if u.Credential.PrivateKeyPath == "" {
 			return fmt.Errorf("%s: privateKeyPath is required for type %q", prefix, credentialTypeGitHubApp)
 		}
-		// The shape is validated; the behaviour is not implemented until
-		// M4 (GitHubAppSource: ghinstallation JWT + scoped mint +
-		// tokenCache). A stub CredentialSource keeps this upstream usable
-		// by config.Validate() and internal/proxy's construction-time
-		// contracts without half-building that milestone's mint/cache
-		// logic here — any attempt to actually use it at request time
-		// fails the same way any other credential-source error does: 502,
-		// never 401 (see internal/proxy.ServeHTTP).
-		u.credentialSource = notImplementedCredentialSource{}
+		// The private key is read and parsed here, at Validate() time,
+		// rather than deferred to the first mint attempt: a missing file
+		// or a file that isn't a valid RSA private key is exactly the
+		// kind of misconfiguration this package's fail-fast-at-startup
+		// philosophy exists to catch before a deployment ever serves
+		// traffic, the same way a bad Identity/Policy path already does.
+		keyPEM, err := os.ReadFile(u.Credential.PrivateKeyPath) //nolint:gosec // privateKeyPath is an operator-supplied config path, not attacker input
+		if err != nil {
+			return fmt.Errorf("%s: read privateKeyPath %q: %w", prefix, u.Credential.PrivateKeyPath, err)
+		}
+		src, err := upstream.NewGitHubAppSource(upstream.GitHubAppConfig{
+			AppID:         u.Credential.AppID,
+			PrivateKeyPEM: keyPEM,
+			APIBaseURL:    u.Credential.APIBaseURL,
+		})
+		if err != nil {
+			// NewGitHubAppSource's own errors are already prefixed
+			// "upstream: ...", so wrap rather than replace them.
+			return fmt.Errorf("%s: %w", prefix, err)
+		}
+		u.credentialSource = src
 
 	default:
 		return fmt.Errorf("%s: type %q is not supported (must be %q or %q)", prefix, u.Credential.Type, credentialTypeStatic, credentialTypeGitHubApp)
@@ -383,15 +391,3 @@ func buildCredentialSource(i int, u *Upstream) error {
 
 	return nil
 }
-
-// notImplementedCredentialSource is the credentialTypeGitHubApp stub:
-// every call fails with a fixed, non-sensitive error until M4 replaces
-// it with a real GitHubAppSource.
-type notImplementedCredentialSource struct{}
-
-func (notImplementedCredentialSource) Credentials(context.Context, gitproto.Repo, gitproto.Verb) (upstream.BasicAuth, error) {
-	return upstream.BasicAuth{}, errGitHubAppNotImplemented
-}
-
-// errGitHubAppNotImplemented is returned by notImplementedCredentialSource.
-var errGitHubAppNotImplemented = errors.New("config: credential type \"github-app\" is not yet implemented")
