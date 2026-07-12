@@ -81,6 +81,38 @@ func TestInvalidRequestMaps404(t *testing.T) {
 	}
 }
 
+// TestUpstreamUnreachableMaps502 pins the current (unasserted-until-now)
+// baseline for what happens when a request's host resolves to a
+// configured upstream, but the upstream itself is unreachable (dial
+// failure). httputil.ReverseProxy's default ErrorHandler maps this to a
+// 502 today; this is the seam M3 tightens (upstream 401/403 -> 502,
+// WWW-Authenticate stripped) per the plan's security invariants, so it
+// needs a pinned baseline before that logic lands on top.
+func TestUpstreamUnreachableMaps502(t *testing.T) {
+	// Stand up a server and close it immediately: its URL is well-formed
+	// but nothing is listening, so any request against it fails to dial
+	// rather than merely returning a non-2xx status.
+	deadSrv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL, err := url.Parse(deadSrv.URL)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", deadSrv.URL, err)
+	}
+	deadSrv.Close()
+
+	p := New(map[string]*url.URL{"testhost": deadURL}, discardLogger())
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("status = %d, want %d for an unreachable upstream", resp.StatusCode, http.StatusBadGateway)
+	}
+}
+
 func TestUnknownHostMaps404(t *testing.T) {
 	p := New(newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), discardLogger())
 	srv := httptest.NewServer(p)
