@@ -1,0 +1,72 @@
+name: CI
+
+# Runs on every push and PR. haybale is a single small Go module (unlike
+# Stirrup's multi-module workspace), so build/test/lint all fit in one
+# reusable job list without the version-label/ldflags machinery Stirrup
+# needs for its release process.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test ./...
+
+      # Covers internal/e2e's real `git clone` through the in-process
+      # proxy alongside a real `git http-backend` CGI upstream — the
+      # concurrency-sensitive path this milestone introduces.
+      - name: Test (race detector)
+        run: go test -race ./...
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install golangci-lint
+        env:
+          # Pinned to the version contributors run locally (matches
+          # Stirrup's pinned CI version) so `just lint` and this job
+          # produce identical diagnostics.
+          GOLANGCI_LINT_VERSION: 2.12.2
+        run: |
+          set -euo pipefail
+          archive="golangci-lint-${GOLANGCI_LINT_VERSION}-linux-amd64.tar.gz"
+          curl --fail --silent --show-error --location \
+            --output "/tmp/${archive}" \
+            "https://github.com/golangci/golangci-lint/releases/download/v${GOLANGCI_LINT_VERSION}/${archive}"
+          mkdir -p "${HOME}/.local/bin"
+          tar -xzf "/tmp/${archive}" \
+            -C "${HOME}/.local/bin" \
+            --strip-components=1 \
+            "golangci-lint-${GOLANGCI_LINT_VERSION}-linux-amd64/golangci-lint"
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+      - name: Run golangci-lint
+        run: golangci-lint run ./...

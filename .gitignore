@@ -1,0 +1,10 @@
+# Build artifacts
+/haybale
+*.test
+*.out
+
+# Coordinator scratch dir — never tracked
+.reviews/
+
+# Editor/OS cruft
+.DS_Store
