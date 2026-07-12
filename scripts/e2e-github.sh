@@ -306,17 +306,121 @@ export GIT_CONFIG_VALUE_1='!f() { echo username=x-access-token; echo "password=$
 REPO_URL="https://github.com/__OWNER__/__REPO__.git"
 WORKDIR=/tmp/work
 
+FORBIDDEN_REGEX='(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]|github_pat_[A-Za-z0-9_]|-----BEGIN[[:space:][:alnum:]]*PRIVATE KEY-----'
+
+# scan_forbidden scans every regular file reachable from / for
+# FORBIDDEN_REGEX, writing the sorted list of matching paths to $1.
+# Deliberately NOT `find -xdev`: -xdev excludes anything on a different
+# device than /, which silently drops real mounted volumes -- notably
+# alpine/git's own anonymous /git volume (confirmed via /proc/mounts: a
+# separate xfs mount, not part of the root overlay), and would also
+# silently drop /tmp itself (where the clone/push below actually
+# happens) under any runtime that mounts it separately. Pseudo-
+# filesystems (/proc, /sys, /dev) are pruned by NAME instead, so they're
+# excluded without excluding real storage that happens to live on its
+# own mount.
+#
+# Each candidate file is scanned individually (names NUL-delimited from
+# find -print0, one grep call per file) rather than batched through a
+# single `xargs grep`: batching makes "zero matches in this batch" and
+# "a real failure partway through this batch" both surface as the same
+# nonzero xargs exit code, which is exactly the silent-failure shape a
+# credential check must not have. Scanning file-by-file lets the
+# overwhelmingly common "no match in this one file" (grep exit 1) be
+# told apart from a genuine per-file error (any other nonzero).
+#
+# Returns 0 once the scan itself has completed -- zero matches is a
+# legitimate, successful outcome -- or 2 if the scan pipeline itself
+# broke, so a broken scan can never be indistinguishable from a
+# genuinely clean pass.
+scan_forbidden() {
+  outfile="$1"
+  names_tmp="$(mktemp)"
+
+  set +e
+  find / -path /proc -prune -o -path /sys -prune -o -path /dev -prune -o -type f -print0 \
+    > "$names_tmp" 2>/tmp/.scan_find_err
+  find_rc=$?
+  set -e
+  if [ "$find_rc" -ne 0 ]; then
+    echo "scan_forbidden: find failed (exit $find_rc):" >&2
+    cat /tmp/.scan_find_err >&2
+    rm -f "$names_tmp"
+    return 2
+  fi
+
+  : > "$outfile"
+  scan_errors=0
+  while IFS= read -r -d '' f; do
+    [ -n "$f" ] || continue
+    set +e
+    grep -qE "$FORBIDDEN_REGEX" "$f" 2>/tmp/.scan_grep_err
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+      echo "$f" >> "$outfile"
+    elif [ "$rc" -ne 1 ]; then
+      scan_errors=$((scan_errors + 1))
+      echo "scan_forbidden: grep failed on $f (exit $rc):" >&2
+      cat /tmp/.scan_grep_err >&2
+    fi
+  done < "$names_tmp"
+  rm -f "$names_tmp"
+
+  if [ "$scan_errors" -gt 0 ]; then
+    echo "scan_forbidden: $scan_errors file(s) could not be scanned" >&2
+    return 2
+  fi
+  sort -o "$outfile" "$outfile"
+  return 0
+}
+
+# hash_matches writes a "sha256sum  path" line for every path listed
+# (one per line) in $1 to $2. Lets an already-flagged path (e.g. the
+# stock ssh binaries' own PEM-format-detection string literals, treated
+# as a known baseline below) be re-checked for *content* changes rather
+# than treated as permanently cleared once its path is known -- a real
+# secret appended into one of those same paths would otherwise never
+# register as "new" under a path-only comparison.
+hash_matches() {
+  list="$1"
+  outfile="$2"
+  : > "$outfile"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    sha256sum "$f" >> "$outfile" 2>/dev/null || true
+  done < "$list"
+}
+
+# lookup_hash prints the hash recorded for an exact path in a
+# hash_matches-produced file ($1), or nothing if that path isn't in it.
+# An exact per-line comparison rather than `grep -F` substring matching,
+# since a plain substring search could false-positive when one baseline
+# path happens to be a suffix of another line in the file.
+lookup_hash() {
+  file="$1" target="$2"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    lpath="${line#*  }"
+    if [ "$lpath" = "$target" ]; then
+      printf '%s\n' "${line%%  *}"
+      return 0
+    fi
+  done < "$file"
+  return 1
+}
+
 # Baseline scan, before any of the above config or any network activity
 # touches disk: the base alpine/git image's own binaries (ssh, mostly)
 # contain string constants that coincidentally match the PEM-header
 # pattern below (format-detection code, not credential material), so
-# only a *newly introduced* match after the clone/push below counts as
-# a finding — see the final credential-less check.
-FORBIDDEN_REGEX='(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]|github_pat_[A-Za-z0-9_]|-----BEGIN[[:space:][:alnum:]]*PRIVATE KEY-----'
-scan_forbidden() {
-  find / -xdev -type f 2>/dev/null | xargs grep -lE "$FORBIDDEN_REGEX" 2>/dev/null | sort
-}
-scan_forbidden > /tmp/.baseline_matches || true
+# only material newly introduced or changed after the clone/push below
+# counts as a finding — see the final credential-less check.
+if ! scan_forbidden /tmp/.baseline_matches; then
+  echo "e2e-github(container): baseline credential scan itself failed -- aborting before any network activity" >&2
+  exit 1
+fi
+hash_matches /tmp/.baseline_matches /tmp/.baseline_hashes
 
 echo "== container: git clone $REPO_URL (rewritten through haybale) =="
 git clone "$REPO_URL" "$WORKDIR"
@@ -344,12 +448,42 @@ for f in "$HOME/.netrc" "$HOME/.git-credentials"; do
   fi
 done
 
-scan_forbidden > /tmp/.after_matches || true
-new_matches="$(grep -vxFf /tmp/.baseline_matches /tmp/.after_matches 2>/dev/null || true)"
-if [[ -n "$new_matches" ]]; then
-  echo "CREDENTIAL_CHECK: FAIL: forbidden credential pattern newly present in:"
-  echo "$new_matches"
+if ! scan_forbidden /tmp/.after_matches; then
+  echo "CREDENTIAL_CHECK: FAIL: after-run credential scan itself failed (see above) -- cannot assert credential-less"
   check_failed=1
+else
+  # Brand-new matches: a path that matches now but didn't even appear in
+  # the baseline scan's match list at all.
+  new_matches="$(grep -vxFf /tmp/.baseline_matches /tmp/.after_matches 2>/dev/null || true)"
+  if [[ -n "$new_matches" ]]; then
+    echo "CREDENTIAL_CHECK: FAIL: forbidden credential pattern newly present in:"
+    echo "$new_matches"
+    check_failed=1
+  fi
+
+  # Content-changed matches: a path that already matched at baseline
+  # (e.g. one of the stock ssh binaries' own PEM-detection strings,
+  # intentionally excluded above as a known false positive) whose
+  # *content* has since changed -- catches a secret appended into an
+  # already-excluded path, which the new-path check above cannot, since
+  # the path itself isn't new.
+  hash_matches /tmp/.after_matches /tmp/.after_hashes
+  changed_matches=""
+  while IFS= read -r hashline; do
+    [[ -n "$hashline" ]] || continue
+    fhash="${hashline%%  *}"
+    fpath="${hashline#*  }"
+    baseline_hash="$(lookup_hash /tmp/.baseline_hashes "$fpath" || true)"
+    if [[ -n "$baseline_hash" && "$fhash" != "$baseline_hash" ]]; then
+      changed_matches="$changed_matches$fpath
+"
+    fi
+  done < /tmp/.after_hashes
+  if [[ -n "$changed_matches" ]]; then
+    echo "CREDENTIAL_CHECK: FAIL: forbidden credential pattern content changed in already-flagged path(s):"
+    echo "$changed_matches"
+    check_failed=1
+  fi
 fi
 
 if env | grep -qE "$FORBIDDEN_REGEX"; then

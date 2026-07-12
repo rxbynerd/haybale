@@ -164,16 +164,27 @@ The container checks, before it exits:
 
 - `~/.netrc` and `~/.git-credentials` do not exist (the `GIT_CONFIG_*`
   approach never creates either).
-- No file on the container's filesystem (`find / -xdev`, i.e. the
-  container's own root filesystem — this naturally excludes `/proc`,
-  `/sys`, `/dev`, which are separate mounted filesystems) newly contains
-  a GitHub token shape (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/
-  `github_pat_`) or a PEM private-key header, compared against a
-  baseline scan taken before the container touches the network at all.
+- No file reachable from `/` — every real mount, not just the root
+  filesystem, including `alpine/git`'s own anonymous `/git` volume and
+  `/tmp` (where the clone/push actually happens) regardless of whether
+  a given runtime mounts it separately — newly contains a GitHub token
+  shape (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`) or a PEM
+  private-key header, compared against a baseline scan taken before the
+  container touches the network at all. `/proc`, `/sys`, `/dev` are
+  excluded by *name* (they're pseudo-filesystems, not real storage),
+  not by `find -xdev`'s device-boundary logic, so a real volume mounted
+  anywhere else is never silently skipped the way `-xdev` would skip
+  it. The comparison is content-aware, not just path-aware: a file
+  already flagged at baseline (see below) is re-hashed after the run,
+  so a secret appended into an already-known path is caught too, not
+  only a secret introduced under a brand-new path. A broken scan itself
+  (e.g. a missing `find`/`grep`) is a distinct, loud failure — never
+  silently indistinguishable from a genuinely clean 0-match pass.
   (The baseline exists because the stock `alpine/git` image's own `ssh`
   binaries contain PEM-format-detection string literals that otherwise
   false-positive on the PEM pattern — diffing against that baseline
-  means only material introduced by *this run* counts as a finding.)
+  means only material introduced or changed by *this run* counts as a
+  finding.)
 - No environment variable's value matches any of the same patterns.
 
 The minted upstream credential — a real `ghs_…` GitHub App installation
