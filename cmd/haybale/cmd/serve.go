@@ -72,6 +72,15 @@ func runServe(cmd *cobra.Command, path string) error {
 		// than silently ignored.
 		return fmt.Errorf("build credential sources: %w", err)
 	}
+	// Every *upstream.GitHubAppSource in credentialSources was built
+	// inside config.Validate(), before this logger existed, so it is
+	// still logging (if it ever needs to — see SetLogger's doc comment)
+	// through its own slog.Default() fallback. Installing the real
+	// logger here, before the proxy starts serving traffic, means its
+	// security.EventTokenMinted events go through the same
+	// ScrubHandler-wrapped logger as every other security event.
+	// StaticSource needs no such wiring — it never logs anything.
+	wireCredentialSourceLoggers(credentialSources, logger)
 
 	// Load already ran Validate(), which populates these from the
 	// identity/policy blocks — nil here would indicate a caller bug
@@ -133,6 +142,24 @@ func buildCredentialSources(cfg *config.Config) (map[string]upstream.CredentialS
 		sources[u.Host] = src
 	}
 	return sources, nil
+}
+
+// wireCredentialSourceLoggers installs logger into every
+// *upstream.GitHubAppSource found in sources, via SetLogger. Every
+// GitHubAppSource in sources was constructed inside config.Validate()
+// (called from config.Load, before logger exists — see
+// GitHubAppSource.SetLogger's doc comment for why), so without this call
+// its security.EventTokenMinted events would go through slog.Default()
+// instead of the ScrubHandler-wrapped logger everything else in this
+// process logs through. Must run once, at startup, before the proxy
+// starts serving traffic — SetLogger is not meant to be called
+// concurrently with an in-flight Credentials() call.
+func wireCredentialSourceLoggers(sources map[string]upstream.CredentialSource, logger *slog.Logger) {
+	for _, src := range sources {
+		if gh, ok := src.(*upstream.GitHubAppSource); ok {
+			gh.SetLogger(logger)
+		}
+	}
 }
 
 // parseLogLevel maps a validated config log level string to a

@@ -1,12 +1,25 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/rxbynerd/haybale/internal/config"
+	"github.com/rxbynerd/haybale/internal/gitproto"
+	"github.com/rxbynerd/haybale/internal/upstream"
 )
 
 // fakeTokenDigestHex is a structurally valid (64 hex char) SHA-256
@@ -127,5 +140,85 @@ func TestBuildCredentialSourcesRejectsUnvalidatedConfig(t *testing.T) {
 	}
 	if _, err := buildCredentialSources(cfg); err == nil {
 		t.Fatal("buildCredentialSources() = nil error, want an error for an unvalidated config")
+	}
+}
+
+// newFakeGitHubAppServer stands up a minimal httptest stand-in for the
+// two GitHub REST endpoints upstream.GitHubAppSource calls, resolving to
+// installationID and always minting token — good enough to observe
+// wireCredentialSourceLoggers actually took effect (see
+// TestWireCredentialSourceLoggers below), not to re-test
+// GitHubAppSource's own behavior (internal/upstream's own tests cover
+// that).
+func newFakeGitHubAppServer(t *testing.T, installationID int64, token string) string {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id": %d}`, installationID)
+	})
+	mux.HandleFunc("/app/installations/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = fmt.Fprintf(w, `{"token": %q, "expires_at": %q}`, token, time.Now().Add(time.Hour).Format(time.RFC3339))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// writeTestRSAKeyPEM generates a throwaway RSA private key (never
+// committed anywhere — generated fresh every test run) PEM-encoded, good
+// enough to construct a GitHubAppSource in these tests.
+func writeTestRSAKeyPEM(t *testing.T) []byte {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey: %v", err)
+	}
+	der := x509.MarshalPKCS1PrivateKey(key)
+	return pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: der})
+}
+
+// TestWireCredentialSourceLoggers asserts wireCredentialSourceLoggers
+// installs logger into every *upstream.GitHubAppSource in sources (so its
+// security.EventTokenMinted events go through the same ScrubHandler-
+// wrapped logger as everything else in the process — see the function's
+// own doc comment for why GitHubAppSource can't just take that logger at
+// construction time) and leaves a StaticSource untouched.
+func TestWireCredentialSourceLoggers(t *testing.T) {
+	fakeURL := newFakeGitHubAppServer(t, 42, "fake-minted-token")
+	ghSrc, err := upstream.NewGitHubAppSource(upstream.GitHubAppConfig{
+		AppID: 1, PrivateKeyPEM: writeTestRSAKeyPEM(t), APIBaseURL: fakeURL,
+	})
+	if err != nil {
+		t.Fatalf("NewGitHubAppSource: %v", err)
+	}
+	staticSrc, err := upstream.NewStaticSource("x-access-token", "static-token") //nolint:gosec // G101: fixed, fake test-only credential
+	if err != nil {
+		t.Fatalf("NewStaticSource: %v", err)
+	}
+
+	sources := map[string]upstream.CredentialSource{
+		"github.com":           ghSrc,
+		"git.internal.example": staticSrc,
+	}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	wireCredentialSourceLoggers(sources, logger)
+
+	repo := gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}
+	if _, err := ghSrc.Credentials(context.Background(), repo, gitproto.Read); err != nil {
+		t.Fatalf("Credentials() unexpected error: %v", err)
+	}
+	if !strings.Contains(buf.String(), `"event":"token_minted"`) {
+		t.Errorf("log output = %q, want a token_minted event logged through the installed logger", buf.String())
+	}
+
+	// staticSrc has no SetLogger method at all — wireCredentialSourceLoggers
+	// must simply skip it (via the type assertion), not panic.
+	if _, err := staticSrc.Credentials(context.Background(), repo, gitproto.Read); err != nil {
+		t.Fatalf("Credentials() unexpected error: %v", err)
 	}
 }
