@@ -15,8 +15,10 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/rxbynerd/haybale/internal/config"
+	"github.com/rxbynerd/haybale/internal/observability"
 	"github.com/rxbynerd/haybale/internal/proxy"
 	"github.com/rxbynerd/haybale/internal/security"
 	"github.com/rxbynerd/haybale/internal/upstream"
@@ -29,6 +31,15 @@ import (
 // bounded, guarding against a client that opens a connection and never
 // sends a request line.
 const readHeaderTimeout = 10 * time.Second
+
+// telemetryShutdownTimeout bounds how long process exit waits for the OTel
+// pipelines to flush and shut down. Unlike the proxy's data path (which
+// deliberately sets no transfer timeout), a telemetry collector that has
+// gone away must never hold the process open: this is a short, fixed
+// backstop, applied after in-flight requests have already drained, so the
+// last batch of spans/metrics/logs gets a fair chance to flush without
+// letting a dead collector stall shutdown indefinitely.
+const telemetryShutdownTimeout = 5 * time.Second
 
 var (
 	configPath       string
@@ -60,15 +71,47 @@ func runServe(cmd *cobra.Command, path string) error {
 		return err
 	}
 
-	// ScrubHandler wraps the leaf text handler so any token or credential
+	// Telemetry is set up before the logger so the OTLP log handler (when
+	// enabled) can be composed into it below. A disabled telemetry block
+	// (no endpoint) yields a no-op Providers: noop-backed metrics, a nil
+	// LogHandler, and a Shutdown that does nothing — so the wiring below is
+	// unconditional and haybale behaves exactly as it did pre-telemetry.
+	providers, err := observability.Setup(cmd.Context(), telemetryConfig(cfg))
+	if err != nil {
+		return fmt.Errorf("setup telemetry: %w", err)
+	}
+
+	// ScrubHandler wraps the leaf handler so any token or credential
 	// material that reaches a log call anywhere in haybale — a bug, since
 	// every call site should already pass only
 	// repo/owner/host/verb/identity — is redacted before it ever leaves
 	// the process, rather than relying solely on every call site getting
-	// that right.
-	logger := slog.New(security.NewScrubHandler(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+	// that right. When telemetry is enabled, the leaf fans out to both
+	// stderr and the OTLP bridge, and the ScrubHandler sits ABOVE that
+	// fan-out so both sinks receive already-scrubbed records — no log value
+	// leaves the process unscrubbed regardless of sink. The outermost
+	// SpanContextHandler stamps trace_id/span_id onto records emitted
+	// inside a request span (a no-op otherwise).
+	var leaf slog.Handler = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: parseLogLevel(cfg.LogLevel),
-	})))
+	})
+	if providers.LogHandler != nil {
+		leaf = observability.NewFanoutHandler(leaf, providers.LogHandler)
+	}
+	logger := slog.New(observability.NewSpanContextHandler(security.NewScrubHandler(leaf)))
+
+	// Shut the telemetry pipelines down on the way out — after
+	// serveWithGracefulDrain has returned (all in-flight requests drained),
+	// so the final spans, metrics, and logs of the run are flushed. Bounded
+	// so a collector that has gone away cannot make process exit hang. A
+	// no-op on a disabled Providers.
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), telemetryShutdownTimeout)
+		defer cancel()
+		if shutdownErr := providers.Shutdown(shutdownCtx); shutdownErr != nil {
+			logger.Warn("telemetry shutdown did not complete cleanly", "error", shutdownErr)
+		}
+	}()
 
 	upstreams, err := buildUpstreams(cfg)
 	if err != nil {
@@ -94,6 +137,11 @@ func runServe(cmd *cobra.Command, path string) error {
 	// ScrubHandler-wrapped logger as every other security event.
 	// StaticSource needs no such wiring — it never logs anything.
 	wireCredentialSourceLoggers(credentialSources, logger)
+	// Install the metric instruments into every GitHubAppSource the same
+	// way, and for the same reason, the logger is installed: the sources
+	// were built inside config.Validate(), before the telemetry pipeline
+	// existed. Must run once, at startup, before the proxy serves traffic.
+	wireCredentialSourceMetrics(credentialSources, providers.Metrics)
 
 	// Load already ran Validate(), which populates these from the
 	// identity/policy blocks — nil here would indicate a caller bug
@@ -101,11 +149,11 @@ func runServe(cmd *cobra.Command, path string) error {
 	// rejects a nil authenticator/policyEngine at construction, so that
 	// caller bug now surfaces here as an error rather than a panic on
 	// the first request.
-	p, err := proxy.New(upstreams, credentialSources, cfg.Identity.Authenticator(), cfg.Policy.Engine(), logger)
+	p, err := proxy.New(upstreams, credentialSources, cfg.Identity.Authenticator(), cfg.Policy.Engine(), logger, providers.Metrics)
 	if err != nil {
 		return fmt.Errorf("build proxy: %w", err)
 	}
-	srv, listenAndServe, scheme, err := newServer(cfg, p)
+	srv, listenAndServe, scheme, err := newServer(cfg, instrumentedHandler(cfg, p))
 	if err != nil {
 		return fmt.Errorf("build server: %w", err)
 	}
@@ -327,6 +375,75 @@ func wireCredentialSourceLoggers(sources map[string]upstream.CredentialSource, l
 			gh.SetLogger(logger)
 		}
 	}
+}
+
+// wireCredentialSourceMetrics installs metrics into every
+// *upstream.GitHubAppSource in sources, via SetMetrics — the metrics
+// counterpart of wireCredentialSourceLoggers, run for the same reason: the
+// sources were built inside config.Validate(), before the telemetry
+// pipeline existed. metrics is always non-nil (a disabled Providers still
+// carries noop-backed instruments), so a source that gets it simply records
+// into no-ops when telemetry is off. StaticSource needs no wiring — it
+// never mints and never touches a cache. Must run once, at startup, before
+// the proxy serves traffic.
+func wireCredentialSourceMetrics(sources map[string]upstream.CredentialSource, metrics *observability.Metrics) {
+	for _, src := range sources {
+		if gh, ok := src.(*upstream.GitHubAppSource); ok {
+			gh.SetMetrics(metrics)
+		}
+	}
+}
+
+// telemetryConfig translates the operator-facing config.TelemetryConfig
+// (kept free of any OpenTelemetry-SDK dependency) into the
+// observability.Config that Setup consumes. This is the single seam where
+// the two representations meet, so config never imports internal/observability
+// and internal/observability never parses the YAML file. The OTLP header
+// secret is resolved here, from the environment variable named by
+// HeadersEnv — never from the YAML — matching how a credential's tokenEnv
+// is read, so a bearer token can't end up committed to a config file.
+func telemetryConfig(cfg *config.Config) observability.Config {
+	var headers map[string]string
+	if cfg.Telemetry.HeadersEnv != "" {
+		headers = observability.ParseOTLPHeaders(os.Getenv(cfg.Telemetry.HeadersEnv))
+	}
+	return observability.Config{
+		Endpoint: cfg.Telemetry.Endpoint,
+		Protocol: cfg.Telemetry.Protocol,
+		Headers:  headers,
+		Resource: observability.ResourceOptions{
+			Environment:      cfg.Telemetry.Environment,
+			ServiceNamespace: cfg.Telemetry.ServiceNamespace,
+			Version:          version,
+		},
+	}
+}
+
+// instrumentedHandler wraps handler with otelhttp's HTTP-server
+// instrumentation (a server span and http.server.* metrics per request)
+// when telemetry is enabled, and returns handler unchanged when it is not —
+// so a disabled deployment carries none of otelhttp's per-request wrapping
+// overhead at all. /healthz is filtered out so load-balancer probes don't
+// flood the trace/metric backends with noise. The span name is kept
+// low-cardinality (method only; the host-in-path URL carries owner/repo,
+// which must not become part of a span name) — the proxy enriches the span
+// with haybale.host/verb/outcome attributes from inside ServeHTTP.
+func instrumentedHandler(cfg *config.Config, handler http.Handler) http.Handler {
+	if !cfg.Telemetry.Enabled() {
+		return handler
+	}
+	return otelhttp.NewHandler(
+		handler,
+		"haybale.request",
+		otelhttp.WithFilter(func(r *http.Request) bool {
+			// Trace everything except the load-balancer health probe.
+			isHealthz := r.Method == http.MethodGet && r.URL.Path == "/healthz"
+			return !isHealthz
+		}),
+		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+			return "haybale.request " + r.Method
+		}),
+	)
 }
 
 // parseLogLevel maps a validated config log level string to a

@@ -269,16 +269,12 @@ func buildLogExporter(ctx context.Context, cfg Config) (sdklog.Exporter, error) 
 func stripURLScheme(endpoint string) string {
 	for _, scheme := range []string{"https://", "http://"} {
 		if rest, ok := strings.CutPrefix(endpoint, scheme); ok {
-			if i := strings.IndexByte(rest, '/'); i >= 0 {
-				return rest[:i]
-			}
-			return rest
+			host, _, _ := strings.Cut(rest, "/")
+			return host
 		}
 	}
-	if i := strings.IndexByte(endpoint, '/'); i >= 0 {
-		return endpoint[:i]
-	}
-	return endpoint
+	host, _, _ := strings.Cut(endpoint, "/")
+	return host
 }
 
 // urlPath returns the path component of an OTLP endpoint URL, or "" when
@@ -307,6 +303,41 @@ func urlPath(endpoint string) string {
 // suffix the SDK would otherwise apply is tacked on here.
 func joinSignalPath(basePath, signal string) string {
 	return strings.TrimRight(basePath, "/") + "/v1/" + signal
+}
+
+// ParseOTLPHeaders parses an OTEL_EXPORTER_OTLP_HEADERS-style value — a
+// comma-separated list of "key=value" pairs, e.g.
+// "authorization=Bearer abc,x-tenant=acme" — into the header map the OTLP
+// exporters accept. Whitespace around each key and value is trimmed. Empty
+// pairs (a stray trailing comma) and pairs with an empty key are skipped;
+// a value may itself contain '=' (a bearer token, a base64 blob), so only
+// the first '=' splits the pair. Returns nil for an empty input, which the
+// exporter builders treat as "no headers".
+//
+// serve.go calls this on the value it reads from the operator's
+// TelemetryConfig.HeadersEnv variable, so a bearer token reaches an
+// exporter only ever from the environment, never from the YAML file.
+func ParseOTLPHeaders(raw string) map[string]string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	headers := make(map[string]string)
+	for pair := range strings.SplitSeq(raw, ",") {
+		key, value, found := strings.Cut(pair, "=")
+		if !found {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		headers[key] = strings.TrimSpace(value)
+	}
+	if len(headers) == 0 {
+		return nil
+	}
+	return headers
 }
 
 // isInsecureEndpoint reports whether the endpoint should be dialled without

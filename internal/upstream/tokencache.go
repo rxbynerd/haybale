@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/singleflight"
 
 	"github.com/rxbynerd/haybale/internal/gitproto"
+	"github.com/rxbynerd/haybale/internal/observability"
 )
 
 // earlyRefreshWindow is how long before a minted token's actual expiry
@@ -75,6 +77,23 @@ type tokenCache struct {
 	write map[repoKey]cachedToken
 
 	group singleflight.Group
+
+	// metrics records the haybale.token_cache.lookups counter (hit|miss).
+	// Installed once at startup via setMetrics (from
+	// GitHubAppSource.SetMetrics) and held in an atomic.Pointer so that
+	// install can't race a concurrent get(); nil until then, and every
+	// read is nil-guarded, so a tokenCache built directly in a test simply
+	// records nothing.
+	metrics atomic.Pointer[observability.Metrics]
+}
+
+// setMetrics installs m as the destination for the hit/miss counter. See
+// the metrics field's doc comment; a nil m is ignored.
+func (c *tokenCache) setMetrics(m *observability.Metrics) {
+	if m == nil {
+		return
+	}
+	c.metrics.Store(m)
 }
 
 // newTokenCache builds an empty tokenCache using now as its clock.
@@ -105,8 +124,14 @@ func (c *tokenCache) get(ctx context.Context, repo gitproto.Repo, verb gitproto.
 	now := c.now()
 
 	if cred, ok := c.lookup(key, verb, now); ok {
+		c.recordLookup(ctx, repo, verb, observability.ResultHit)
 		return cred, nil
 	}
+	// A miss is recorded once here, before the singleflight call, so it
+	// counts every caller that had no usable cached token — both the
+	// leader that runs the mint and any follower that merely waits on it —
+	// giving a hit ratio that reflects real mint pressure.
+	c.recordLookup(ctx, repo, verb, observability.ResultMiss)
 
 	// The singleflight key must include verb: a concurrent read and
 	// write for the same repo mint different scopes and must not
@@ -133,6 +158,15 @@ func (c *tokenCache) get(ctx context.Context, repo gitproto.Repo, verb gitproto.
 		return res.Val.(BasicAuth), nil
 	case <-ctx.Done():
 		return BasicAuth{}, ctx.Err()
+	}
+}
+
+// recordLookup emits one hit/miss observation on the cache counter, tagged
+// by host and verb (never by owner/repo — that would be unbounded
+// cardinality). A no-op until setMetrics has run.
+func (c *tokenCache) recordLookup(ctx context.Context, repo gitproto.Repo, verb gitproto.Verb, result string) {
+	if m := c.metrics.Load(); m != nil {
+		m.RecordCacheLookup(ctx, repo.Host, verb.String(), result)
 	}
 }
 

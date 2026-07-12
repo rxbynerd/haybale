@@ -27,8 +27,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/rxbynerd/haybale/internal/gitproto"
 	"github.com/rxbynerd/haybale/internal/identity"
+	"github.com/rxbynerd/haybale/internal/observability"
 	"github.com/rxbynerd/haybale/internal/policy"
 	"github.com/rxbynerd/haybale/internal/security"
 	"github.com/rxbynerd/haybale/internal/upstream"
@@ -54,6 +60,7 @@ type Proxy struct {
 	credentialSources map[string]upstream.CredentialSource
 	rp                *httputil.ReverseProxy
 	logger            *slog.Logger
+	metrics           *observability.Metrics
 	authenticator     identity.Authenticator
 	policyEngine      policy.Engine
 
@@ -113,8 +120,10 @@ type credentialContext struct {
 // this constructor should catch immediately, matching the
 // fail-fast-at-startup philosophy internal/config already uses.
 //
-// A nil logger falls back to slog.Default().
-func New(upstreams map[string]*url.URL, credentialSources map[string]upstream.CredentialSource, authenticator identity.Authenticator, policyEngine policy.Engine, logger *slog.Logger) (*Proxy, error) {
+// A nil logger falls back to slog.Default(); a nil metrics falls back to
+// observability.NewNoopMetrics() so every record call site is
+// unconditional and no path has to nil-check.
+func New(upstreams map[string]*url.URL, credentialSources map[string]upstream.CredentialSource, authenticator identity.Authenticator, policyEngine policy.Engine, logger *slog.Logger, metrics *observability.Metrics) (*Proxy, error) {
 	if authenticator == nil {
 		return nil, fmt.Errorf("proxy: authenticator is required")
 	}
@@ -124,12 +133,16 @@ func New(upstreams map[string]*url.URL, credentialSources map[string]upstream.Cr
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if metrics == nil {
+		metrics = observability.NewNoopMetrics()
+	}
 	p := &Proxy{
 		upstreams:         upstreams,
 		credentialSources: credentialSources,
 		authenticator:     authenticator,
 		policyEngine:      policyEngine,
 		logger:            logger,
+		metrics:           metrics,
 	}
 	p.rp = &httputil.ReverseProxy{
 		Rewrite: p.rewrite,
@@ -138,19 +151,35 @@ func New(upstreams map[string]*url.URL, credentialSources map[string]upstream.Cr
 		// percentages) streams live through the proxy rather than
 		// arriving in bursts.
 		FlushInterval: -1,
-		Transport: &http.Transport{
-			// Never let the transport request/decode its own gzip
-			// encoding — Content-Encoding and Accept-Encoding must pass
-			// through exactly as the client sent them, since this is a
-			// byte-for-byte passthrough, not a decoding proxy.
-			DisableCompression: true,
-			// ForceAttemptHTTP2 already defaults to false on a
-			// manually-constructed http.Transport (it is only true on
-			// http.DefaultTransport); set explicitly so the HTTP/1.1
-			// requirement is visible here rather than relying on that
-			// default.
-			ForceAttemptHTTP2: false,
-		},
+		// otelhttp.NewTransport wraps the upstream leg so each forwarded
+		// request produces a client span (parented to the inbound server
+		// span) and an http.client.* metric. It is given an EMPTY
+		// propagator deliberately: haybale must not inject its own
+		// traceparent/tracestate/baggage into the request it sends
+		// upstream, preserving the byte-for-byte passthrough invariant
+		// (the upstream leg carries only the headers the client sent plus
+		// the Authorization rewrite injects — see rewrite). Inbound trace
+		// continuation still works: the SERVER handler in serve.go uses the
+		// global W3C propagator to extract a traceparent a caller (a
+		// Stirrup sandbox) supplied, so haybale's spans still nest under
+		// the caller's trace. When telemetry is disabled the global tracer
+		// is a no-op and this wrapper adds negligible overhead.
+		Transport: otelhttp.NewTransport(
+			&http.Transport{
+				// Never let the transport request/decode its own gzip
+				// encoding — Content-Encoding and Accept-Encoding must pass
+				// through exactly as the client sent them, since this is a
+				// byte-for-byte passthrough, not a decoding proxy.
+				DisableCompression: true,
+				// ForceAttemptHTTP2 already defaults to false on a
+				// manually-constructed http.Transport (it is only true on
+				// http.DefaultTransport); set explicitly so the HTTP/1.1
+				// requirement is visible here rather than relying on that
+				// default.
+				ForceAttemptHTTP2: false,
+			},
+			otelhttp.WithPropagators(propagation.NewCompositeTextMapPropagator()),
+		),
 		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError),
 		// ModifyResponse maps a post-injection upstream 401/403 to a 502
 		// and resets the response headers to a minimal known-safe set
@@ -177,6 +206,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The server span otelhttp opened (in serve.go) lives on r.Context();
+	// enrich it as the request resolves so a trace carries haybale's own
+	// view (verb, host, outcome) alongside otelhttp's protocol attributes.
+	span := trace.SpanFromContext(r.Context())
+
 	repo, verb, err := gitproto.ParseRequest(r)
 	if err != nil {
 		// Malformed, dumb-protocol, and path-traversal requests all
@@ -187,6 +221,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// strings, never the raw request path/query) so a deployment
 		// under active probing has signal without an information leak
 		// or unbounded log-line size from attacker-controlled input.
+		span.SetAttributes(attribute.String("haybale.outcome", observability.OutcomeRejected))
+		p.metrics.RecordRejected(r.Context())
 		p.logger.Warn("rejected request", "reason", err.Error())
 		http.NotFound(w, r)
 		return
@@ -194,16 +230,36 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	base, ok := p.upstreams[repo.Host]
 	if !ok {
+		// Deliberately no host label on the metric here: repo.Host is
+		// attacker-controlled for an unknown upstream (see
+		// Metrics.RecordRejected). The span, which tolerates the
+		// cardinality, still gets the verb for debugging.
+		span.SetAttributes(
+			attribute.String("haybale.verb", verb.String()),
+			attribute.String("haybale.outcome", observability.OutcomeRejected),
+		)
+		p.metrics.RecordRejected(r.Context())
 		p.logger.Warn("rejected request", "reason", "unknown upstream host", "host", repo.Host)
 		http.NotFound(w, r)
 		return
 	}
+
+	// From here host is a configured upstream (a bounded label) and verb
+	// is known — safe to put both on the span and on metric labels.
+	span.SetAttributes(
+		attribute.String("haybale.host", repo.Host),
+		attribute.String("haybale.verb", verb.String()),
+		attribute.String("haybale.repo.owner", repo.Owner),
+		attribute.String("haybale.repo.name", repo.Name),
+	)
 
 	id, err := p.authenticator.Authenticate(r.Context(), r)
 	if err != nil {
 		// The credential itself is never logged — only that
 		// authentication failed and for which repo/verb it was
 		// attempted, which is the audit-relevant context.
+		span.SetAttributes(attribute.String("haybale.outcome", observability.OutcomeAuthnFailed))
+		p.metrics.RecordFailure(r.Context(), repo.Host, verb.String(), observability.OutcomeAuthnFailed)
 		security.Log(p.logger, security.EventAuthnFailed,
 			"host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "verb", verb.String())
 		w.Header().Set("WWW-Authenticate", wwwAuthenticateChallenge)
@@ -227,12 +283,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// exactly the same http.NotFound(w, r) call the two branches
 		// above use, with nothing written to w beforehand — do not add
 		// a header or a body here.
+		span.SetAttributes(
+			attribute.String("haybale.identity", id.ID),
+			attribute.String("haybale.outcome", observability.OutcomePolicyDenied),
+		)
+		p.metrics.RecordFailure(r.Context(), repo.Host, verb.String(), observability.OutcomePolicyDenied)
 		security.Log(p.logger, security.EventPolicyDenied,
 			"identity", id.ID, "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "verb", verb.String(),
 			"reason", decision.Reason, "matchedRule", matchedRule)
 		http.NotFound(w, r)
 		return
 	}
+	span.SetAttributes(attribute.String("haybale.identity", id.ID))
 
 	source, ok := p.credentialSources[repo.Host]
 	if !ok || source == nil {
@@ -244,6 +306,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// path production traffic should ever reach. It is handled
 		// identically to a Credentials() error below: 502, never 401,
 		// since the client still has no upstream credential to supply.
+		span.SetAttributes(attribute.String("haybale.outcome", observability.OutcomeUpstreamAuthFailed))
+		p.metrics.RecordFailure(r.Context(), repo.Host, verb.String(), observability.OutcomeUpstreamAuthFailed)
 		security.Log(p.logger, security.EventUpstreamAuthFailed,
 			"host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "verb", verb.String(),
 			"reason", "no credential source configured for this upstream")
@@ -259,6 +323,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// The error itself is never logged — only that it happened —
 		// since an implementation's error could in principle wrap
 		// response bytes from an upstream token-minting call.
+		span.SetAttributes(attribute.String("haybale.outcome", observability.OutcomeUpstreamAuthFailed))
+		p.metrics.RecordFailure(r.Context(), repo.Host, verb.String(), observability.OutcomeUpstreamAuthFailed)
 		security.Log(p.logger, security.EventUpstreamAuthFailed,
 			"host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "verb", verb.String(),
 			"reason", "credential source error")
@@ -275,9 +341,23 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var bytesOut atomic.Int64
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK, bytesOut: &bytesOut}
 
+	// In-flight gauge brackets exactly the forwarded transfer: incremented
+	// immediately before the (possibly multi-gigabyte, arbitrarily long)
+	// upstream stream begins and decremented via defer when it returns, so
+	// a stuck or saturating upstream shows up as a rising gauge. Uses
+	// r.Context() so the observation carries the request's trace context.
+	p.metrics.InFlightAdd(r.Context(), repo.Host, verb.String(), 1)
+	defer p.metrics.InFlightAdd(r.Context(), repo.Host, verb.String(), -1)
+
 	start := time.Now()
 	p.rp.ServeHTTP(rec, r.WithContext(ctx))
 	duration := time.Since(start)
+
+	span.SetAttributes(
+		attribute.String("haybale.outcome", observability.OutcomeProxied),
+		attribute.Int("http.response.status_code", rec.status),
+	)
+	p.metrics.RecordProxied(r.Context(), repo.Host, verb.String(), rec.status, duration, bytesIn.Load(), bytesOut.Load())
 
 	// Logged after ServeHTTP returns (rather than before, as a prior
 	// version of this line did at Debug level) so the log carries the
@@ -289,7 +369,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// response writer, never by buffering: pack data can run to
 	// gigabytes, so nothing here reads the body itself, only how many
 	// bytes passed through it.
-	p.logger.Info("proxied request",
+	//
+	// InfoContext (not Info) so the record carries r.Context(): when
+	// telemetry is on, the SpanContextHandler stamps this line with the
+	// same trace_id/span_id as the request span and the otelslog bridge
+	// ships it correlated. With telemetry off there is no active span and
+	// the context is simply ignored.
+	p.logger.InfoContext(r.Context(), "proxied request",
 		"identity", id.ID, "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "verb", verb.String(), "status", rec.status,
 		"bytesIn", bytesIn.Load(), "bytesOut", bytesOut.Load(), "durationMs", duration.Milliseconds())
 }

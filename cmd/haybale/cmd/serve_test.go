@@ -29,6 +29,7 @@ import (
 	"github.com/rxbynerd/haybale/internal/config"
 	"github.com/rxbynerd/haybale/internal/gitproto"
 	"github.com/rxbynerd/haybale/internal/identity"
+	"github.com/rxbynerd/haybale/internal/observability"
 	"github.com/rxbynerd/haybale/internal/policy"
 	"github.com/rxbynerd/haybale/internal/proxy"
 	"github.com/rxbynerd/haybale/internal/upstream"
@@ -381,7 +382,7 @@ func TestServeWithGracefulDrainWaitsForInFlightRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upstream.NewStaticSource(): %v", err)
 	}
-	p, err := proxy.New(map[string]*url.URL{"host": upstreamURL}, map[string]upstream.CredentialSource{"host": credSrc}, auth, eng, discardLogger())
+	p, err := proxy.New(map[string]*url.URL{"host": upstreamURL}, map[string]upstream.CredentialSource{"host": credSrc}, auth, eng, discardLogger(), observability.NewNoopMetrics())
 	if err != nil {
 		t.Fatalf("proxy.New(): %v", err)
 	}
@@ -510,7 +511,7 @@ func TestServeWithGracefulDrainExceedsFiniteTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upstream.NewStaticSource(): %v", err)
 	}
-	p, err := proxy.New(map[string]*url.URL{"host": upstreamURL}, map[string]upstream.CredentialSource{"host": credSrc}, auth, eng, discardLogger())
+	p, err := proxy.New(map[string]*url.URL{"host": upstreamURL}, map[string]upstream.CredentialSource{"host": credSrc}, auth, eng, discardLogger(), observability.NewNoopMetrics())
 	if err != nil {
 		t.Fatalf("proxy.New(): %v", err)
 	}

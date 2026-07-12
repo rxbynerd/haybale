@@ -3,7 +3,9 @@ package observability
 import (
 	"context"
 	"fmt"
+	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/metric"
@@ -93,9 +95,6 @@ type Metrics struct {
 	// mint traffic haybale generates.
 	TokenCacheLookups metric.Int64Counter
 }
-
-// meterName is the instrumentation scope the meter carries — the same
-// ScopeName shared with traces and logs.
 
 // NewNoopMetrics returns a Metrics whose instruments are all no-ops,
 // backed by noop.MeterProvider. Used when telemetry is disabled so every
@@ -194,6 +193,75 @@ func newMetricsFromMeter(meter metric.Meter, provider *sdkmetric.MeterProvider) 
 		return nil, err
 	}
 	return m, nil
+}
+
+// RecordRejected counts a request rejected before any auth check — a
+// gitproto parse failure or an unknown upstream host (both a 404). It
+// carries only the outcome label, deliberately no host: an unknown-host
+// rejection's host segment is attacker-controlled, so labelling with it
+// would let a probe explode metric-series cardinality. The rejected
+// request's detail still lands on its trace span, which tolerates it.
+func (m *Metrics) RecordRejected(ctx context.Context) {
+	m.RequestsTotal.Add(ctx, 1, metric.WithAttributes(attribute.String(attrOutcome, OutcomeRejected)))
+}
+
+// RecordFailure counts a request that resolved to a configured upstream
+// (so host is a bounded label) but failed before or during forwarding:
+// OutcomeAuthnFailed, OutcomePolicyDenied, or OutcomeUpstreamAuthFailed.
+func (m *Metrics) RecordFailure(ctx context.Context, host, verb, outcome string) {
+	m.RequestsTotal.Add(ctx, 1, metric.WithAttributes(
+		attribute.String(attrHost, host),
+		attribute.String(attrVerb, verb),
+		attribute.String(attrOutcome, outcome),
+	))
+}
+
+// RecordProxied records the full set of proxied-request observations in one
+// place: the outcome counter (with the upstream HTTP status), the latency
+// histogram, and the inbound/outbound byte histograms. status is the
+// client-visible status (after any modifyResponse rewrite); bytesIn and
+// bytesOut come from the streaming byte-counters, never from buffering.
+func (m *Metrics) RecordProxied(ctx context.Context, host, verb string, status int, duration time.Duration, bytesIn, bytesOut int64) {
+	hostVerb := []attribute.KeyValue{
+		attribute.String(attrHost, host),
+		attribute.String(attrVerb, verb),
+	}
+	m.RequestsTotal.Add(ctx, 1, metric.WithAttributes(append(hostVerb,
+		attribute.String(attrOutcome, OutcomeProxied),
+		attribute.Int(attrStatus, status),
+	)...))
+	m.RequestDuration.Record(ctx, duration.Seconds(), metric.WithAttributes(append(hostVerb,
+		attribute.String(attrOutcome, OutcomeProxied),
+	)...))
+	m.RequestBytesIn.Record(ctx, bytesIn, metric.WithAttributes(hostVerb...))
+	m.RequestBytesOut.Record(ctx, bytesOut, metric.WithAttributes(hostVerb...))
+}
+
+// InFlightAdd adds delta (+1 entering, -1 leaving) to the in-flight gauge
+// for host/verb.
+func (m *Metrics) InFlightAdd(ctx context.Context, host, verb string, delta int64) {
+	m.InFlight.Add(ctx, delta, metric.WithAttributes(
+		attribute.String(attrHost, host),
+		attribute.String(attrVerb, verb),
+	))
+}
+
+// RecordMint counts one GitHub App installation-token mint for host/verb.
+func (m *Metrics) RecordMint(ctx context.Context, host, verb string) {
+	m.TokensMinted.Add(ctx, 1, metric.WithAttributes(
+		attribute.String(attrHost, host),
+		attribute.String(attrVerb, verb),
+	))
+}
+
+// RecordCacheLookup counts one token-cache lookup for host/verb with the
+// given result (ResultHit or ResultMiss).
+func (m *Metrics) RecordCacheLookup(ctx context.Context, host, verb, result string) {
+	m.TokenCacheLookups.Add(ctx, 1, metric.WithAttributes(
+		attribute.String(attrHost, host),
+		attribute.String(attrVerb, verb),
+		attribute.String(attrResult, result),
+	))
 }
 
 // shutdown flushes and shuts the meter provider down. A no-op on the

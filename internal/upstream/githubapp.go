@@ -14,9 +14,16 @@ import (
 	"time"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/rxbynerd/haybale/internal/gitproto"
+	"github.com/rxbynerd/haybale/internal/observability"
 	"github.com/rxbynerd/haybale/internal/security"
 )
 
@@ -106,6 +113,17 @@ type GitHubAppSource struct {
 	// actually does more than once, but a test might) can't race with a
 	// concurrent Credentials() call reading it.
 	logger atomic.Pointer[slog.Logger]
+
+	// metrics is where GitHubAppSource records the haybale.tokens.minted
+	// counter, and is propagated to the embedded tokenCache for its
+	// hit/miss counter. Like logger it is installed post-construction via
+	// SetMetrics (construction happens inside config.Validate(), before
+	// serve.go has built the telemetry pipeline) and held in an
+	// atomic.Pointer so that install can't race a concurrent Credentials()
+	// read. nil until SetMetrics runs; every read is nil-guarded, so a
+	// GitHubAppSource that never gets metrics (a direct-construction test)
+	// simply records nothing.
+	metrics atomic.Pointer[observability.Metrics]
 }
 
 // NewGitHubAppSource builds a GitHubAppSource from cfg. It fails fast if
@@ -136,10 +154,25 @@ func NewGitHubAppSource(cfg GitHubAppConfig) (*GitHubAppSource, error) {
 	}
 	appsTransport.BaseURL = apiBaseURL
 
+	// otelhttp.NewTransport wraps the JWT-signing transport so the
+	// installation-lookup GET and the token-mint POST each emit a client
+	// span (nested under the haybale.mint span) and an http.client.*
+	// metric, making a slow GitHub/GHES control-plane call observable on
+	// its own. Given an EMPTY propagator so haybale never injects its
+	// traceparent into a request to the GitHub API — these are haybale's
+	// own control-plane calls, and there is no reason to leak its internal
+	// trace topology to the upstream. A no-op when telemetry is disabled
+	// (the global tracer/meter are no-ops). appHTTPClientTimeout still
+	// bounds the whole call as before.
+	instrumentedTransport := otelhttp.NewTransport(
+		appsTransport,
+		otelhttp.WithPropagators(propagation.NewCompositeTextMapPropagator()),
+	)
+
 	src := &GitHubAppSource{
 		appID:         cfg.AppID,
 		apiBaseURL:    strings.TrimRight(apiBaseURL, "/"),
-		httpClient:    &http.Client{Transport: appsTransport, Timeout: appHTTPClientTimeout},
+		httpClient:    &http.Client{Transport: instrumentedTransport, Timeout: appHTTPClientTimeout},
 		installations: newInstallationLookup(time.Now),
 		cache:         newTokenCache(time.Now),
 	}
@@ -160,6 +193,22 @@ func (s *GitHubAppSource) SetLogger(logger *slog.Logger) {
 		return
 	}
 	s.logger.Store(logger)
+}
+
+// SetMetrics installs metrics as the destination for this source's
+// haybale.tokens.minted counter and propagates it to the embedded
+// tokenCache for the hit/miss counter. Like SetLogger it exists as a
+// post-construction setter because construction happens inside
+// config.Validate(), before serve.go has built the telemetry pipeline, and
+// is intended to be called once at startup before the proxy serves traffic
+// (see the metrics field's doc comment). A nil metrics is ignored, leaving
+// this source recording nothing — matching SetLogger's nil handling.
+func (s *GitHubAppSource) SetMetrics(metrics *observability.Metrics) {
+	if metrics == nil {
+		return
+	}
+	s.metrics.Store(metrics)
+	s.cache.setMetrics(metrics)
 }
 
 // Credentials implements CredentialSource. It returns a cached, still-valid
@@ -193,8 +242,26 @@ func (s *GitHubAppSource) Credentials(ctx context.Context, repo gitproto.Repo, v
 // and the installation ID — never the token itself, in the event or in
 // any error this returns.
 func (s *GitHubAppSource) mint(ctx context.Context, repo gitproto.Repo, verb gitproto.Verb) (BasicAuth, time.Time, error) {
+	// A span brackets the whole mint — the installation lookup GET and the
+	// token POST (each of which also gets its own client span from the
+	// otelhttp-wrapped httpClient below) — so a slow mint is visible as a
+	// distinct child of the request span rather than hidden inside overall
+	// request latency. Uses the global tracer, which is a no-op when
+	// telemetry is disabled. Owner/repo are span attributes (traces
+	// tolerate the cardinality); they are never metric labels.
+	ctx, span := otel.Tracer(observability.ScopeName).Start(ctx, "haybale.mint",
+		trace.WithAttributes(
+			attribute.String("haybale.host", repo.Host),
+			attribute.String("haybale.repo.owner", repo.Owner),
+			attribute.String("haybale.repo.name", repo.Name),
+			attribute.String("haybale.verb", verb.String()),
+		),
+	)
+	defer span.End()
+
 	installationID, err := s.installations.get(ctx, s.httpClient, s.apiBaseURL, repo.Owner, repo.Name)
 	if err != nil {
+		span.SetStatus(codes.Error, "resolve installation")
 		return BasicAuth{}, time.Time{}, fmt.Errorf("upstream: github app source: resolve installation for %s/%s: %w", repo.Owner, repo.Name, err)
 	}
 
@@ -207,18 +274,21 @@ func (s *GitHubAppSource) mint(ctx context.Context, repo gitproto.Repo, verb git
 		Permissions:  mintPermissions{Contents: permission},
 	})
 	if err != nil {
+		span.SetStatus(codes.Error, "encode mint request")
 		return BasicAuth{}, time.Time{}, fmt.Errorf("upstream: github app source: encode mint request: %w", err)
 	}
 
 	url := fmt.Sprintf("%s/app/installations/%d/access_tokens", s.apiBaseURL, installationID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
 	if err != nil {
+		span.SetStatus(codes.Error, "build mint request")
 		return BasicAuth{}, time.Time{}, fmt.Errorf("upstream: github app source: build mint request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
+		span.SetStatus(codes.Error, "mint token")
 		return BasicAuth{}, time.Time{}, fmt.Errorf("upstream: github app source: mint token: %w", err)
 	}
 	defer drain(resp.Body)
@@ -229,14 +299,23 @@ func (s *GitHubAppSource) mint(ctx context.Context, repo gitproto.Repo, verb git
 		// GitHub error body is just a JSON message (never a token), this
 		// keeps that guarantee by construction rather than by trusting
 		// GitHub's API shape never to change.
+		span.SetStatus(codes.Error, "mint token: unexpected status")
 		return BasicAuth{}, time.Time{}, fmt.Errorf("upstream: github app source: mint token: unexpected status %d", resp.StatusCode)
 	}
 
 	var tokenResp mintResponse
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		span.SetStatus(codes.Error, "decode mint response")
 		return BasicAuth{}, time.Time{}, fmt.Errorf("upstream: github app source: decode mint response: %w", err)
 	}
 
+	// installationID is a stable, non-secret identifier, safe as a span
+	// attribute; the token itself is never put on the span, the counter,
+	// the event, or any error — the same guarantee mint has always held.
+	span.SetAttributes(attribute.Int64("haybale.installation_id", installationID))
+	if m := s.metrics.Load(); m != nil {
+		m.RecordMint(ctx, repo.Host, verb.String())
+	}
 	security.Log(s.logger.Load(), security.EventTokenMinted,
 		"host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "verb", verb.String(),
 		"appID", s.appID, "installationID", installationID)
