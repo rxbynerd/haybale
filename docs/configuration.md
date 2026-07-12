@@ -135,8 +135,13 @@ a YAML file of identity IDs and their token digests:
 # identities.yaml
 identities:
   - id: run-9f2c1a
-    tokenDigest: sha256:3f9c...  # SHA-256 hex digest, "sha256:" prefix required
+    tokenDigest: sha256:601ed2eb0237bdc2a29c718763b4890384abca0a61e38938a0e22526be20c9f4
 ```
+
+(A full, valid 64-hex-char SHA-256 digest — the exact shape `haybale
+token new` prints. `decodeDigest` rejects anything shorter, so a
+truncated placeholder like `sha256:3f9c...` would fail to load if
+copy-pasted.)
 
 Only the digest is ever persisted — haybale never stores or logs a raw
 token. To provision a new identity:
@@ -330,7 +335,7 @@ upstreams:
 # /etc/haybale/identities.yaml
 identities:
   - id: run-9f2c1a
-    tokenDigest: sha256:3f9c1e6b2a...
+    tokenDigest: sha256:601ed2eb0237bdc2a29c718763b4890384abca0a61e38938a0e22526be20c9f4
 ```
 
 ```yaml
