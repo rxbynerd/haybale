@@ -73,3 +73,20 @@ func runGit(t *testing.T, gitPath, dir string, env []string, args ...string) str
 	}
 	return string(out)
 }
+
+// runGitExpectError is runGit's mirror image for the M2 negative tests:
+// it runs `git <args>` expecting the command to fail (a denied clone or
+// push), returning the combined output for the caller to inspect — e.g.
+// for the HTTP status git reported — and failing the test if the
+// command unexpectedly succeeds.
+func runGitExpectError(t *testing.T, gitPath, dir string, env []string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command(gitPath, args...) //nolint:gosec // see runGit
+	cmd.Dir = dir
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("git %s (dir=%s) unexpectedly succeeded:\n%s", strings.Join(args, " "), dir, out)
+	}
+	return string(out)
+}

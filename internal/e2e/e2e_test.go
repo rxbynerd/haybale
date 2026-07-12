@@ -1,15 +1,14 @@
 // Package e2e is haybale's crown-jewel integration harness: it exercises
 // a real `git clone` subprocess against an in-process haybale proxy that
 // forwards to a real `git http-backend` CGI upstream — no mocked git
-// protocol, no stubbed proxy behaviour. M1's proxy has no identity or
-// policy layer yet, so this covers the passthrough path end to end;
-// M2/M3 extend this same harness with negative cases (bad token, policy
-// denial, upstream auth) as those layers land.
+// protocol, no stubbed proxy behaviour, and (since M2) the real
+// identity.StaticTokenAuthenticator and policy.GlobEngine wired in ahead
+// of the passthrough, not test stubs. M3 extends this same harness with
+// upstream-credential negative cases (mint failure, upstream auth) as
+// that layer lands.
 package e2e
 
 import (
-	"io"
-	"log/slog"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -17,6 +16,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/rxbynerd/haybale/internal/policy"
 	"github.com/rxbynerd/haybale/internal/proxy"
 )
 
@@ -52,11 +52,17 @@ func TestCloneThroughProxy(t *testing.T) {
 		t.Fatalf("url.Parse(%q): %v", upstreamSrv.URL, err)
 	}
 
-	haybale := proxy.New(map[string]*url.URL{hostKey: upstreamURL}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	const testID = "run-e2e-clone"
+	auth, token := mintTestToken(t, testID)
+	eng := newPolicy(t, []policy.Rule{
+		{Identities: []string{testID}, Repos: []string{repoKey(hostKey, owner, repoName)}, Permissions: []policy.Permission{policy.PermissionRead, policy.PermissionWrite}},
+	})
+
+	haybale := proxy.New(map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
 	haybaleSrv := httptest.NewServer(haybale)
 	t.Cleanup(haybaleSrv.Close)
 
-	cloneURL := haybaleSrv.URL + "/" + hostKey + "/" + owner + "/" + repoName + ".git"
+	cloneURL := withToken(t, haybaleSrv.URL+"/"+hostKey+"/"+owner+"/"+repoName+".git", token)
 
 	clientHome := t.TempDir()
 	clientEnv := isolatedGitEnv(clientHome)
@@ -105,11 +111,17 @@ func TestPushThroughProxy(t *testing.T) {
 		t.Fatalf("url.Parse(%q): %v", upstreamSrv.URL, err)
 	}
 
-	haybale := proxy.New(map[string]*url.URL{hostKey: upstreamURL}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	const testID = "run-e2e-push"
+	auth, token := mintTestToken(t, testID)
+	eng := newPolicy(t, []policy.Rule{
+		{Identities: []string{testID}, Repos: []string{repoKey(hostKey, owner, repoName)}, Permissions: []policy.Permission{policy.PermissionRead, policy.PermissionWrite}},
+	})
+
+	haybale := proxy.New(map[string]*url.URL{hostKey: upstreamURL}, auth, eng, discardLogger())
 	haybaleSrv := httptest.NewServer(haybale)
 	t.Cleanup(haybaleSrv.Close)
 
-	cloneURL := haybaleSrv.URL + "/" + hostKey + "/" + owner + "/" + repoName + ".git"
+	cloneURL := withToken(t, haybaleSrv.URL+"/"+hostKey+"/"+owner+"/"+repoName+".git", token)
 
 	clientHome := t.TempDir()
 	clientEnv := isolatedGitEnv(clientHome)
