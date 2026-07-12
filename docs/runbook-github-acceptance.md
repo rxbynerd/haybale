@@ -86,6 +86,11 @@ covers every other repo the App could technically reach.
 Prerequisites: `just build` succeeds, `gh` is authenticated (`gh auth
 status`), and a container runtime is installed — this dev environment
 uses **podman** (docker is not installed), at `/opt/podman/bin/podman`.
+The key at `HAYBALE_APP_KEY_PATH` must be `chmod 600` (see step 6 in
+[Section 1](#1-creating-a-github-app-for-this-skip-if-reusing-haybale-dev),
+which applies whether or not you created the App yourself) —
+`haybale serve` refuses to start otherwise (`internal/config.Validate()`,
+CWE-732).
 
 ```
 HAYBALE_APP_KEY_PATH=/path/to/haybale-dev.private-key.pem just e2e-github
