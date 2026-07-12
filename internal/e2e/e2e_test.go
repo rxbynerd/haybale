@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -73,5 +74,60 @@ func TestCloneThroughProxy(t *testing.T) {
 
 	if got := rec.GitProtocol(); got != "version=2" {
 		t.Errorf("upstream saw Git-Protocol = %q, want %q — haybale must forward this header verbatim or protocol v2 silently downgrades to v1", got, "version=2")
+	}
+}
+
+// TestPushThroughProxy is the real-git write-path acceptance test for
+// M1, mirroring TestCloneThroughProxy's harness but exercising
+// git-receive-pack (git push) instead of git-upload-pack (git clone).
+// Until this test, the write path had no real-git regression coverage in
+// this harness — only clone did — despite being the path M2's policy
+// gate and M3's credential injection change first and most
+// consequentially. The test asserts the push succeeds and the upstream
+// bare repo's HEAD SHA now matches the pushed commit.
+func TestPushThroughProxy(t *testing.T) {
+	gitPath, httpBackendPath := requireGit(t)
+
+	projectRoot := t.TempDir()
+	bareDir, _ := newBareRepoWithCommit(t, gitPath, projectRoot, owner, repoName)
+
+	// git-http-backend disables git-receive-pack (push) by default for
+	// anonymous (unauthenticated) requests — which every request through
+	// this CGI upstream is, since newUpstream sets up no auth. The bare
+	// repo must opt in explicitly.
+	repoEnv := isolatedGitEnv(t.TempDir())
+	runGit(t, gitPath, bareDir, repoEnv, "config", "http.receivepack", "true")
+
+	upstreamSrv, _ := newUpstream(t, httpBackendPath, projectRoot)
+
+	upstreamURL, err := url.Parse(upstreamSrv.URL)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", upstreamSrv.URL, err)
+	}
+
+	haybale := proxy.New(map[string]*url.URL{hostKey: upstreamURL}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	haybaleSrv := httptest.NewServer(haybale)
+	t.Cleanup(haybaleSrv.Close)
+
+	cloneURL := haybaleSrv.URL + "/" + hostKey + "/" + owner + "/" + repoName + ".git"
+
+	clientHome := t.TempDir()
+	clientEnv := isolatedGitEnv(clientHome)
+	cloneDir := filepath.Join(t.TempDir(), "clone")
+	runGit(t, gitPath, t.TempDir(), clientEnv, "clone", "--quiet", cloneURL, cloneDir)
+
+	newFile := filepath.Join(cloneDir, "NEWFILE.md")
+	if err := os.WriteFile(newFile, []byte("pushed through the haybale e2e harness\n"), 0o644); err != nil {
+		t.Fatalf("write NEWFILE.md: %v", err)
+	}
+	runGit(t, gitPath, cloneDir, clientEnv, "add", "NEWFILE.md")
+	runGit(t, gitPath, cloneDir, clientEnv, "commit", "--quiet", "-m", "add NEWFILE.md")
+	wantSHA := strings.TrimSpace(runGit(t, gitPath, cloneDir, clientEnv, "rev-parse", "HEAD"))
+
+	runGit(t, gitPath, cloneDir, clientEnv, "push", "--quiet", "origin", "HEAD:main")
+
+	gotSHA := strings.TrimSpace(runGit(t, gitPath, bareDir, repoEnv, "rev-parse", "HEAD"))
+	if gotSHA != wantSHA {
+		t.Errorf("bare repo HEAD after push = %s, want pushed commit %s", gotSHA, wantSHA)
 	}
 }
