@@ -76,6 +76,19 @@ func TestValidate(t *testing.T) {
 			wantErr: "must be an absolute URL",
 		},
 		{
+			name: "upstream baseURL is unparseable",
+			cfg: Config{
+				Listen:   ":8466",
+				LogLevel: "info",
+				// An unterminated IPv6 literal: url.Parse rejects this
+				// outright (not merely "no scheme"), exercising the
+				// url.Parse error branch Validate()'s doc comment
+				// promises to reject but which had no test coverage.
+				Upstreams: []Upstream{{Host: "github.com", BaseURL: "http://[::1"}},
+			},
+			wantErr: "not a valid URL",
+		},
+		{
 			name: "duplicate upstream host",
 			cfg: Config{
 				Listen:   ":8466",
@@ -105,6 +118,27 @@ func TestValidate(t *testing.T) {
 				t.Fatalf("Validate() error = %q, want substring %q", err.Error(), tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestValidatePopulatesParsedBaseURL(t *testing.T) {
+	cfg := Config{
+		Listen:   ":8466",
+		LogLevel: "info",
+		Upstreams: []Upstream{
+			{Host: "github.com", BaseURL: "https://github.com:8443"},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected error: %v", err)
+	}
+
+	parsed := cfg.Upstreams[0].ParsedBaseURL()
+	if parsed == nil {
+		t.Fatal("ParsedBaseURL() = nil after successful Validate()")
+	}
+	if got := parsed.String(); got != "https://github.com:8443" {
+		t.Errorf("ParsedBaseURL().String() = %q, want %q", got, "https://github.com:8443")
 	}
 }
 

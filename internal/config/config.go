@@ -56,6 +56,24 @@ type Upstream struct {
 	// BaseURL is the upstream's base URL that requests are rewritten
 	// against, e.g. "https://github.com".
 	BaseURL string `yaml:"baseURL"`
+
+	// parsedBaseURL caches the *url.URL Validate() parsed from BaseURL
+	// while checking well-formedness, so callers building the map
+	// internal/proxy.New consumes (buildUpstreams in
+	// cmd/haybale/cmd/serve.go) reuse that exact parse via ParsedBaseURL
+	// instead of independently re-parsing BaseURL — one parse, one
+	// source of truth for what "the upstream's URL" means.
+	parsedBaseURL *url.URL
+}
+
+// ParsedBaseURL returns the *url.URL a prior successful call to
+// Validate() parsed from BaseURL, or nil if Validate() has not yet run
+// (or did not return nil) for this Upstream. Every production config
+// flows through Load (which always calls Validate) before this is read,
+// so a nil result at that point indicates a caller bug, not a runtime
+// condition.
+func (u Upstream) ParsedBaseURL() *url.URL {
+	return u.parsedBaseURL
 }
 
 // Load reads and parses the YAML file at path, applies defaults, and
@@ -105,7 +123,8 @@ func (c *Config) Validate() error {
 	}
 
 	seen := make(map[string]bool, len(c.Upstreams))
-	for i, u := range c.Upstreams {
+	for i := range c.Upstreams {
+		u := &c.Upstreams[i]
 		if u.Host == "" {
 			return fmt.Errorf("upstreams[%d]: host is required", i)
 		}
@@ -124,6 +143,7 @@ func (c *Config) Validate() error {
 		if parsed.Scheme == "" || parsed.Host == "" {
 			return fmt.Errorf("upstreams[%d] (host %q): baseURL %q must be an absolute URL with scheme and host", i, u.Host, u.BaseURL)
 		}
+		u.parsedBaseURL = parsed
 	}
 
 	return nil

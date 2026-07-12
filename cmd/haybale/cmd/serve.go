@@ -76,13 +76,16 @@ func runServe(cmd *cobra.Command, path string) error {
 }
 
 // buildUpstreams converts config.Upstreams (already validated) into the
-// host->baseURL map internal/proxy.New expects.
+// host->baseURL map internal/proxy.New expects, reusing the exact
+// *url.URL Validate() already parsed from each BaseURL rather than
+// parsing the string a second time — this closes the gap where the URL
+// Validate() checked and the URL the proxy actually dials could diverge.
 func buildUpstreams(cfg *config.Config) (map[string]*url.URL, error) {
 	upstreams := make(map[string]*url.URL, len(cfg.Upstreams))
 	for _, u := range cfg.Upstreams {
-		parsed, err := url.Parse(u.BaseURL)
-		if err != nil {
-			return nil, fmt.Errorf("upstream %q: %w", u.Host, err)
+		parsed := u.ParsedBaseURL()
+		if parsed == nil {
+			return nil, fmt.Errorf("upstream %q: baseURL was not validated (call Validate() before buildUpstreams)", u.Host)
 		}
 		upstreams[u.Host] = parsed
 	}

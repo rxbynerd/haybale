@@ -29,10 +29,18 @@ func TestParseLogLevel(t *testing.T) {
 
 func TestBuildUpstreams(t *testing.T) {
 	cfg := &config.Config{
+		LogLevel: "info",
 		Upstreams: []config.Upstream{
 			{Host: "github.com", BaseURL: "https://github.com"},
 			{Host: "git.internal.example", BaseURL: "https://git.internal.example:8443"},
 		},
+	}
+	// buildUpstreams reuses the *url.URL Validate() parsed onto each
+	// Upstream (R1) rather than re-parsing BaseURL itself, so Validate()
+	// must run first here — exactly as runServe already does via
+	// config.Load.
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
 	}
 
 	upstreams, err := buildUpstreams(cfg)
