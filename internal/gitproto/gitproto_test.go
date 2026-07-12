@@ -3,6 +3,7 @@ package gitproto
 import (
 	"errors"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -215,6 +216,20 @@ func TestParseRequest(t *testing.T) {
 				t.Errorf("ParseRequest(%s %s) verb = %v, want %v", tt.method, tt.target, verb, tt.wantVerb)
 			}
 		})
+	}
+}
+
+// TestInvalidSingleLine pins the R2 fix: invalid()'s .Error() must never
+// contain a newline, or every rejection log line that includes it would
+// break in half. errors.Join (the prior implementation) violated this;
+// fmt.Errorf("%w: %s", ...) does not.
+func TestInvalidSingleLine(t *testing.T) {
+	err := invalid("some reason")
+	if strings.Contains(err.Error(), "\n") {
+		t.Errorf("invalid(%q).Error() = %q, contains a newline", "some reason", err.Error())
+	}
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Errorf("invalid(%q) does not satisfy errors.Is(_, ErrInvalidRequest)", "some reason")
 	}
 }
 

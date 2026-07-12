@@ -21,6 +21,7 @@ package gitproto
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 )
@@ -72,8 +73,15 @@ var ErrInvalidRequest = errors.New("gitproto: invalid smart-HTTP request")
 // invalid wraps reason under ErrInvalidRequest so callers can use
 // errors.Is(err, ErrInvalidRequest) while still getting a descriptive
 // message for logs.
+//
+// This must produce a single-line .Error() string: errors.Join renders
+// each joined error on its own line, which would split every rejection
+// log entry in two and corrupt line-oriented log ingestion the moment a
+// caller logs err.Error() (as the proxy's rejection logging does).
+// fmt.Errorf's %w keeps errors.Is(_, ErrInvalidRequest) working while
+// keeping the message on one line.
 func invalid(reason string) error {
-	return errors.Join(ErrInvalidRequest, errors.New(reason))
+	return fmt.Errorf("%w: %s", ErrInvalidRequest, reason)
 }
 
 // ParseRequest extracts the target Repo and Verb from r, or an error
