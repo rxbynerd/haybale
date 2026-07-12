@@ -105,7 +105,10 @@ func runServe(cmd *cobra.Command, path string) error {
 	if err != nil {
 		return fmt.Errorf("build proxy: %w", err)
 	}
-	srv, listenAndServe, scheme := newServer(cfg, p)
+	srv, listenAndServe, scheme, err := newServer(cfg, p)
+	if err != nil {
+		return fmt.Errorf("build server: %w", err)
+	}
 
 	logger.Info("starting haybale", "listen", cfg.Listen, "scheme", scheme, "upstreams", len(upstreams), "drainTimeout", cfg.ParsedDrainTimeout())
 	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "haybale listening on %s://%s\n", scheme, cfg.Listen); err != nil {
@@ -144,9 +147,18 @@ func runServe(cmd *cobra.Command, path string) error {
 // multi-gigabyte pack transfer is allowed to take; only
 // ReadHeaderTimeout bounds anything, for TLS exactly as for plain HTTP.
 //
+// Returns an error, rather than panicking, if cfg.TLS.Enabled() is true
+// but cfg.TLS.Certificate() is nil — TLSConfig.Certificate's own doc
+// comment says this happens when Validate() hasn't run yet, which is
+// unreachable via runServe (config.Load always calls Validate) but is
+// exactly the caller-bug case buildUpstreams/buildCredentialSources
+// already guard against for their own inputs; newServer's TLS branch
+// should fail the same clean way rather than nil-pointer-panicking on
+// *cfg.TLS.Certificate().
+//
 // Extracted from runServe so TLS wiring is testable without a real
 // listener — see TestNewServerTLSEnabled/TestNewServerPlainHTTP.
-func newServer(cfg *config.Config, handler http.Handler) (srv *http.Server, listenAndServe func() error, scheme string) {
+func newServer(cfg *config.Config, handler http.Handler) (srv *http.Server, listenAndServe func() error, scheme string, err error) {
 	srv = &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           handler,
@@ -154,14 +166,19 @@ func newServer(cfg *config.Config, handler http.Handler) (srv *http.Server, list
 	}
 
 	if !cfg.TLS.Enabled() {
-		return srv, srv.ListenAndServe, "http"
+		return srv, srv.ListenAndServe, "http", nil
+	}
+
+	cert := cfg.TLS.Certificate()
+	if cert == nil {
+		return nil, nil, "", fmt.Errorf("newServer: tls is enabled but no certificate was loaded (config.Validate() must run before newServer)")
 	}
 
 	srv.TLSConfig = &tls.Config{
-		Certificates: []tls.Certificate{*cfg.TLS.Certificate()},
+		Certificates: []tls.Certificate{*cert},
 		MinVersion:   tls.VersionTLS12,
 	}
-	return srv, func() error { return srv.ListenAndServeTLS("", "") }, "https"
+	return srv, func() error { return srv.ListenAndServeTLS("", "") }, "https", nil
 }
 
 // serveWithGracefulDrain runs listenAndServe (srv.ListenAndServe or the

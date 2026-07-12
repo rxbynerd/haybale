@@ -219,7 +219,10 @@ func TestNewServerPlainHTTP(t *testing.T) {
 		t.Fatalf("Validate(): %v", err)
 	}
 
-	srv, listenAndServe, scheme := newServer(cfg, http.NotFoundHandler())
+	srv, listenAndServe, scheme, err := newServer(cfg, http.NotFoundHandler())
+	if err != nil {
+		t.Fatalf("newServer() unexpected error: %v", err)
+	}
 	if scheme != "http" {
 		t.Errorf("scheme = %q, want %q", scheme, "http")
 	}
@@ -251,9 +254,12 @@ func TestNewServerTLSEnabled(t *testing.T) {
 		t.Fatalf("Validate(): %v", err)
 	}
 
-	srv, _, scheme := newServer(cfg, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv, _, scheme, err := newServer(cfg, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
+	if err != nil {
+		t.Fatalf("newServer() unexpected error: %v", err)
+	}
 	if scheme != "https" {
 		t.Errorf("scheme = %q, want %q", scheme, "https")
 	}
@@ -295,6 +301,37 @@ func TestNewServerTLSEnabled(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestNewServerRejectsUnvalidatedTLSConfig asserts newServer fails
+// cleanly (an error, not a nil-pointer panic on *cfg.TLS.Certificate())
+// when handed a Config whose "tls" block is enabled but was never run
+// through config.Validate() — the same "caller forgot to call
+// Validate()" caller-bug scenario
+// TestBuildCredentialSourcesRejectsUnvalidatedConfig already covers for
+// buildCredentialSources, and buildUpstreams for ParsedBaseURL.
+func TestNewServerRejectsUnvalidatedTLSConfig(t *testing.T) {
+	cfg := &config.Config{
+		Upstreams: []config.Upstream{{Host: "github.com", BaseURL: "https://github.com"}},
+		TLS:       config.TLSConfig{CertPath: "/etc/haybale/tls.crt", KeyPath: "/etc/haybale/tls.key"},
+	}
+	// Deliberately not calling cfg.Validate(): TLS.Enabled() is true
+	// (both CertPath/KeyPath are set) but TLS.Certificate() stays nil,
+	// since only Validate() ever populates it.
+
+	srv, listenAndServe, scheme, err := newServer(cfg, http.NotFoundHandler())
+	if err == nil {
+		t.Fatal("newServer() = nil error, want an error for an unvalidated TLS config")
+	}
+	if srv != nil {
+		t.Errorf("newServer() srv = %v, want nil alongside a non-nil error", srv)
+	}
+	if listenAndServe != nil {
+		t.Error("newServer() listenAndServe != nil, want nil alongside a non-nil error")
+	}
+	if scheme != "" {
+		t.Errorf("newServer() scheme = %q, want %q alongside a non-nil error", scheme, "")
 	}
 }
 
