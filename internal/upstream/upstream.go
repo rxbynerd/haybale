@@ -41,6 +41,18 @@ type BasicAuth struct {
 // client) has no upstream credential of its own to supply, and
 // re-prompting it would only hang the client on a credential it cannot
 // produce.
+//
+// Credentials must be safe to call concurrently from multiple
+// goroutines: the proxy invokes it once per in-flight request with no
+// external synchronization.
+//
+// Implementations are responsible for enforcing their own
+// timeout/deadline on Credentials. The proxy passes the inbound
+// request's context through unmodified and imposes no bound of its own —
+// the server intentionally sets no read/write/idle timeout (to permit
+// multi-gigabyte pack transfers), so an implementation that blocks
+// unboundedly (e.g. a hung upstream API call) will hang the request
+// indefinitely.
 type CredentialSource interface {
 	Credentials(ctx context.Context, repo gitproto.Repo, verb gitproto.Verb) (BasicAuth, error)
 }
