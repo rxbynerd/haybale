@@ -295,6 +295,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	span.SetAttributes(attribute.String("haybale.identity", id.ID))
+	if id.Issuer != "" {
+		// The VERIFIED issuer (post-authentication) is drawn from the
+		// operator's own bounded, configured issuer set — never the
+		// attacker-controlled unverified `iss` — so it is safe as a
+		// low-cardinality span attribute for audit correlation.
+		span.SetAttributes(attribute.String("haybale.issuer", id.Issuer))
+	}
 
 	source, ok := p.credentialSources[repo.Host]
 	if !ok || source == nil {
@@ -376,7 +383,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// ships it correlated. With telemetry off there is no active span and
 	// the context is simply ignored.
 	p.logger.InfoContext(r.Context(), "proxied request",
-		"identity", id.ID, "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "verb", verb.String(), "status", rec.status,
+		"identity", id.ID, "issuer", id.Issuer, "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "verb", verb.String(), "status", rec.status,
 		"bytesIn", bytesIn.Load(), "bytesOut", bytesOut.Load(), "durationMs", duration.Milliseconds())
 }
 

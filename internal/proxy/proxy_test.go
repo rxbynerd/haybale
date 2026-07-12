@@ -117,7 +117,7 @@ const testIdentityID = "test-identity"
 // allowAllAuthenticator authenticates any request as testIdentityID
 // regardless of what credential (if any) is presented. Tests that only
 // care about routing/streaming behaviour use this rather than standing
-// up a real identity.StaticTokenAuthenticator fixture.
+// up a real identity.JWTAuthenticator fixture.
 type allowAllAuthenticator struct{}
 
 func (allowAllAuthenticator) Authenticate(context.Context, *http.Request) (*identity.Identity, error) {
@@ -809,6 +809,47 @@ func TestPolicyDenialMaps404(t *testing.T) {
 
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+// scopedAuthenticator authenticates every request as testIdentityID
+// carrying a fixed RepoScope, so the proxy+policy repo-scope intersection
+// can be exercised end to end (a real JWT is verified in
+// internal/identity's own tests; here the concern is only that a scope
+// miss maps to the same 404 a policy denial does).
+type scopedAuthenticator struct{ scope []string }
+
+func (a scopedAuthenticator) Authenticate(context.Context, *http.Request) (*identity.Identity, error) {
+	return &identity.Identity{ID: testIdentityID, RepoScope: a.scope}, nil
+}
+
+// TestRepoScopeMissMaps404 confirms a repo outside the token's own
+// RepoScope is denied by the real GlobEngine (policy ∩ scope) and, like
+// every policy denial, surfaces to the client as a 404 — no existence
+// oracle distinguishing "out of token scope" from "does not exist".
+func TestRepoScopeMissMaps404(t *testing.T) {
+	// Policy would allow all of acme; the token's scope narrows it to
+	// widgets only, so gadgets is denied.
+	eng, err := policy.NewGlobEngine([]policy.Rule{
+		{Identities: []string{testIdentityID}, Repos: []string{"testhost/acme/*"}, Permissions: []policy.Permission{policy.PermissionRead}},
+	})
+	if err != nil {
+		t.Fatalf("policy.NewGlobEngine: %v", err)
+	}
+	auth := scopedAuthenticator{scope: []string{"testhost/acme/widgets"}}
+	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"}), auth, eng, discardLogger())
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	// Out-of-scope repo: denied → 404.
+	resp, err := http.Get(srv.URL + "/testhost/acme/gadgets.git/info/refs?service=git-upload-pack")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("out-of-scope repo status = %d, want %d", resp.StatusCode, http.StatusNotFound)
 	}
 }
 

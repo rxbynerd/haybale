@@ -119,22 +119,26 @@ func writePolicyCheckTestConfig(t *testing.T, policyRulesYAML string) string {
 
 	dir := t.TempDir()
 
-	identityPath := filepath.Join(dir, "identities.yaml")
-	identityContent := "identities:\n  - id: run-1\n    tokenDigest: sha256:" + fakeTokenDigestHex + "\n"
-	if err := os.WriteFile(identityPath, []byte(identityContent), 0o600); err != nil {
-		t.Fatalf("os.WriteFile(identities.yaml): %v", err)
-	}
-
 	policyPath := filepath.Join(dir, "policy.yaml")
 	if err := os.WriteFile(policyPath, []byte(policyRulesYAML), 0o600); err != nil {
 		t.Fatalf("os.WriteFile(policy.yaml): %v", err)
 	}
 
+	// The jwksFile deliberately need not exist: `haybale policy check`
+	// loads the config offline, and identity validation is structural (it
+	// never fetches or reads the JWKS — that is BuildAuthenticator's job,
+	// which policy check never invokes). This is exactly the offline path
+	// keeping the JWKS fetch out of Validate() is designed to protect.
+	jwksPath := filepath.Join(dir, "jwks.json")
 	haybalePath := filepath.Join(dir, "haybale.yaml")
 	haybaleContent := `
 identity:
-  type: static-token-file
-  path: ` + identityPath + `
+  type: jwt
+  issuers:
+    - issuer: https://issuer.example
+      jwksFile: ` + jwksPath + `
+      audiences: [https://haybale.internal]
+      identityTemplate: "{sub}"
 policy:
   path: ` + policyPath + `
 upstreams:

@@ -143,13 +143,24 @@ func runServe(cmd *cobra.Command, path string) error {
 	// existed. Must run once, at startup, before the proxy serves traffic.
 	wireCredentialSourceMetrics(credentialSources, providers.Metrics)
 
-	// Load already ran Validate(), which populates these from the
-	// identity/policy blocks — nil here would indicate a caller bug
-	// (Validate() didn't run), not a runtime condition. proxy.New itself
-	// rejects a nil authenticator/policyEngine at construction, so that
-	// caller bug now surfaces here as an error rather than a panic on
-	// the first request.
-	p, err := proxy.New(upstreams, credentialSources, cfg.Identity.Authenticator(), cfg.Policy.Engine(), logger, providers.Metrics)
+	// Build the JWT authenticator now, at startup: this performs each
+	// issuer's initial JWKS fetch (fail-fast — an unreachable or empty
+	// JWKS refuses to serve traffic rather than failing per-request) and
+	// launches the background refresh goroutines, bound to cmd.Context()
+	// so they stop when the server shuts down. Deliberately not done in
+	// config.Validate() (see IdentityConfig.BuildAuthenticator): that path
+	// also runs for the offline `haybale policy check`, which must never
+	// reach out to a JWKS endpoint. The policy engine, by contrast, is
+	// pure file loading and stays in Validate() — Engine() below reuses
+	// exactly what Validate() built.
+	authenticator, err := cfg.Identity.BuildAuthenticator(cmd.Context(), logger)
+	if err != nil {
+		return fmt.Errorf("build authenticator: %w", err)
+	}
+	// proxy.New rejects a nil authenticator/policyEngine at construction,
+	// so a caller bug (Validate() didn't run, leaving Engine() nil)
+	// surfaces here as an error rather than a panic on the first request.
+	p, err := proxy.New(upstreams, credentialSources, authenticator, cfg.Policy.Engine(), logger, providers.Metrics)
 	if err != nil {
 		return fmt.Errorf("build proxy: %w", err)
 	}

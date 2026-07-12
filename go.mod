@@ -3,7 +3,10 @@ module github.com/rxbynerd/haybale
 go 1.26.1
 
 require (
+	github.com/MicahParks/jwkset v0.11.0
+	github.com/MicahParks/keyfunc/v3 v3.8.0
 	github.com/bradleyfalzon/ghinstallation/v2 v2.19.0
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/spf13/cobra v1.10.2
 	go.opentelemetry.io/contrib/bridges/otelslog v0.19.0
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.69.0
@@ -21,6 +24,7 @@ require (
 	go.opentelemetry.io/otel/sdk/metric v1.44.0
 	go.opentelemetry.io/otel/trace v1.44.0
 	golang.org/x/sync v0.22.0
+	golang.org/x/time v0.9.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
