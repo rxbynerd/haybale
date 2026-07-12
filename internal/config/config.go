@@ -3,10 +3,13 @@
 //
 // Validate() is fail-fast: it is called once at startup (Load does this
 // automatically) so a misconfigured deployment refuses to serve traffic
-// rather than failing unpredictably on the first request. The shape here
-// covers only what M1 needs (listen address, log level, upstreams); M2
-// and M3 add identity and policy blocks alongside Upstream without
-// restructuring what's here.
+// rather than failing unpredictably on the first request. This includes
+// the identity and policy blocks: Validate() doesn't just check their
+// paths are non-empty, it loads and parses the files at those paths (via
+// internal/identity and internal/policy), so a malformed identities.yaml
+// or policy.yaml fails startup exactly like a bad upstream baseURL does.
+// M3 adds credential blocks alongside Upstream without restructuring
+// what's here.
 package config
 
 import (
@@ -16,6 +19,9 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/rxbynerd/haybale/internal/identity"
+	"github.com/rxbynerd/haybale/internal/policy"
 )
 
 // defaultListen is used when Listen is left empty in the YAML.
@@ -40,10 +46,62 @@ type Config struct {
 	// LogLevel is one of debug|info|warn|error. Defaults to "info" when
 	// empty.
 	LogLevel string `yaml:"logLevel"`
+	// Identity configures how haybale authenticates inbound requests.
+	Identity IdentityConfig `yaml:"identity"`
+	// Policy configures how haybale authorizes an authenticated
+	// request.
+	Policy PolicyConfig `yaml:"policy"`
 	// Upstreams lists the git hosts haybale proxies to, keyed by the
 	// first path segment of the host-in-path URL scheme
 	// (/{host}/{owner}/{repo}.git/<endpoint>).
 	Upstreams []Upstream `yaml:"upstreams"`
+}
+
+// identityTypeStaticTokenFile is the only Identity.Type value v0.1
+// supports: a static, file-backed set of identity -> token-digest
+// mappings (internal/identity.StaticTokenAuthenticator).
+const identityTypeStaticTokenFile = "static-token-file"
+
+// IdentityConfig selects and configures haybale's identity.Authenticator.
+type IdentityConfig struct {
+	// Type is a discriminator selecting which Authenticator
+	// implementation to build; the only supported value in v0.1 is
+	// "static-token-file".
+	Type string `yaml:"type"`
+	// Path is the identities.yaml file Validate() loads the
+	// Authenticator from, when Type is "static-token-file".
+	Path string `yaml:"path"`
+
+	// authenticator caches the identity.Authenticator Validate() built
+	// from Path, so callers (cmd/haybale/cmd/serve.go in particular)
+	// reuse that exact value instead of re-parsing Path — the same
+	// pattern Upstream.parsedBaseURL/ParsedBaseURL already establishes.
+	authenticator identity.Authenticator
+}
+
+// Authenticator returns the identity.Authenticator a prior successful
+// call to Validate() built from Path, or nil if Validate() has not yet
+// run (or did not return nil) for this IdentityConfig.
+func (c IdentityConfig) Authenticator() identity.Authenticator {
+	return c.authenticator
+}
+
+// PolicyConfig configures haybale's policy.Engine.
+type PolicyConfig struct {
+	// Path is the policy.yaml file Validate() loads the Engine from.
+	Path string `yaml:"path"`
+
+	// engine caches the policy.Engine Validate() built from Path, for
+	// the same reuse-not-reparse reason IdentityConfig.authenticator
+	// does.
+	engine policy.Engine
+}
+
+// Engine returns the policy.Engine a prior successful call to
+// Validate() built from Path, or nil if Validate() has not yet run (or
+// did not return nil) for this PolicyConfig.
+func (c PolicyConfig) Engine() policy.Engine {
+	return c.engine
 }
 
 // Upstream is one upstream git host haybale can proxy requests to.
@@ -110,9 +168,11 @@ func (c *Config) applyDefaults() {
 
 // Validate fail-fasts on anything that would make Config unusable at
 // startup: an unrecognised log level, no upstreams at all, an upstream
-// with a missing host or an unparseable/relative BaseURL, or two
-// upstreams sharing the same Host key (which would make routing
-// ambiguous).
+// with a missing host or an unparseable/relative BaseURL, two upstreams
+// sharing the same Host key (which would make routing ambiguous), an
+// unsupported or unconfigured Identity, or an Identity/Policy file that
+// is missing, malformed, or otherwise fails its own package's
+// validation.
 func (c *Config) Validate() error {
 	if !validLogLevels[strings.ToLower(c.LogLevel)] {
 		return fmt.Errorf("logLevel %q is not one of debug, info, warn, error", c.LogLevel)
@@ -145,6 +205,35 @@ func (c *Config) Validate() error {
 		}
 		u.parsedBaseURL = parsed
 	}
+
+	switch c.Identity.Type {
+	case identityTypeStaticTokenFile:
+		if c.Identity.Path == "" {
+			return fmt.Errorf("identity: path is required for type %q", identityTypeStaticTokenFile)
+		}
+		auth, err := identity.LoadStaticTokenAuthenticator(c.Identity.Path)
+		if err != nil {
+			// LoadStaticTokenAuthenticator's own errors are already
+			// prefixed "identity: ...", so returning err directly (not
+			// wrapping it again) avoids a doubled prefix.
+			return err
+		}
+		c.Identity.authenticator = auth
+	default:
+		return fmt.Errorf("identity: type %q is not supported (must be %q)", c.Identity.Type, identityTypeStaticTokenFile)
+	}
+
+	if c.Policy.Path == "" {
+		return fmt.Errorf("policy: path is required")
+	}
+	engine, err := policy.LoadGlobEngine(c.Policy.Path)
+	if err != nil {
+		// LoadGlobEngine's own errors are already prefixed "policy:
+		// ...", so returning err directly (not wrapping it again)
+		// avoids a doubled prefix.
+		return err
+	}
+	c.Policy.engine = engine
 
 	return nil
 }

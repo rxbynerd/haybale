@@ -7,104 +7,304 @@ import (
 	"testing"
 )
 
+// fakeTokenDigest is a structurally valid "sha256:<hex>" tokenDigest
+// value good enough for exercising config-level validation, which only
+// cares that identities.yaml parses and decodes — it never needs to
+// correspond to any real token.
+const fakeTokenDigest = "sha256:" + "11" + "22" + "33" + "44" + "55" + "66" + "77" + "88" +
+	"99" + "aa" + "bb" + "cc" + "dd" + "ee" + "ff" + "00" +
+	"11" + "22" + "33" + "44" + "55" + "66" + "77" + "88" +
+	"99" + "aa" + "bb" + "cc" + "dd" + "ee" + "ff" + "00"
+
+// writeValidIdentityAndPolicyFiles writes a minimal valid identities.yaml
+// and policy.yaml under t.TempDir(), returning their paths. Every
+// TestValidate case that isn't itself exercising identity/policy
+// validation uses these so the rest of Validate() can be tested in
+// isolation.
+func writeValidIdentityAndPolicyFiles(t *testing.T) (identityPath, policyPath string) {
+	t.Helper()
+	dir := t.TempDir()
+
+	identityPath = filepath.Join(dir, "identities.yaml")
+	identityContent := "identities:\n  - id: run-1\n    tokenDigest: " + fakeTokenDigest + "\n"
+	if err := os.WriteFile(identityPath, []byte(identityContent), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(identities.yaml): %v", err)
+	}
+
+	policyPath = filepath.Join(dir, "policy.yaml")
+	policyContent := "rules:\n  - identities: [\"run-*\"]\n    repos: [\"github.com/acme/*\"]\n    permissions: [read, write]\n"
+	if err := os.WriteFile(policyPath, []byte(policyContent), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(policy.yaml): %v", err)
+	}
+
+	return identityPath, policyPath
+}
+
 func TestValidate(t *testing.T) {
 	validUpstream := Upstream{Host: "github.com", BaseURL: "https://github.com"}
 
 	tests := []struct {
 		name    string
-		cfg     Config
+		cfg     func(t *testing.T) Config
 		wantErr string // substring expected in the error; "" means no error
 	}{
 		{
 			name: "valid minimal config",
-			cfg: Config{
-				Listen:    ":8466",
-				LogLevel:  "info",
-				Upstreams: []Upstream{validUpstream},
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
 			},
 		},
 		{
 			name: "log level is case-insensitive",
-			cfg: Config{
-				Listen:    ":8466",
-				LogLevel:  "DEBUG",
-				Upstreams: []Upstream{validUpstream},
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "DEBUG",
+					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
 			},
 		},
 		{
 			name: "unknown log level",
-			cfg: Config{
-				Listen:    ":8466",
-				LogLevel:  "verbose",
-				Upstreams: []Upstream{validUpstream},
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "verbose",
+					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
 			},
 			wantErr: "logLevel",
 		},
 		{
 			name: "no upstreams",
-			cfg: Config{
-				Listen:   ":8466",
-				LogLevel: "info",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:   PolicyConfig{Path: policyPath},
+				}
 			},
 			wantErr: "at least one upstream",
 		},
 		{
 			name: "upstream missing host",
-			cfg: Config{
-				Listen:    ":8466",
-				LogLevel:  "info",
-				Upstreams: []Upstream{{BaseURL: "https://github.com"}},
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{{BaseURL: "https://github.com"}},
+				}
 			},
 			wantErr: "host is required",
 		},
 		{
 			name: "upstream missing baseURL",
-			cfg: Config{
-				Listen:    ":8466",
-				LogLevel:  "info",
-				Upstreams: []Upstream{{Host: "github.com"}},
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{{Host: "github.com"}},
+				}
 			},
 			wantErr: "baseURL is required",
 		},
 		{
 			name: "upstream baseURL missing scheme",
-			cfg: Config{
-				Listen:    ":8466",
-				LogLevel:  "info",
-				Upstreams: []Upstream{{Host: "github.com", BaseURL: "github.com"}},
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{{Host: "github.com", BaseURL: "github.com"}},
+				}
 			},
 			wantErr: "must be an absolute URL",
 		},
 		{
 			name: "upstream baseURL is unparseable",
-			cfg: Config{
-				Listen:   ":8466",
-				LogLevel: "info",
-				// An unterminated IPv6 literal: url.Parse rejects this
-				// outright (not merely "no scheme"), exercising the
-				// url.Parse error branch Validate()'s doc comment
-				// promises to reject but which had no test coverage.
-				Upstreams: []Upstream{{Host: "github.com", BaseURL: "http://[::1"}},
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:   PolicyConfig{Path: policyPath},
+					// An unterminated IPv6 literal: url.Parse rejects this
+					// outright (not merely "no scheme"), exercising the
+					// url.Parse error branch Validate()'s doc comment
+					// promises to reject but which had no test coverage.
+					Upstreams: []Upstream{{Host: "github.com", BaseURL: "http://[::1"}},
+				}
 			},
 			wantErr: "not a valid URL",
 		},
 		{
 			name: "duplicate upstream host",
-			cfg: Config{
-				Listen:   ":8466",
-				LogLevel: "info",
-				Upstreams: []Upstream{
-					{Host: "github.com", BaseURL: "https://github.com"},
-					{Host: "github.com", BaseURL: "https://github.example.com"},
-				},
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:   PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{
+						{Host: "github.com", BaseURL: "https://github.com"},
+						{Host: "github.com", BaseURL: "https://github.example.com"},
+					},
+				}
 			},
 			wantErr: "duplicate host",
+		},
+		{
+			name: "identity type empty",
+			cfg: func(t *testing.T) Config {
+				_, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "identity: type",
+		},
+		{
+			name: "identity type unsupported",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					Identity:  IdentityConfig{Type: "ldap", Path: identityPath},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "identity: type",
+		},
+		{
+			name: "identity path empty",
+			cfg: func(t *testing.T) Config {
+				_, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "identity: path is required",
+		},
+		{
+			name: "identity path does not exist",
+			cfg: func(t *testing.T) Config {
+				_, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: filepath.Join(t.TempDir(), "nope.yaml")},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "identity:",
+		},
+		{
+			name: "identity file fails its own validation",
+			cfg: func(t *testing.T) Config {
+				dir := t.TempDir()
+				identityPath := filepath.Join(dir, "identities.yaml")
+				if err := os.WriteFile(identityPath, []byte("identities: []\n"), 0o600); err != nil {
+					t.Fatalf("os.WriteFile: %v", err)
+				}
+				_, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "at least one identity",
+		},
+		{
+			name: "policy path empty",
+			cfg: func(t *testing.T) Config {
+				identityPath, _ := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "policy: path is required",
+		},
+		{
+			name: "policy path does not exist",
+			cfg: func(t *testing.T) Config {
+				identityPath, _ := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:    PolicyConfig{Path: filepath.Join(t.TempDir(), "nope.yaml")},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "policy:",
+		},
+		{
+			name: "policy file fails its own validation",
+			cfg: func(t *testing.T) Config {
+				identityPath, _ := writeValidIdentityAndPolicyFiles(t)
+				dir := t.TempDir()
+				policyPath := filepath.Join(dir, "policy.yaml")
+				badPolicy := "rules:\n  - identities: [\"run-*\"]\n    repos: [\"github.com/acme/*\"]\n    permissions: [admin]\n"
+				if err := os.WriteFile(policyPath, []byte(badPolicy), 0o600); err != nil {
+					t.Fatalf("os.WriteFile: %v", err)
+				}
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: `must be "read" or "write"`,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := tt.cfg.Validate()
+			cfg := tt.cfg(t)
+			err := cfg.Validate()
 			if tt.wantErr == "" {
 				if err != nil {
 					t.Fatalf("Validate() unexpected error: %v", err)
@@ -122,9 +322,12 @@ func TestValidate(t *testing.T) {
 }
 
 func TestValidatePopulatesParsedBaseURL(t *testing.T) {
+	identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
 	cfg := Config{
 		Listen:   ":8466",
 		LogLevel: "info",
+		Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+		Policy:   PolicyConfig{Path: policyPath},
 		Upstreams: []Upstream{
 			{Host: "github.com", BaseURL: "https://github.com:8443"},
 		},
@@ -139,6 +342,27 @@ func TestValidatePopulatesParsedBaseURL(t *testing.T) {
 	}
 	if got := parsed.String(); got != "https://github.com:8443" {
 		t.Errorf("ParsedBaseURL().String() = %q, want %q", got, "https://github.com:8443")
+	}
+}
+
+func TestValidatePopulatesAuthenticatorAndEngine(t *testing.T) {
+	identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+	cfg := Config{
+		Listen:    ":8466",
+		LogLevel:  "info",
+		Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+		Policy:    PolicyConfig{Path: policyPath},
+		Upstreams: []Upstream{{Host: "github.com", BaseURL: "https://github.com"}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected error: %v", err)
+	}
+
+	if cfg.Identity.Authenticator() == nil {
+		t.Error("Identity.Authenticator() = nil after successful Validate()")
+	}
+	if cfg.Policy.Engine() == nil {
+		t.Error("Policy.Engine() = nil after successful Validate()")
 	}
 }
 
@@ -173,10 +397,16 @@ func TestApplyDefaultsDoesNotOverrideExplicitValues(t *testing.T) {
 
 func TestLoad(t *testing.T) {
 	dir := t.TempDir()
+	identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
 	path := filepath.Join(dir, "haybale.yaml")
 	yamlContent := `
 listen: ":9999"
 logLevel: warn
+identity:
+  type: static-token-file
+  path: ` + identityPath + `
+policy:
+  path: ` + policyPath + `
 upstreams:
   - host: github.com
     baseURL: https://github.com
@@ -203,12 +433,24 @@ upstreams:
 	if cfg.Upstreams[0].Host != "github.com" || cfg.Upstreams[0].BaseURL != "https://github.com" {
 		t.Errorf("Upstreams[0] = %+v, want {github.com https://github.com}", cfg.Upstreams[0])
 	}
+	if cfg.Identity.Authenticator() == nil {
+		t.Error("Identity.Authenticator() = nil after Load()")
+	}
+	if cfg.Policy.Engine() == nil {
+		t.Error("Policy.Engine() = nil after Load()")
+	}
 }
 
 func TestLoadAppliesDefaults(t *testing.T) {
 	dir := t.TempDir()
+	identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
 	path := filepath.Join(dir, "haybale.yaml")
 	yamlContent := `
+identity:
+  type: static-token-file
+  path: ` + identityPath + `
+policy:
+  path: ` + policyPath + `
 upstreams:
   - host: github.com
     baseURL: https://github.com
@@ -233,6 +475,10 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "haybale.yaml")
 	// No upstreams: Validate() must fail, and Load() must surface it.
+	// Also omits identity/policy blocks, but the missing-upstreams error
+	// is checked first in Validate() only because it's asserted here —
+	// the point of this test is that Load() propagates whatever error
+	// Validate() returns, not which specific error fires first.
 	if err := os.WriteFile(path, []byte("listen: \":8466\"\n"), 0o600); err != nil {
 		t.Fatalf("os.WriteFile: %v", err)
 	}
