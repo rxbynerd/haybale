@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel"
@@ -66,9 +67,19 @@ type Config struct {
 func (c Config) Enabled() bool { return c.Endpoint != "" }
 
 // Validate checks the telemetry config in isolation, without dialling
-// anything, so a misconfigured protocol fails fast at startup (from
-// config.Validate) rather than on the first export attempt. A disabled
-// config (empty Endpoint) is always valid.
+// anything, so a misconfiguration fails fast at startup rather than on the
+// first export attempt. Setup calls it (after resolving the header secret)
+// before building any pipeline; a disabled config (empty Endpoint) is
+// always valid.
+//
+// Two things are checked: the protocol enum, and — the reason this runs
+// here rather than only in internal/config — that OTLP request headers are
+// never sent to a non-https endpoint. The header secret (an Authorization
+// bearer token for a managed collector) is resolved from the environment
+// in serve.go and so is only known here, not at config-load time; refusing
+// it over an unencrypted connection (CWE-319) keeps haybale's
+// secure-by-default posture rather than silently shipping the token in
+// cleartext to a remote collector an operator addressed without a scheme.
 func (c Config) Validate() error {
 	if !c.Enabled() {
 		return nil
@@ -77,6 +88,9 @@ func (c Config) Validate() error {
 	case "", ProtocolGRPC, ProtocolHTTP:
 	default:
 		return fmt.Errorf("protocol %q is not supported (must be %q or %q)", c.Protocol, ProtocolGRPC, ProtocolHTTP)
+	}
+	if len(c.Headers) > 0 && isInsecureEndpoint(c.Endpoint) {
+		return fmt.Errorf("OTLP headers (e.g. an authorization token) require an https:// endpoint; refusing to send them in cleartext to %q — set an https:// endpoint or unset headersEnv", c.Endpoint)
 	}
 	return nil
 }
@@ -123,6 +137,13 @@ func Setup(ctx context.Context, cfg Config) (*Providers, error) {
 	if !cfg.Enabled() {
 		return &Providers{Metrics: NewNoopMetrics()}, nil
 	}
+	// Fail fast on a bad protocol or a cleartext-headers misconfiguration
+	// before dialling anything (see Config.Validate). This is the live call
+	// site — internal/config validates the protocol early too, but only
+	// here are the resolved header secrets available to guard.
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("telemetry config: %w", err)
+	}
 
 	res := BuildResource(cfg.Resource)
 
@@ -139,6 +160,17 @@ func Setup(ctx context.Context, cfg Config) (*Providers, error) {
 	if err != nil {
 		// Undo the trace pipeline we already started before failing, so a
 		// half-built Setup never leaks a live exporter/batcher goroutine.
+		//
+		// This (and the log-exporter teardown below) is defensive: the three
+		// build* helpers all dispatch on the same cfg.Protocol, already
+		// validated above, so in practice if the trace exporter built the
+		// metric and log ones do too — there is no cfg reachable through the
+		// public API that fails the second build but not the first. The
+		// teardown is kept anyway so the invariant "Setup either returns a
+		// fully-wired Providers or leaks nothing" holds by construction if a
+		// future build* helper grows an independent failure mode. It is left
+		// untested rather than fitted with an injectable-builder seam whose
+		// only purpose would be to reach this branch.
 		_ = tp.Shutdown(ctx)
 		return nil, fmt.Errorf("build metrics: %w", err)
 	}
@@ -180,20 +212,38 @@ func Setup(ctx context.Context, cfg Config) (*Providers, error) {
 // call on a no-op Providers (from a disabled Config) and on a nil
 // receiver, so serve.go can defer it unconditionally. Give it a bounded
 // context: a collector that has gone away must not make drain hang.
+//
+// The three pipelines are shut down concurrently, not in sequence, against
+// that one shared deadline. serve.go bounds the whole call by a single
+// short timeout (telemetryShutdownTimeout); shutting down in series would
+// let a pipeline whose collector is unreachable block for the entire window
+// and leave the other two flushing against an already-expired context — so
+// the last batch of, say, metrics would be silently dropped because the
+// trace flush ate the budget. Running them concurrently gives each pipeline
+// the full deadline to flush its own tail.
 func (p *Providers) Shutdown(ctx context.Context) error {
 	if p == nil {
 		return nil
 	}
-	var errs []error
+	shutdowns := make([]func(context.Context) error, 0, 3)
 	if p.tracerProvider != nil {
-		errs = append(errs, p.tracerProvider.Shutdown(ctx))
+		shutdowns = append(shutdowns, p.tracerProvider.Shutdown)
 	}
 	if p.Metrics != nil {
-		errs = append(errs, p.Metrics.shutdown(ctx))
+		shutdowns = append(shutdowns, p.Metrics.shutdown)
 	}
 	if p.loggerProvider != nil {
-		errs = append(errs, p.loggerProvider.Shutdown(ctx))
+		shutdowns = append(shutdowns, p.loggerProvider.Shutdown)
 	}
+
+	errs := make([]error, len(shutdowns))
+	var wg sync.WaitGroup
+	for i, shutdown := range shutdowns {
+		wg.Go(func() {
+			errs[i] = shutdown(ctx)
+		})
+	}
+	wg.Wait()
 	return errors.Join(errs...)
 }
 

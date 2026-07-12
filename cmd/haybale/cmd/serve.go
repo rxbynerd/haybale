@@ -300,16 +300,25 @@ func serveWithGracefulDrain(ctx context.Context, srv *http.Server, p *proxy.Prox
 			shutdownCtx, cancel = context.WithTimeout(shutdownCtx, drainTimeout)
 			defer cancel()
 		}
+		// Timed so drain duration is observable — one of the internal
+		// operations issue #1 calls out. How long a fleet takes to drain on
+		// deploy/rollout is a real operational signal (a rising drain time
+		// means longer-running transfers in flight), and previously the
+		// clean-drain path logged nothing at all, so an operator couldn't
+		// tell a fast drain from a slow one or confirm it completed.
+		drainStart := time.Now()
 		shutdownErr := srv.Shutdown(shutdownCtx)
+		drainDuration := time.Since(drainStart)
 		switch {
 		case shutdownErr == nil:
 			// Fully drained: every in-flight request finished on its own
 			// before drainTimeout (if any) elapsed.
+			logger.Info("drain complete, all in-flight requests finished", "drainDurationMs", drainDuration.Milliseconds())
 		case drainTimeout > 0 && errors.Is(shutdownErr, context.DeadlineExceeded):
-			logger.Warn("drainTimeout exceeded before every in-flight request finished; exiting now as a deliberate, operator-configured cutoff rather than waiting further — any connection still active will be terminated when the process exits", "drainTimeout", drainTimeout)
+			logger.Warn("drainTimeout exceeded before every in-flight request finished; exiting now as a deliberate, operator-configured cutoff rather than waiting further — any connection still active will be terminated when the process exits", "drainTimeout", drainTimeout, "drainDurationMs", drainDuration.Milliseconds())
 			shutdownErr = ErrDrainTimeoutExceeded
 		default:
-			logger.Warn("graceful shutdown did not complete cleanly", "error", shutdownErr)
+			logger.Warn("graceful shutdown did not complete cleanly", "error", shutdownErr, "drainDurationMs", drainDuration.Milliseconds())
 		}
 
 		// Shutdown only signals listenAndServe to stop; it doesn't itself

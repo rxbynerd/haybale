@@ -1,13 +1,17 @@
 package observability
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/rxbynerd/haybale/internal/security"
 )
 
 // recordingHandler captures the records and attributes it is handed, and
@@ -103,5 +107,121 @@ func TestSpanContextHandlerNoIDsWithoutSpan(t *testing.T) {
 	}
 	if _, ok := inner.attrs["trace_id"]; ok {
 		t.Error("trace_id added without an active span; want none")
+	}
+}
+
+// toggleHandler is a slog.Handler whose Enabled result is fixed and that
+// records whether WithAttrs/WithGroup were called on it, so the fan-out and
+// span-context handlers' delegation of the slog.Handler contract can be
+// asserted.
+type toggleHandler struct {
+	enabled   bool
+	withAttrs bool
+	withGroup bool
+}
+
+func (h *toggleHandler) Enabled(context.Context, slog.Level) bool  { return h.enabled }
+func (h *toggleHandler) Handle(context.Context, slog.Record) error { return nil }
+func (h *toggleHandler) WithAttrs([]slog.Attr) slog.Handler        { h.withAttrs = true; return h }
+func (h *toggleHandler) WithGroup(string) slog.Handler             { h.withGroup = true; return h }
+
+func TestFanoutHandlerEnabledIfAnyInnerEnabled(t *testing.T) {
+	t.Parallel()
+	on := &toggleHandler{enabled: true}
+	off := &toggleHandler{enabled: false}
+	if !NewFanoutHandler(off, on).Enabled(context.Background(), slog.LevelInfo) {
+		t.Error("Enabled() = false with one enabled inner, want true")
+	}
+	if NewFanoutHandler(off, &toggleHandler{enabled: false}).Enabled(context.Background(), slog.LevelInfo) {
+		t.Error("Enabled() = true with all inners disabled, want false")
+	}
+}
+
+func TestFanoutHandlerWithAttrsAndGroupDelegateToEveryInner(t *testing.T) {
+	t.Parallel()
+	a, b := &toggleHandler{enabled: true}, &toggleHandler{enabled: true}
+
+	got := NewFanoutHandler(a, b).WithAttrs([]slog.Attr{slog.String("k", "v")})
+	if _, ok := got.(*FanoutHandler); !ok {
+		t.Errorf("WithAttrs() returned %T, want *FanoutHandler (wrapper must be preserved)", got)
+	}
+	if !a.withAttrs || !b.withAttrs {
+		t.Error("WithAttrs() did not reach every inner handler")
+	}
+
+	got = NewFanoutHandler(a, b).WithGroup("g")
+	if _, ok := got.(*FanoutHandler); !ok {
+		t.Errorf("WithGroup() returned %T, want *FanoutHandler", got)
+	}
+	if !a.withGroup || !b.withGroup {
+		t.Error("WithGroup() did not reach every inner handler")
+	}
+}
+
+func TestSpanContextHandlerDelegatesContract(t *testing.T) {
+	t.Parallel()
+	inner := &toggleHandler{enabled: true}
+	h := NewSpanContextHandler(inner)
+
+	if !h.Enabled(context.Background(), slog.LevelInfo) {
+		t.Error("Enabled() = false, want it to delegate the inner's true")
+	}
+	if got := h.WithAttrs([]slog.Attr{slog.String("k", "v")}); func() bool { _, ok := got.(*SpanContextHandler); return !ok }() {
+		t.Errorf("WithAttrs() returned %T, want *SpanContextHandler (wrapper preserved)", got)
+	}
+	if !inner.withAttrs {
+		t.Error("WithAttrs() did not delegate to the inner handler")
+	}
+	if got := h.WithGroup("g"); func() bool { _, ok := got.(*SpanContextHandler); return !ok }() {
+		t.Errorf("WithGroup() returned %T, want *SpanContextHandler", got)
+	}
+	if !inner.withGroup {
+		t.Error("WithGroup() did not delegate to the inner handler")
+	}
+}
+
+// TestComposedLoggerChainScrubsCorrelatesAndFansOut assembles the exact
+// three-layer chain serve.go builds — SpanContextHandler(ScrubHandler(
+// Fanout{sinkA, sinkB})) — and asserts, end to end, that a single record
+// logged inside a span with a secret-shaped attribute reaches BOTH sinks,
+// with trace_id/span_id stamped AND the secret redacted. This is the
+// security invariant the layer ordering exists to guarantee (no value
+// leaves the process unscrubbed, on any sink), which no single-layer unit
+// test covers.
+func TestComposedLoggerChainScrubsCorrelatesAndFansOut(t *testing.T) {
+	t.Parallel()
+	var bufA, bufB bytes.Buffer
+	sinkA := slog.NewTextHandler(&bufA, nil)
+	sinkB := slog.NewTextHandler(&bufB, nil)
+
+	chain := NewSpanContextHandler(security.NewScrubHandler(NewFanoutHandler(sinkA, sinkB)))
+	logger := slog.New(chain)
+
+	traceID, _ := trace.TraceIDFromHex("0123456789abcdef0123456789abcdef")
+	spanID, _ := trace.SpanIDFromHex("0123456789abcdef")
+	ctx := trace.ContextWithSpanContext(context.Background(), trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    traceID,
+		SpanID:     spanID,
+		TraceFlags: trace.FlagsSampled,
+	}))
+
+	// A GitHub App installation-token-shaped secret: the scrubber must
+	// redact it before it reaches either sink.
+	logger.InfoContext(ctx, "proxied request", "leaked", "ghs_0123456789abcdefghijklmnopqrstuvwxyz")
+
+	for name, buf := range map[string]*bytes.Buffer{"sinkA": &bufA, "sinkB": &bufB} {
+		out := buf.String()
+		if out == "" {
+			t.Fatalf("%s received no record; the fan-out must reach every sink", name)
+		}
+		if !strings.Contains(out, traceID.String()) {
+			t.Errorf("%s missing trace_id %q; got: %s", name, traceID.String(), out)
+		}
+		if !strings.Contains(out, "[REDACTED]") {
+			t.Errorf("%s did not redact the secret; got: %s", name, out)
+		}
+		if strings.Contains(out, "ghs_0123456789") {
+			t.Errorf("%s leaked the raw secret; got: %s", name, out)
+		}
 	}
 }

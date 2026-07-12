@@ -224,3 +224,33 @@ func TestUpstreamReceivesNoTraceparent(t *testing.T) {
 		}
 	}
 }
+
+// TestNewFallsBackToDefaultLoggerAndNoopMetrics covers New's documented
+// nil-handling: a nil logger falls back to slog.Default() and nil metrics
+// to a noop-backed Metrics, so the proxy is usable and records into no-ops
+// without panicking. Every other call site passes both explicitly.
+func TestNewFallsBackToDefaultLoggerAndNoopMetrics(t *testing.T) {
+	up := &recordingUpstream{}
+	upstreamSrv := httptest.NewServer(up.handler())
+	defer upstreamSrv.Close()
+
+	upstreams := newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL})
+	p, err := New(upstreams, credentialsForHosts(upstreams), allowAllAuthenticator{}, allowAllPolicy{}, nil, nil)
+	if err != nil {
+		t.Fatalf("New(nil logger, nil metrics) error = %v", err)
+	}
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	// A real request must flow through without panicking on the fallback
+	// logger/metrics.
+	resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+}

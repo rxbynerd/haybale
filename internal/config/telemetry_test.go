@@ -3,7 +3,26 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"github.com/rxbynerd/haybale/internal/observability"
 )
+
+// TestOTLPProtocolConstantsMatchObservability is the round-trip check the
+// config.go doc comment relies on: internal/config deliberately hard-codes
+// the OTLP protocol strings rather than importing observability's
+// constants (to keep the OTel SDK out of config's production dependency
+// graph), so this test-only cross-check pins the two definitions together.
+// If observability renames or revalues a protocol, this fails rather than
+// letting a config that parses cleanly reach a Setup that rejects it.
+func TestOTLPProtocolConstantsMatchObservability(t *testing.T) {
+	t.Parallel()
+	if otlpProtocolGRPC != observability.ProtocolGRPC {
+		t.Errorf("otlpProtocolGRPC = %q, observability.ProtocolGRPC = %q; they must match", otlpProtocolGRPC, observability.ProtocolGRPC)
+	}
+	if otlpProtocolHTTP != observability.ProtocolHTTP {
+		t.Errorf("otlpProtocolHTTP = %q, observability.ProtocolHTTP = %q; they must match", otlpProtocolHTTP, observability.ProtocolHTTP)
+	}
+}
 
 func TestTelemetryConfigEnabled(t *testing.T) {
 	t.Parallel()

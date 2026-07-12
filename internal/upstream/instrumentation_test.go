@@ -2,7 +2,11 @@ package upstream
 
 import (
 	"context"
+	"io"
+	"log/slog"
+	"sync"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -107,4 +111,102 @@ func TestGitHubAppSourceWithoutMetricsDoesNotPanic(t *testing.T) {
 	if got := fake.mintCallCount(); got != 1 {
 		t.Errorf("mint call count = %d, want 1", got)
 	}
+}
+
+// TestTokenCacheConcurrentLookupsRecordMissPerCaller pins the documented
+// invariant that a miss is recorded for every caller that had no usable
+// cached token — the leader that runs the mint AND every follower that
+// merely waits on it — so the hit ratio reflects real mint pressure. N
+// goroutines pile into one singleflight'd mint for the same key; exactly
+// one mint runs, but all N must be counted as misses.
+func TestTokenCacheConcurrentLookupsRecordMissPerCaller(t *testing.T) {
+	cache := newTokenCache(time.Now)
+	metrics, reader := observability.NewTestMetrics()
+	cache.setMetrics(metrics)
+
+	repo := gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}
+
+	const n = 40
+	var mintCalls sync.WaitGroup
+	mintCalls.Add(1)
+	release := make(chan struct{})
+	var once sync.Once
+	mint := func(_ context.Context, _ gitproto.Repo, _ gitproto.Verb) (BasicAuth, time.Time, error) {
+		once.Do(mintCalls.Done) // signal the first (and only) real mint
+		<-release
+		return BasicAuth{Username: "x-access-token", Password: "shared"}, time.Now().Add(time.Hour), nil
+	}
+
+	var start sync.WaitGroup
+	start.Add(1)
+	var done sync.WaitGroup
+	for i := 0; i < n; i++ {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			start.Wait()
+			_, _ = cache.get(context.Background(), repo, gitproto.Read, mint)
+		}()
+	}
+	start.Done()
+
+	mintCalls.Wait() // every goroutine is now piled into the one in-flight mint
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	done.Wait()
+
+	misses := map[string]int64{}
+	for _, dp := range sumPoints(t, reader, "haybale.token_cache.lookups.total") {
+		misses[attrOf(dp.Attributes, "haybale.result")] += dp.Value
+	}
+	if misses["miss"] != n {
+		t.Errorf("recorded %d misses, want %d (one per caller sharing the collapsed mint)", misses["miss"], n)
+	}
+}
+
+// TestSetMetricsAndSetLoggerRaceFreeWithCredentials exercises the
+// atomic.Pointer install contract under -race: installing metrics/logger
+// concurrently with in-flight Credentials() calls must not race. Production
+// only installs once at startup, but the atomics are documented as making
+// concurrent install-vs-read safe, and only a concurrent test proves it.
+func TestSetMetricsAndSetLoggerRaceFreeWithCredentials(t *testing.T) {
+	fake := newGitHubFake(4278664)
+	src := newTestSource(t, fake)
+	repo := gitproto.Repo{Host: "github.com", Owner: "rxbynerd", Name: "haybale"}
+
+	metrics, _ := observability.NewTestMetrics()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Installers: hammer SetMetrics/SetLogger.
+	wg.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				src.SetMetrics(metrics)
+				src.SetLogger(logger)
+			}
+		}
+	})
+	// Readers: concurrent Credentials() calls (each reads the atomics).
+	for i := 0; i < 4; i++ {
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_, _ = src.Credentials(context.Background(), repo, gitproto.Read)
+				}
+			}
+		})
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	close(stop)
+	wg.Wait()
 }

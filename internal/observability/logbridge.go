@@ -75,8 +75,11 @@ func (h *FanoutHandler) WithGroup(name string) slog.Handler {
 }
 
 // SpanContextHandler injects trace_id / span_id attributes onto any record
-// emitted with a context that carries a sampled span, so a log line on the
-// stderr sink can be joined to its trace in a backend. It is the outermost
+// emitted with a context that carries a valid span context (Handle checks
+// SpanContext.IsValid, not IsSampled — a record is correlated whenever it
+// has a span at all, independent of the sampling decision), so a log line
+// on the stderr sink can be joined to its trace in a backend. It is the
+// outermost
 // handler in the chain (above ScrubHandler) so the IDs it adds still pass
 // through scrubbing before reaching a sink — trace/span IDs are not
 // secrets, but keeping the scrubber the single choke point is the

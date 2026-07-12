@@ -308,11 +308,13 @@ type CredentialConfig struct {
 // Telemetry.Protocol accepts (an empty value means grpc). They are string
 // literals here rather than an import of internal/observability's own
 // ProtocolGRPC/ProtocolHTTP constants deliberately: keeping config free of
-// the OpenTelemetry SDK dependency means a build of internal/config — and
-// its tests, and every package that imports it — does not pull in the otel
-// module graph. cmd/haybale/cmd/serve.go is the single seam that bridges
-// this config into internal/observability. If these values ever diverge
-// from observability's, the round-trip test in serve_test.go catches it.
+// the OpenTelemetry SDK dependency means a production build of
+// internal/config — and every package that imports it — does not pull in
+// the otel module graph. cmd/haybale/cmd/serve.go is the single seam that
+// bridges this config into internal/observability. If these values ever
+// diverge from observability's ProtocolGRPC/ProtocolHTTP, the (test-only)
+// round-trip check TestOTLPProtocolConstantsMatchObservability in
+// telemetry_test.go fails.
 const (
 	otlpProtocolGRPC = "grpc"
 	otlpProtocolHTTP = "http/protobuf"

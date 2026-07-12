@@ -26,6 +26,8 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+
 	"github.com/rxbynerd/haybale/internal/config"
 	"github.com/rxbynerd/haybale/internal/gitproto"
 	"github.com/rxbynerd/haybale/internal/identity"
@@ -671,5 +673,118 @@ func TestWireCredentialSourceLoggers(t *testing.T) {
 	// must simply skip it (via the type assertion), not panic.
 	if _, err := staticSrc.Credentials(context.Background(), repo, gitproto.Read); err != nil {
 		t.Fatalf("Credentials() unexpected error: %v", err)
+	}
+}
+
+// TestWireCredentialSourceMetrics is the metrics counterpart of
+// TestWireCredentialSourceLoggers: it asserts wireCredentialSourceMetrics
+// installs the metrics into every *upstream.GitHubAppSource (so its mints
+// are counted) and skips a StaticSource without panicking.
+func TestWireCredentialSourceMetrics(t *testing.T) {
+	fakeURL := newFakeGitHubAppServer(t, 42, "fake-minted-token")
+	ghSrc, err := upstream.NewGitHubAppSource(upstream.GitHubAppConfig{
+		AppID: 1, PrivateKeyPEM: writeTestRSAKeyPEM(t), APIBaseURL: fakeURL,
+	})
+	if err != nil {
+		t.Fatalf("NewGitHubAppSource: %v", err)
+	}
+	staticSrc, err := upstream.NewStaticSource("x-access-token", "static-token") //nolint:gosec // G101: fixed, fake test-only credential
+	if err != nil {
+		t.Fatalf("NewStaticSource: %v", err)
+	}
+	sources := map[string]upstream.CredentialSource{
+		"github.com":           ghSrc,
+		"git.internal.example": staticSrc,
+	}
+
+	metrics, reader := observability.NewTestMetrics()
+	wireCredentialSourceMetrics(sources, metrics)
+
+	repo := gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}
+	if _, err := ghSrc.Credentials(context.Background(), repo, gitproto.Read); err != nil {
+		t.Fatalf("Credentials() unexpected error: %v", err)
+	}
+	// staticSrc must be skipped by the type assertion, not panic.
+	if _, err := staticSrc.Credentials(context.Background(), repo, gitproto.Read); err != nil {
+		t.Fatalf("static Credentials() unexpected error: %v", err)
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("Collect() error = %v", err)
+	}
+	var minted int64
+	for _, sm := range rm.ScopeMetrics {
+		for _, md := range sm.Metrics {
+			if md.Name != "haybale.tokens.minted.total" {
+				continue
+			}
+			if sum, ok := md.Data.(metricdata.Sum[int64]); ok {
+				for _, dp := range sum.DataPoints {
+					minted += dp.Value
+				}
+			}
+		}
+	}
+	if minted != 1 {
+		t.Errorf("tokens.minted total = %d, want 1 (the GitHubAppSource mint should be counted)", minted)
+	}
+}
+
+// TestInstrumentedHandlerWrapsOnlyWhenEnabled asserts instrumentedHandler
+// returns the handler untouched when telemetry is disabled (so a disabled
+// deployment carries none of otelhttp's per-request wrapping) and wraps it
+// when enabled.
+func TestInstrumentedHandlerWrapsOnlyWhenEnabled(t *testing.T) {
+	mux := http.NewServeMux() // a comparable, concrete http.Handler
+
+	disabled := &config.Config{}
+	if got := instrumentedHandler(disabled, mux); got != http.Handler(mux) {
+		t.Error("disabled telemetry: instrumentedHandler wrapped the handler; want it returned unchanged")
+	}
+
+	enabled := &config.Config{Telemetry: config.TelemetryConfig{Endpoint: "localhost:4317"}}
+	if got := instrumentedHandler(enabled, mux); got == http.Handler(mux) {
+		t.Error("enabled telemetry: instrumentedHandler returned the handler unchanged; want it wrapped by otelhttp")
+	}
+}
+
+// TestTelemetryConfigTranslation asserts the config->observability.Config
+// bridge maps every field and resolves the OTLP header secret from the
+// environment variable named by headersEnv (never from the YAML).
+func TestTelemetryConfigTranslation(t *testing.T) {
+	t.Setenv("HB_TEST_OTLP_HEADERS", "authorization=Bearer tok,x-tenant=acme")
+	cfg := &config.Config{Telemetry: config.TelemetryConfig{
+		Endpoint:         "https://collector/otlp",
+		Protocol:         "http/protobuf",
+		Environment:      "prod",
+		ServiceNamespace: "team-a",
+		HeadersEnv:       "HB_TEST_OTLP_HEADERS",
+	}}
+
+	got := telemetryConfig(cfg)
+	if got.Endpoint != "https://collector/otlp" {
+		t.Errorf("Endpoint = %q, want https://collector/otlp", got.Endpoint)
+	}
+	if got.Protocol != "http/protobuf" {
+		t.Errorf("Protocol = %q, want http/protobuf", got.Protocol)
+	}
+	if got.Resource.Environment != "prod" || got.Resource.ServiceNamespace != "team-a" {
+		t.Errorf("Resource = %+v, want Environment=prod ServiceNamespace=team-a", got.Resource)
+	}
+	if got.Resource.Version != version {
+		t.Errorf("Resource.Version = %q, want the build version %q", got.Resource.Version, version)
+	}
+	if got.Headers["authorization"] != "Bearer tok" || got.Headers["x-tenant"] != "acme" {
+		t.Errorf("Headers = %v, want the parsed headersEnv value", got.Headers)
+	}
+}
+
+// TestTelemetryConfigNoHeadersEnv confirms an unset headersEnv yields nil
+// headers (not a spurious empty map, and no env read).
+func TestTelemetryConfigNoHeadersEnv(t *testing.T) {
+	cfg := &config.Config{Telemetry: config.TelemetryConfig{Endpoint: "localhost:4317"}}
+	if got := telemetryConfig(cfg); got.Headers != nil {
+		t.Errorf("Headers = %v, want nil when headersEnv is unset", got.Headers)
 	}
 }
