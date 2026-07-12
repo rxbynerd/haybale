@@ -83,22 +83,59 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Malformed, dumb-protocol, and path-traversal requests all
 		// collapse to the same 404 a policy-denied or genuinely
-		// nonexistent repo would return — no existence oracle.
+		// nonexistent repo would return — no existence oracle. Logged
+		// at the fixed, static reason gitproto.invalid() already
+		// produces (err.Error() here is always one of those constant
+		// strings, never the raw request path/query) so a deployment
+		// under active probing has signal without an information leak
+		// or unbounded log-line size from attacker-controlled input.
+		p.logger.Warn("rejected request", "reason", err.Error())
 		http.NotFound(w, r)
 		return
 	}
 
 	base, ok := p.upstreams[repo.Host]
 	if !ok {
+		p.logger.Warn("rejected request", "reason", "unknown upstream host", "host", repo.Host)
 		http.NotFound(w, r)
 		return
 	}
 
-	p.logger.Debug("proxying request",
-		"host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "verb", verb.String())
-
 	ctx := context.WithValue(r.Context(), routeKey{}, base)
-	p.rp.ServeHTTP(w, r.WithContext(ctx))
+	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	p.rp.ServeHTTP(rec, r.WithContext(ctx))
+
+	// Logged after ServeHTTP returns (rather than before, as a prior
+	// version of this line did at Debug level) so the log carries the
+	// actual response status — the one piece of per-request outcome
+	// information a caller can't know in advance. Info rather than
+	// Debug so a default-configured deployment (LogLevel: "info") gets
+	// baseline per-request observability instead of logging nothing.
+	p.logger.Info("proxied request",
+		"host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "verb", verb.String(), "status", rec.status)
+}
+
+// statusRecorder wraps an http.ResponseWriter to capture the status code
+// written, so ServeHTTP can log it after httputil.ReverseProxy has
+// finished writing the response. It implements http.Flusher (delegating
+// to the underlying ResponseWriter when available) so it doesn't disable
+// the live-flushing behaviour New's FlushInterval: -1 configures — the
+// ReverseProxy internals silently drop flushing for a ResponseWriter that
+// doesn't implement http.Flusher.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // rewrite implements httputil.ReverseProxy.Rewrite. It points the

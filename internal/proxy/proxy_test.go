@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -320,5 +321,108 @@ func TestStreamsLargeBodyUnmodified(t *testing.T) {
 	}
 	if !bytes.Equal(respBody, payload) {
 		t.Errorf("streamed payload corrupted: got %d bytes, want %d bytes matching", len(respBody), len(payload))
+	}
+}
+
+// logLines splits a JSON-lines log buffer into its non-empty lines.
+func logLines(buf *bytes.Buffer) []string {
+	trimmed := strings.TrimSpace(buf.String())
+	if trimmed == "" {
+		return nil
+	}
+	return strings.Split(trimmed, "\n")
+}
+
+func TestRejectedRequestIsLogged(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	p := New(newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), logger)
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/github.com/acme/widgets.git/objects/ab/cdef")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	lines := logLines(&buf)
+	if len(lines) != 1 {
+		t.Fatalf("got %d log records, want exactly 1: %q", len(lines), buf.String())
+	}
+	if !strings.Contains(lines[0], `"level":"WARN"`) {
+		t.Errorf("log record = %q, want level WARN", lines[0])
+	}
+	// The static reason gitproto produces for this request shape — never
+	// the raw path/query.
+	if !strings.Contains(lines[0], "not a smart-HTTP endpoint") {
+		t.Errorf("log record = %q, want it to contain the static rejection reason", lines[0])
+	}
+}
+
+func TestUnknownHostIsLogged(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	p := New(newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), logger)
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/gitlab.example/acme/widgets.git/info/refs?service=git-upload-pack")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	lines := logLines(&buf)
+	if len(lines) != 1 {
+		t.Fatalf("got %d log records, want exactly 1: %q", len(lines), buf.String())
+	}
+	if !strings.Contains(lines[0], `"level":"WARN"`) {
+		t.Errorf("log record = %q, want level WARN", lines[0])
+	}
+	if !strings.Contains(lines[0], "unknown upstream host") {
+		t.Errorf("log record = %q, want it to contain the rejection reason", lines[0])
+	}
+}
+
+func TestProxiedRequestLogsRepoVerbStatus(t *testing.T) {
+	up := &recordingUpstream{}
+	upstreamSrv := httptest.NewServer(up.handler())
+	defer upstreamSrv.Close()
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	p := New(newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), logger)
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	lines := logLines(&buf)
+	if len(lines) != 1 {
+		t.Fatalf("got %d log records, want exactly 1: %q", len(lines), buf.String())
+	}
+	line := lines[0]
+	for _, want := range []string{
+		`"level":"INFO"`,
+		`"host":"testhost"`,
+		`"owner":"acme"`,
+		`"repo":"widgets"`,
+		`"verb":"read"`,
+		`"status":` + strconv.Itoa(http.StatusOK),
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("log record = %q, want it to contain %q", line, want)
+		}
 	}
 }
