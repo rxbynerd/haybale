@@ -591,6 +591,140 @@ func TestNewURLKeySourceFailFast(t *testing.T) {
 	}
 }
 
+// TestNewJWTAuthenticatorGuards covers the constructor's own fail-fast
+// guards (independent of config-layer validation), since NewJWTAuthenticator
+// is a public entry point a direct caller might reach without config.
+func TestNewJWTAuthenticatorGuards(t *testing.T) {
+	s := newES256Signer(t, "k1")
+	valid := IssuerConfig{
+		Issuer: contractIssuer, JWKSFile: jwksFile(t, s),
+		Algorithms: []string{"ES256"}, Audiences: []string{"aud"}, IdentityTemplate: "{sub}",
+	}
+	// clone returns a copy of valid with one field tweaked.
+	clone := func(mut func(*IssuerConfig)) IssuerConfig {
+		c := valid
+		mut(&c)
+		return c
+	}
+
+	tests := []struct {
+		name    string
+		issuers []IssuerConfig
+		wantErr string
+	}{
+		{"empty issuer list", nil, "at least one issuer"},
+		{"empty issuer string", []IssuerConfig{clone(func(c *IssuerConfig) { c.Issuer = "" })}, "must not be empty"},
+		{"duplicate issuer", []IssuerConfig{valid, valid}, "duplicate issuer"},
+		{"nil algorithms disables allowlist", []IssuerConfig{clone(func(c *IssuerConfig) { c.Algorithms = nil })}, "at least one signing algorithm"},
+		{"empty algorithms", []IssuerConfig{clone(func(c *IssuerConfig) { c.Algorithms = []string{} })}, "at least one signing algorithm"},
+		{"no key source", []IssuerConfig{clone(func(c *IssuerConfig) { c.JWKSFile = "" })}, "neither jwksURL nor jwksFile"},
+		{"bad template", []IssuerConfig{clone(func(c *IssuerConfig) { c.IdentityTemplate = "{unclosed" })}, "identityTemplate"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewJWTAuthenticator(context.Background(), tc.issuers, discardLogger())
+			if err == nil {
+				t.Fatalf("NewJWTAuthenticator succeeded, want error containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("err = %v, want it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestAuthenticateRepoScopeNonStringElement confirms a scope array with a
+// non-string element (["repo", 123]) is rejected — distinct from the
+// wrong-overall-type case in the attack matrix.
+func TestAuthenticateRepoScopeNonStringElement(t *testing.T) {
+	s := newES256Signer(t, "k1")
+	a := newAuth(t, s, "{sub}", func(ic *IssuerConfig) { ic.RepoScopeClaim = "haybale.dev/repos" })
+	c := baseClaims(contractIssuer, "https://haybale.internal")
+	c["haybale.dev/repos"] = []any{"github.com/rxbynerd/haybale", 123}
+	if _, err := a.Authenticate(context.Background(), basicAuthReq(t, mint(t, s, c))); err != ErrAuthenticationFailed {
+		t.Errorf("err = %v, want ErrAuthenticationFailed", err)
+	}
+}
+
+// TestAuthenticateEmptyStringClaimRejected confirms a template referencing
+// a present-but-empty-string claim fails (an empty identity must never
+// reach the policy engine).
+func TestAuthenticateEmptyStringClaimRejected(t *testing.T) {
+	s := newES256Signer(t, "k1")
+	a := newAuth(t, s, "{sub}", nil)
+	c := baseClaims(contractIssuer, "https://haybale.internal")
+	c["sub"] = ""
+	if _, err := a.Authenticate(context.Background(), basicAuthReq(t, mint(t, s, c))); err != ErrAuthenticationFailed {
+		t.Errorf("err = %v, want ErrAuthenticationFailed for empty sub", err)
+	}
+}
+
+// TestAuthenticateNbfIatWithinLeeway is the accept-side partner of the
+// attack matrix's nbf/iat-beyond-leeway rejections: a token whose nbf/iat
+// is slightly in the future but inside leeway is accepted.
+func TestAuthenticateNbfIatWithinLeeway(t *testing.T) {
+	s := newES256Signer(t, "k1")
+	a := newAuth(t, s, "{sub}", func(ic *IssuerConfig) { ic.Leeway = 60 * time.Second })
+	c := baseClaims(contractIssuer, "https://haybale.internal")
+	c["nbf"] = time.Now().Add(30 * time.Second).Unix() // 30s ahead, within 60s leeway
+	c["iat"] = time.Now().Add(30 * time.Second).Unix()
+	if _, err := a.Authenticate(context.Background(), basicAuthReq(t, mint(t, s, c))); err != nil {
+		t.Errorf("Authenticate nbf/iat within leeway: %v", err)
+	}
+}
+
+// TestAuthenticateTypCaseInsensitiveMatch confirms the typ check is
+// case-insensitive on the accept side (issuer wants "JWT", token has
+// "jwt").
+func TestAuthenticateTypCaseInsensitiveMatch(t *testing.T) {
+	s := newES256Signer(t, "k1")
+	a := newAuth(t, s, "{sub}", func(ic *IssuerConfig) { ic.Typ = "JWT" })
+	tok := jwt.NewWithClaims(s.method, baseClaims(contractIssuer, "https://haybale.internal"))
+	tok.Header["kid"] = s.kid
+	tok.Header["typ"] = "jwt" // lower-case; must still match "JWT"
+	signed, err := tok.SignedString(s.key)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if _, err := a.Authenticate(context.Background(), basicAuthReq(t, signed)); err != nil {
+		t.Errorf("Authenticate typ case-insensitive: %v", err)
+	}
+}
+
+// TestAuthenticateMultiAudienceAnyOf locks in any-of audience semantics: a
+// token carrying one of several configured audiences is accepted. Guards
+// against an accidental switch to all-of (WithAllAudiences).
+func TestAuthenticateMultiAudienceAnyOf(t *testing.T) {
+	s := newES256Signer(t, "k1")
+	a := newAuth(t, s, "{sub}", func(ic *IssuerConfig) {
+		ic.Audiences = []string{"https://haybale.internal", "https://haybale.other"}
+	})
+	// Token carries only the second configured audience.
+	if _, err := a.Authenticate(context.Background(), basicAuthReq(t, mint(t, s, baseClaims(contractIssuer, "https://haybale.other")))); err != nil {
+		t.Errorf("Authenticate with one-of-many audiences: %v", err)
+	}
+}
+
+func TestStringClaim(t *testing.T) {
+	claims := jwt.MapClaims{
+		"s":   "hello",
+		"exp": float64(1750000000), // how encoding/json decodes a JSON number
+		"f":   float64(1.5),
+	}
+	if got := stringClaim(claims, "s"); got != "hello" {
+		t.Errorf("stringClaim(s) = %q, want hello", got)
+	}
+	if got := stringClaim(claims, "exp"); got != "1750000000" {
+		t.Errorf("stringClaim(exp) = %q, want 1750000000 (not scientific notation)", got)
+	}
+	if got := stringClaim(claims, "f"); got != "1.5" {
+		t.Errorf("stringClaim(f) = %q, want 1.5", got)
+	}
+	if got := stringClaim(claims, "absent"); got != "" {
+		t.Errorf("stringClaim(absent) = %q, want empty", got)
+	}
+}
+
 func TestParseTemplate(t *testing.T) {
 	tests := []struct {
 		tmpl    string

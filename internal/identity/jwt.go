@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -122,8 +123,23 @@ func NewJWTAuthenticator(ctx context.Context, issuers []IssuerConfig, logger *sl
 	}
 	byIssuer := make(map[string]*issuerVerifier, len(issuers))
 	for _, ic := range issuers {
+		if ic.Issuer == "" {
+			return nil, fmt.Errorf("identity: issuer string must not be empty")
+		}
 		if _, dup := byIssuer[ic.Issuer]; dup {
 			return nil, fmt.Errorf("identity: duplicate issuer %q", ic.Issuer)
+		}
+		// Reject an empty algorithm allowlist at construction, not just in
+		// config: golang-jwt's WithValidMethods only enforces the allowlist
+		// when the slice is NON-NIL (parser.go: `if p.validMethods != nil`),
+		// so a nil Algorithms would silently disable algorithm checking
+		// entirely — admitting alg:none and every HMAC variant, the exact
+		// algorithm-confusion attack this verifier exists to defeat. The
+		// production config path always defaults Algorithms to
+		// [RS256, ES256] before reaching here, but this constructor is
+		// public and must not leave that landmine for a direct caller.
+		if len(ic.Algorithms) == 0 {
+			return nil, fmt.Errorf("identity: issuer %q: at least one signing algorithm is required", ic.Issuer)
 		}
 
 		var keys keySource
@@ -345,8 +361,11 @@ func ValidateGlob(pattern string) error {
 
 // renderIdentity resolves segments against claims into the final identity
 // string. Every {claim} placeholder must resolve to a present, string
-// -typed claim; a missing or non-string claim is an error (the caller
-// maps it to an authentication failure).
+// -typed, NON-EMPTY claim; a claim that is missing, not a string, or the
+// empty string is an error (the caller maps it to an authentication
+// failure), as is a template that renders to an empty identity overall —
+// an empty or partial identity must never reach the policy engine, where
+// it could match a rule the operator did not intend.
 func renderIdentity(segments []templateSegment, claims jwt.MapClaims) (string, error) {
 	var b strings.Builder
 	for _, s := range segments {
@@ -423,11 +442,19 @@ func matchesAnyGlob(patterns []string, s string) bool {
 // stringClaim renders a claim as a string for a debug log line, tolerating
 // the non-string types (numbers, in particular exp) that MapClaims decodes
 // JSON into. Used only for audit logging of verified claims, never for a
-// security decision.
+// security decision. A float64 (how encoding/json decodes every JSON
+// number, including a Unix-timestamp exp) that holds an integral value is
+// rendered as a plain integer rather than left to default %v formatting,
+// which would print a timestamp like 1750000000 as "1.75e+09".
 func stringClaim(claims jwt.MapClaims, name string) string {
 	switch v := claims[name].(type) {
 	case string:
 		return v
+	case float64:
+		if v == float64(int64(v)) {
+			return strconv.FormatInt(int64(v), 10)
+		}
+		return strconv.FormatFloat(v, 'f', -1, 64)
 	case nil:
 		return ""
 	default:

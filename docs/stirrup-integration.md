@@ -182,14 +182,15 @@ surrounding infrastructure delivers them.
 Two follow-ups are explicitly out of scope for this integration as
 written, tracked for later:
 
-- **Auto-provisioning.** Rather than an operator running `haybale token
-  new`/editing `policy.yaml` by hand per run, a future `identity.Authenticator`
-  implementation (behind the same `Authenticator` seam
-  `StaticTokenAuthenticator` implements today — see
-  `internal/identity/identity.go`) could derive and verify a token as
-  `HMAC(shared_key, RunID)`, letting Stirrup and haybale agree on a
-  per-run credential with no manual provisioning step and no token ever
-  persisted anywhere.
+- **Control-plane JWT issuance.** The remaining gap is Stirrup-side: a
+  Stirrup control plane that mints a per-run JWT (per
+  `docs/jwt-identity.md`) and publishes a JWKS haybale trusts, so a run's
+  identity is provisioned automatically rather than an operator editing
+  `policy.yaml` by hand per run. haybale is already the verifier (behind
+  the `identity.Authenticator` seam `JWTAuthenticator` implements today —
+  see `internal/identity/identity.go`); what does not yet exist is the
+  issuer. Signed JWTs also make Stirrup's guessable-`RunID` a non-issue —
+  the signature, not the subject string, is the credential.
 - **Cedar policy backend.** haybale's `policy.Engine` interface
   (`internal/policy/policy.go`) is deliberately narrow so a Cedar-backed
   implementation can replace `GlobEngine` without touching

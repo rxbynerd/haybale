@@ -26,7 +26,7 @@ upstream's own credential in its place.
 | Field | Requirement |
 |-------|-------------|
 | `alg` | An **asymmetric** signature algorithm the issuer is configured for in haybale — `ES256` (recommended) or `RS256`. HMAC algorithms and `none` are **rejected unconditionally**; haybale never accepts a symmetric or unsigned token. |
-| `kid` | **Required.** Names the key in the JWKS that signed this token, so haybale can select it and so key rotation works. |
+| `kid` | **Strongly recommended.** Names the key in the JWKS that signed this token, so haybale can select exactly that key and so key rotation works cleanly. If `kid` is absent, haybale falls back to trying every key in *that issuer's* key set (never another issuer's) — correct but slower, and ambiguous during rotation. Always send a `kid`. |
 | `typ` | `at+jwt` is **recommended** (RFC 9068 explicit typing). haybale only enforces `typ` for an issuer configured with a required value; GitHub's own `JWT` is accepted where no specific `typ` is required. |
 
 ## Claims

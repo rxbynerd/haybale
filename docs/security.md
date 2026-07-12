@@ -245,6 +245,32 @@ This is a named part of the threat model:
   `kid` behind a rate limit, so a burst of unknown-`kid` tokens cannot be
   turned into an outbound-fetch amplification vector.
 
+### Known limitation: unbounded stale keys on sustained refresh failure
+
+If background refresh **starts failing** (the JWKS endpoint becomes
+unreachable), haybale currently keeps serving the **last successfully
+fetched** key set indefinitely, logging each refresh failure at `warn`
+(`jwks background refresh failed`). It favors availability: a JWKS outage
+does not lock every caller out.
+
+The security trade this makes is **unbounded trust duration** (CWE-613): if
+an issuer's signing key is compromised and rotated out of the published
+JWKS, *and* an attacker can simultaneously prevent haybale's egress to that
+one JWKS URL (a targeted partition), haybale would keep accepting tokens
+signed by the revoked key. This requires a prior key compromise plus a
+sustained, targeted network partition to exploit.
+
+A per-issuer `staleIfErrorFor` bound (serve last-known-good for at most
+N after refresh begins failing; `0` = fail closed immediately) is a
+**planned v0.2 follow-up**, deliberately deferred here: the value is a
+judgment call the deployment owner should sign off on, and the current
+JWKS library exposes no refresh-*success* signal to implement the bound
+correctly without a custom storage wrapper. An operator who needs
+fail-closed behavior today should monitor the `jwks background refresh
+failed` warning and rotate the deployment. The optional startup
+`discoveryCheck` (verify the configured issuer/jwksURL against the
+issuer's OIDC discovery document) is deferred on the same track.
+
 ## Default-deny policy
 
 `policy.yaml`'s rules are evaluated in order, first-match-wins; a

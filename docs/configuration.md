@@ -285,6 +285,21 @@ ever narrow its access this way, never widen it — the policy remains the
 ceiling. An absent claim leaves policy to decide alone; an explicit empty
 list denies every repo.
 
+### JWKS refresh and failure behavior
+
+A `jwksURL` is fetched once at startup (fail-fast — an unreachable or
+empty JWKS refuses to start) and then refreshed in the background,
+honoring the endpoint's `Cache-Control` and refetching on an unseen `kid`
+(rate-limited). If refresh later **starts failing**, haybale keeps serving
+the last successfully fetched key set and logs each failure at `warn`
+(`jwks background refresh failed`) — availability over strict freshness.
+
+A per-issuer `staleIfErrorFor` bound (fail closed once keys have been
+un-refreshable for N) and the optional `discoveryCheck` startup self-check
+are **planned but not yet implemented**; see the "Known limitation" note
+in `docs/security.md`. Until then, alert on the `jwks background refresh
+failed` warning if you need to react to a stale-trust-material condition.
+
 ## Policy
 
 ```yaml

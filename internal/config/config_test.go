@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/MicahParks/jwkset"
+	"github.com/golang-jwt/jwt/v5"
+	"gopkg.in/yaml.v3"
 
 	"github.com/rxbynerd/haybale/internal/gitproto"
 	"github.com/rxbynerd/haybale/internal/upstream"
@@ -839,6 +841,143 @@ func TestValidate(t *testing.T) {
 			wantErr: "duplicate issuer",
 		},
 		{
+			name: "issuer valid https jwksURL",
+			cfg: func(t *testing.T) Config {
+				_, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSURL: "https://issuer.example/.well-known/jwks",
+						Audiences: StringList{"aud"}, IdentityTemplate: "{sub}",
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			// No wantErr: a structurally-valid https jwksURL passes
+			// validation (Validate does not fetch it).
+		},
+		{
+			name: "issuer loopback http jwksURL permitted",
+			cfg: func(t *testing.T) Config {
+				_, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSURL: "http://127.0.0.1:9999/jwks",
+						Audiences: StringList{"aud"}, IdentityTemplate: "{sub}",
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			// No wantErr: http is permitted for a loopback host (testing).
+		},
+		{
+			name: "issuer jwksURL empty host",
+			cfg: func(t *testing.T) Config {
+				_, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSURL: "https:///jwks",
+						Audiences: StringList{"aud"}, IdentityTemplate: "{sub}",
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "must be an absolute URL with a host",
+		},
+		{
+			name: "issuer empty audience entry",
+			cfg: func(t *testing.T) Config {
+				jwksPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSFile: jwksPath,
+						Audiences: StringList{"aud", ""}, IdentityTemplate: "{sub}",
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "audience must not be empty",
+		},
+		{
+			name: "issuer invalid leeway duration",
+			cfg: func(t *testing.T) Config {
+				jwksPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSFile: jwksPath, Leeway: "not-a-duration",
+						Audiences: StringList{"aud"}, IdentityTemplate: "{sub}",
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "leeway",
+		},
+		{
+			name: "issuer negative leeway",
+			cfg: func(t *testing.T) Config {
+				jwksPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSFile: jwksPath, Leeway: "-5s",
+						Audiences: StringList{"aud"}, IdentityTemplate: "{sub}",
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "must not be negative",
+		},
+		{
+			name: "issuer claimBinding empty pattern list",
+			cfg: func(t *testing.T) Config {
+				jwksPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSFile: jwksPath, Audiences: StringList{"aud"},
+						IdentityTemplate: "{sub}", ClaimBindings: map[string]StringList{"repository_owner": {}},
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "has no values",
+		},
+		{
+			name: "issuer claimBinding malformed glob",
+			cfg: func(t *testing.T) Config {
+				jwksPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSFile: jwksPath, Audiences: StringList{"aud"},
+						IdentityTemplate: "{sub}", ClaimBindings: map[string]StringList{"repository_owner": {"[unclosed"}},
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "claimBindings",
+		},
+		{
 			name: "policy path empty",
 			cfg: func(t *testing.T) Config {
 				identityPath, _ := writeValidIdentityAndPolicyFiles(t)
@@ -1446,5 +1585,111 @@ func TestLoadMalformedYAML(t *testing.T) {
 	_, err := Load(path)
 	if err == nil {
 		t.Fatal("Load() = nil error, want error for malformed YAML")
+	}
+}
+
+// TestStringListUnmarshalScalar exercises StringList's scalar branch (a
+// bare YAML scalar decoding into a one-element slice) — the form
+// StringList exists to support (audiences: single-value), which the
+// bracketed-sequence fixtures elsewhere never cover.
+func TestStringListUnmarshalScalar(t *testing.T) {
+	var scalar StringList
+	if err := yaml.Unmarshal([]byte("just-one"), &scalar); err != nil {
+		t.Fatalf("Unmarshal scalar: %v", err)
+	}
+	if len(scalar) != 1 || scalar[0] != "just-one" {
+		t.Errorf("scalar StringList = %v, want [just-one]", scalar)
+	}
+
+	var seq StringList
+	if err := yaml.Unmarshal([]byte("[a, b, c]"), &seq); err != nil {
+		t.Fatalf("Unmarshal sequence: %v", err)
+	}
+	if len(seq) != 3 || seq[0] != "a" || seq[2] != "c" {
+		t.Errorf("sequence StringList = %v, want [a b c]", seq)
+	}
+}
+
+// TestBuildAuthenticatorEnforcesClaimBindings closes the config->identity
+// translation gap: it builds a real authenticator via BuildAuthenticator
+// from a Config whose issuer sets claimBindings, then confirms the built
+// authenticator actually enforces them — a token missing the bound claim
+// is rejected, one carrying it is accepted. This verifies the
+// map[string]StringList -> map[string][]string copy in BuildAuthenticator,
+// not just the identity package's own binding logic.
+func TestBuildAuthenticatorEnforcesClaimBindings(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa.GenerateKey: %v", err)
+	}
+	jwk, err := jwkset.NewJWKFromKey(key.Public(), jwkset.JWKOptions{
+		Metadata: jwkset.JWKMetadataOptions{KID: "k1", ALG: jwkset.AlgES256, USE: jwkset.UseSig},
+	})
+	if err != nil {
+		t.Fatalf("jwkset.NewJWKFromKey: %v", err)
+	}
+	store := jwkset.NewMemoryStorage()
+	if err := store.KeyWrite(context.Background(), jwk); err != nil {
+		t.Fatalf("KeyWrite: %v", err)
+	}
+	raw, err := store.JSONPublic(context.Background())
+	if err != nil {
+		t.Fatalf("JSONPublic: %v", err)
+	}
+	jwksPath := filepath.Join(t.TempDir(), "jwks.json")
+	if err := os.WriteFile(jwksPath, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	ident := IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+		Issuer:           "https://issuer.example",
+		JWKSFile:         jwksPath,
+		Audiences:        StringList{"https://haybale.internal"},
+		IdentityTemplate: "{sub}",
+		ClaimBindings:    map[string]StringList{"repository_owner": {"rxbynerd"}},
+	}}}
+	if err := ident.validate(); err != nil {
+		t.Fatalf("identity validate: %v", err)
+	}
+	auth, err := ident.BuildAuthenticator(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("BuildAuthenticator: %v", err)
+	}
+
+	mint := func(owner string) string {
+		now := time.Now()
+		claims := jwt.MapClaims{
+			"iss": "https://issuer.example", "aud": "https://haybale.internal",
+			"sub": "run-1", "iat": now.Unix(), "exp": now.Add(time.Hour).Unix(),
+		}
+		if owner != "" {
+			claims["repository_owner"] = owner
+		}
+		tok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+		tok.Header["kid"] = "k1"
+		signed, err := tok.SignedString(key)
+		if err != nil {
+			t.Fatalf("sign: %v", err)
+		}
+		return signed
+	}
+
+	req := func(token string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/github.com/o/r.git/info/refs?service=git-upload-pack", nil)
+		r.SetBasicAuth("git", token)
+		return r
+	}
+
+	// Binding satisfied -> authenticated.
+	if _, err := auth.Authenticate(context.Background(), req(mint("rxbynerd"))); err != nil {
+		t.Errorf("Authenticate with satisfied claim binding: %v", err)
+	}
+	// Binding violated -> rejected.
+	if _, err := auth.Authenticate(context.Background(), req(mint("someone-else"))); err == nil {
+		t.Error("Authenticate with violated claim binding succeeded, want failure")
+	}
+	// Bound claim absent -> rejected.
+	if _, err := auth.Authenticate(context.Background(), req(mint(""))); err == nil {
+		t.Error("Authenticate with missing bound claim succeeded, want failure")
 	}
 }
