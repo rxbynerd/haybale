@@ -56,6 +56,27 @@ type Proxy struct {
 	logger            *slog.Logger
 	authenticator     identity.Authenticator
 	policyEngine      policy.Engine
+
+	// draining is set by BeginDrain, called from cmd/haybale/cmd/serve.go
+	// on SIGTERM/SIGINT before http.Server.Shutdown is invoked. Once true,
+	// /healthz starts returning 503 instead of 200, telling a load
+	// balancer to stop routing new traffic to this instance while
+	// Shutdown lets in-flight requests — a large git clone/push in
+	// particular — finish streaming to completion. An atomic.Bool since
+	// BeginDrain runs concurrently with in-flight ServeHTTP calls, with no
+	// other synchronization between them.
+	draining atomic.Bool
+}
+
+// BeginDrain marks p as draining: every subsequent /healthz request
+// returns 503 instead of 200. It does not itself stop accepting new
+// connections or wait for in-flight requests — that is
+// http.Server.Shutdown's job (see cmd/haybale/cmd/serve.go) — it only
+// flips the health-check signal a load balancer polls, so a caller
+// should invoke this immediately before calling Shutdown. Idempotent and
+// safe to call concurrently with ServeHTTP.
+func (p *Proxy) BeginDrain() {
+	p.draining.Store(true)
 }
 
 // routeKey is the context key ServeHTTP uses to hand the resolved
@@ -144,6 +165,14 @@ func New(upstreams map[string]*url.URL, credentialSources map[string]upstream.Cr
 // ServeHTTP implements http.Handler.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet && r.URL.Path == "/healthz" {
+		if p.draining.Load() {
+			// Deliberately still a "successful" HTTP exchange, just a
+			// non-2xx status: a load balancer's health check should read
+			// this as "stop routing new traffic here", not as haybale
+			// itself being unreachable.
+			http.Error(w, "503 Service Unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}

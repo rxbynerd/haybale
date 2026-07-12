@@ -164,6 +164,29 @@ func TestHealthz(t *testing.T) {
 	}
 }
 
+// TestHealthzReturnsServiceUnavailableWhileDraining asserts BeginDrain
+// flips /healthz from 200 to 503 — the signal a load balancer's health
+// check polls to stop routing new traffic to an instance that's
+// gracefully shutting down (see cmd/haybale/cmd/serve.go's
+// SIGTERM/SIGINT handling, which calls BeginDrain immediately before
+// http.Server.Shutdown).
+func TestHealthzReturnsServiceUnavailableWhileDraining(t *testing.T) {
+	p := mustNew(t, newUpstreamMap(t, nil), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	p.BeginDrain()
+
+	resp, err := http.Get(srv.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("GET /healthz status = %d, want %d while draining", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+}
+
 func TestInvalidRequestMaps404(t *testing.T) {
 	p := mustNew(t, newUpstreamMap(t, map[string]string{"github.com": "http://127.0.0.1:1"}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
 	srv := httptest.NewServer(p)
