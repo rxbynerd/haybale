@@ -27,6 +27,11 @@ type namedPattern struct {
 //     URLs commonly carry a token this way
 //     (https://x-access-token:ghs_xxx@host/owner/repo.git), and neither
 //     the Basic nor Bearer pattern above matches that shape.
+//   - a compact JWT (eyJ-prefixed, three dot-joined base64url segments) —
+//     what a caller now presents as its haybale credential. The identity
+//     layer only ever logs a token's verified claims, never the compact
+//     token, so this catches a raw token that reaches a log through a bug
+//     or a dependency's error string.
 //   - GitHub's own token prefixes (ghp_/gho_/ghu_/ghs_/ghr_ and the
 //     github_pat_ fine-grained PAT shape) — what a real personal access
 //     token, OAuth token, user-to-server token, GitHub App installation
@@ -50,6 +55,16 @@ var secretPatterns = []namedPattern{
 	{"url_userinfo", regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://[^\s/@]+@`)},
 	{"basic_auth_header", regexp.MustCompile(`(?i)Basic\s+[A-Za-z0-9+/]+=*`)},
 	{"bearer_token_header", regexp.MustCompile(`(?i)Bearer\s+[A-Za-z0-9._~+/=-]+`)},
+	// A compact JWT — three base64url segments joined by dots, with the
+	// leading segment always starting "eyJ" (the base64url of `{"`, the
+	// start of every JOSE header). This is what a caller now presents as
+	// its haybale credential, so a bug that ever logged the raw token
+	// (rather than only the verified claims the identity layer emits)
+	// would leak it; this is the defense-in-depth backstop. Placed after
+	// basic_auth_header/bearer_token_header so a JWT carried inside one of
+	// those headers is caught by the header pattern first, and this
+	// catches a bare token that reached a log some other way.
+	{"jwt_compact", regexp.MustCompile(`\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+`)},
 	// Covers every current GitHub token-prefix shape (classic PAT ghp_,
 	// OAuth gho_, user-to-server ghu_, App installation ghs_, refresh
 	// ghr_) plus the github_pat_ fine-grained PAT shape, which doesn't

@@ -87,6 +87,18 @@ func LoadGlobEngine(policyPath string) (*GlobEngine, error) {
 // match — Allowed reflecting whether that rule's Permissions grants the
 // requested verb — or a default-deny Decision with a nil Rule if no
 // rule's patterns matched at all.
+//
+// When the authenticated identity carries a non-nil RepoScope (a
+// per-token narrowing claim the JWT verifier extracted), that scope is
+// intersected with the policy: a repo the policy would otherwise allow is
+// still denied if it falls outside every scope glob. The effective
+// permission is policy ∩ scope — a token can only ever narrow access
+// below what policy grants, never widen it. A nil RepoScope leaves policy
+// to decide alone; a non-nil but empty RepoScope denies every repo (the
+// token asserted an empty scope). The scope check runs only after a rule
+// has matched and granted, so a scope denial is audit-distinguishable
+// (its own Reason) from an ordinary rule miss, while the proxy maps both
+// to the same 404 (no existence oracle).
 func (e *GlobEngine) Authorize(id identity.Identity, repo gitproto.Repo, verb gitproto.Verb) Decision {
 	key := repoKey(repo)
 	for i := range e.rules {
@@ -97,10 +109,17 @@ func (e *GlobEngine) Authorize(id identity.Identity, repo gitproto.Repo, verb gi
 		if !matchesAny(rule.Repos, key) {
 			continue
 		}
-		if rule.grants(verb) {
-			return Decision{Allowed: true, Rule: rule, Reason: "matched rule grants " + string(permissionFor(verb))}
+		if !rule.grants(verb) {
+			return Decision{Allowed: false, Rule: rule, Reason: "matched rule does not grant " + string(permissionFor(verb))}
 		}
-		return Decision{Allowed: false, Rule: rule, Reason: "matched rule does not grant " + string(permissionFor(verb))}
+		if id.RepoScope != nil && !matchesAny(id.RepoScope, key) {
+			// Policy granted, but the token's own scope claim does not
+			// cover this repo: the intersection denies it. Carries the
+			// matched rule so audit can see "policy would have allowed,
+			// token scope narrowed it out" rather than a bare deny.
+			return Decision{Allowed: false, Rule: rule, Reason: "repo outside token scope"}
+		}
+		return Decision{Allowed: true, Rule: rule, Reason: "matched rule grants " + string(permissionFor(verb))}
 	}
 	return Decision{Allowed: false, Rule: nil, Reason: "no matching rule (default deny)"}
 }

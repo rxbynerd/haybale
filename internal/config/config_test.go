@@ -19,18 +19,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MicahParks/jwkset"
+	"github.com/golang-jwt/jwt/v5"
+	"gopkg.in/yaml.v3"
+
 	"github.com/rxbynerd/haybale/internal/gitproto"
 	"github.com/rxbynerd/haybale/internal/upstream"
 )
-
-// fakeTokenDigest is a structurally valid "sha256:<hex>" tokenDigest
-// value good enough for exercising config-level validation, which only
-// cares that identities.yaml parses and decodes — it never needs to
-// correspond to any real token.
-const fakeTokenDigest = "sha256:" + "11" + "22" + "33" + "44" + "55" + "66" + "77" + "88" +
-	"99" + "aa" + "bb" + "cc" + "dd" + "ee" + "ff" + "00" +
-	"11" + "22" + "33" + "44" + "55" + "66" + "77" + "88" +
-	"99" + "aa" + "bb" + "cc" + "dd" + "ee" + "ff" + "00"
 
 // testTokenEnv is the environment variable name every config_test.go
 // fixture's "static" credential block points tokenEnv at. Every test
@@ -48,22 +43,67 @@ const testTokenEnvValue = "test-token-value"
 // testTokenEnvValue).
 var validCredential = CredentialConfig{Type: credentialTypeStatic, TokenEnv: testTokenEnv}
 
-// writeValidIdentityAndPolicyFiles writes a minimal valid identities.yaml
-// and policy.yaml under t.TempDir(), returning their paths. Every
-// TestValidate case that isn't itself exercising identity/policy
-// validation uses these so the rest of Validate() can be tested in
-// isolation.
+// writeValidJWKSFile generates a throwaway ES256 key (never committed —
+// generated fresh every run) and writes its public half as a JWKS
+// document under t.TempDir(), returning the path. Good enough to satisfy
+// a jwt issuer's jwksFile at both config-validation time (which only
+// checks the path is set) and BuildAuthenticator time (which reads and
+// parses it, requiring at least one key).
+func writeValidJWKSFile(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa.GenerateKey: %v", err)
+	}
+	jwk, err := jwkset.NewJWKFromKey(key.Public(), jwkset.JWKOptions{
+		Metadata: jwkset.JWKMetadataOptions{KID: "test-key", ALG: jwkset.AlgES256, USE: jwkset.UseSig},
+	})
+	if err != nil {
+		t.Fatalf("jwkset.NewJWKFromKey: %v", err)
+	}
+	store := jwkset.NewMemoryStorage()
+	if err := store.KeyWrite(context.Background(), jwk); err != nil {
+		t.Fatalf("store.KeyWrite: %v", err)
+	}
+	raw, err := store.JSONPublic(context.Background())
+	if err != nil {
+		t.Fatalf("store.JSONPublic: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "jwks.json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("os.WriteFile(jwks.json): %v", err)
+	}
+	return path
+}
+
+// validJWTIdentity is a jwt IdentityConfig that Validate() succeeds on,
+// backed by the file-based JWKS at jwksPath. Every TestValidate case that
+// isn't itself exercising identity validation uses this so the rest of
+// Validate() can be tested in isolation.
+func validJWTIdentity(jwksPath string) IdentityConfig {
+	return IdentityConfig{
+		Type: identityTypeJWT,
+		Issuers: []IssuerConfig{{
+			Issuer:           "https://issuer.example",
+			JWKSFile:         jwksPath,
+			Audiences:        StringList{"https://haybale.internal"},
+			IdentityTemplate: "{sub}",
+		}},
+	}
+}
+
+// writeValidIdentityAndPolicyFiles writes a valid JWKS file and
+// policy.yaml under t.TempDir(), returning their paths. identityPath is a
+// JWKS document suitable for validJWTIdentity; policyPath is a minimal
+// allow rule. Every TestValidate case that isn't itself exercising
+// identity/policy validation uses these so the rest of Validate() can be
+// tested in isolation.
 func writeValidIdentityAndPolicyFiles(t *testing.T) (identityPath, policyPath string) {
 	t.Helper()
-	dir := t.TempDir()
 
-	identityPath = filepath.Join(dir, "identities.yaml")
-	identityContent := "identities:\n  - id: run-1\n    tokenDigest: " + fakeTokenDigest + "\n"
-	if err := os.WriteFile(identityPath, []byte(identityContent), 0o600); err != nil {
-		t.Fatalf("os.WriteFile(identities.yaml): %v", err)
-	}
+	identityPath = writeValidJWKSFile(t)
 
-	policyPath = filepath.Join(dir, "policy.yaml")
+	policyPath = filepath.Join(t.TempDir(), "policy.yaml")
 	policyContent := "rules:\n  - identities: [\"run-*\"]\n    repos: [\"github.com/acme/*\"]\n    permissions: [read, write]\n"
 	if err := os.WriteFile(policyPath, []byte(policyContent), 0o600); err != nil {
 		t.Fatalf("os.WriteFile(policy.yaml): %v", err)
@@ -176,7 +216,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:    ":8466",
 					LogLevel:  "info",
-					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity:  validJWTIdentity(identityPath),
 					Policy:    PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{validUpstream},
 				}
@@ -189,7 +229,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:    ":8466",
 					LogLevel:  "DEBUG",
-					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity:  validJWTIdentity(identityPath),
 					Policy:    PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{validUpstream},
 				}
@@ -202,7 +242,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:    ":8466",
 					LogLevel:  "verbose",
-					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity:  validJWTIdentity(identityPath),
 					Policy:    PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{validUpstream},
 				}
@@ -218,7 +258,7 @@ func TestValidate(t *testing.T) {
 					Listen:    ":8466",
 					LogLevel:  "info",
 					TLS:       TLSConfig{CertPath: certPath},
-					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity:  validJWTIdentity(identityPath),
 					Policy:    PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{validUpstream},
 				}
@@ -234,7 +274,7 @@ func TestValidate(t *testing.T) {
 					Listen:    ":8466",
 					LogLevel:  "info",
 					TLS:       TLSConfig{KeyPath: keyPath},
-					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity:  validJWTIdentity(identityPath),
 					Policy:    PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{validUpstream},
 				}
@@ -250,7 +290,7 @@ func TestValidate(t *testing.T) {
 					Listen:    ":8466",
 					LogLevel:  "info",
 					TLS:       TLSConfig{CertPath: filepath.Join(t.TempDir(), "nope.pem"), KeyPath: keyPath},
-					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity:  validJWTIdentity(identityPath),
 					Policy:    PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{validUpstream},
 				}
@@ -267,7 +307,7 @@ func TestValidate(t *testing.T) {
 					Listen:    ":8466",
 					LogLevel:  "info",
 					TLS:       TLSConfig{CertPath: certPath, KeyPath: otherKeyPath},
-					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity:  validJWTIdentity(identityPath),
 					Policy:    PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{validUpstream},
 				}
@@ -283,7 +323,7 @@ func TestValidate(t *testing.T) {
 					Listen:    ":8466",
 					LogLevel:  "info",
 					TLS:       TLSConfig{CertPath: certPath, KeyPath: keyPath},
-					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity:  validJWTIdentity(identityPath),
 					Policy:    PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{validUpstream},
 				}
@@ -303,7 +343,7 @@ func TestValidate(t *testing.T) {
 					Listen:    ":8466",
 					LogLevel:  "info",
 					TLS:       TLSConfig{CertPath: certPath, KeyPath: keyPath},
-					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity:  validJWTIdentity(identityPath),
 					Policy:    PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{validUpstream},
 				}
@@ -318,7 +358,7 @@ func TestValidate(t *testing.T) {
 					Listen:       ":8466",
 					LogLevel:     "info",
 					DrainTimeout: "not-a-duration",
-					Identity:     IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity:     validJWTIdentity(identityPath),
 					Policy:       PolicyConfig{Path: policyPath},
 					Upstreams:    []Upstream{validUpstream},
 				}
@@ -333,7 +373,7 @@ func TestValidate(t *testing.T) {
 					Listen:       ":8466",
 					LogLevel:     "info",
 					DrainTimeout: "-1m",
-					Identity:     IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity:     validJWTIdentity(identityPath),
 					Policy:       PolicyConfig{Path: policyPath},
 					Upstreams:    []Upstream{validUpstream},
 				}
@@ -348,7 +388,7 @@ func TestValidate(t *testing.T) {
 					Listen:       ":8466",
 					LogLevel:     "info",
 					DrainTimeout: "0s",
-					Identity:     IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity:     validJWTIdentity(identityPath),
 					Policy:       PolicyConfig{Path: policyPath},
 					Upstreams:    []Upstream{validUpstream},
 				}
@@ -361,7 +401,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:   ":8466",
 					LogLevel: "info",
-					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity: validJWTIdentity(identityPath),
 					Policy:   PolicyConfig{Path: policyPath},
 				}
 			},
@@ -374,7 +414,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:    ":8466",
 					LogLevel:  "info",
-					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity:  validJWTIdentity(identityPath),
 					Policy:    PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{{BaseURL: "https://github.com"}},
 				}
@@ -388,7 +428,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:    ":8466",
 					LogLevel:  "info",
-					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity:  validJWTIdentity(identityPath),
 					Policy:    PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{{Host: "github.com"}},
 				}
@@ -402,7 +442,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:    ":8466",
 					LogLevel:  "info",
-					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity:  validJWTIdentity(identityPath),
 					Policy:    PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{{Host: "github.com", BaseURL: "github.com"}},
 				}
@@ -416,7 +456,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:   ":8466",
 					LogLevel: "info",
-					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity: validJWTIdentity(identityPath),
 					Policy:   PolicyConfig{Path: policyPath},
 					// An unterminated IPv6 literal: url.Parse rejects this
 					// outright (not merely "no scheme"), exercising the
@@ -434,7 +474,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:   ":8466",
 					LogLevel: "info",
-					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity: validJWTIdentity(identityPath),
 					Policy:   PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{
 						{Host: "github.com", BaseURL: "https://github.com", Credential: validCredential},
@@ -451,7 +491,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:    ":8466",
 					LogLevel:  "info",
-					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity:  validJWTIdentity(identityPath),
 					Policy:    PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{{Host: "github.com", BaseURL: "https://github.com"}},
 				}
@@ -465,7 +505,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:   ":8466",
 					LogLevel: "info",
-					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity: validJWTIdentity(identityPath),
 					Policy:   PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{
 						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{Type: "ldap"}},
@@ -481,7 +521,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:   ":8466",
 					LogLevel: "info",
-					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity: validJWTIdentity(identityPath),
 					Policy:   PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{
 						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
@@ -499,7 +539,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:   ":8466",
 					LogLevel: "info",
-					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity: validJWTIdentity(identityPath),
 					Policy:   PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{
 						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{Type: credentialTypeStatic}},
@@ -515,7 +555,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:   ":8466",
 					LogLevel: "info",
-					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity: validJWTIdentity(identityPath),
 					Policy:   PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{
 						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{ //nolint:gosec // G101: TokenEnv below is an environment-variable name (deliberately never set), not a credential value
@@ -533,7 +573,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:   ":8466",
 					LogLevel: "info",
-					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity: validJWTIdentity(identityPath),
 					Policy:   PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{
 						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
@@ -551,7 +591,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:   ":8466",
 					LogLevel: "info",
-					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity: validJWTIdentity(identityPath),
 					Policy:   PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{
 						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
@@ -569,7 +609,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:   ":8466",
 					LogLevel: "info",
-					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity: validJWTIdentity(identityPath),
 					Policy:   PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{
 						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
@@ -591,7 +631,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:   ":8466",
 					LogLevel: "info",
-					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity: validJWTIdentity(identityPath),
 					Policy:   PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{
 						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
@@ -613,7 +653,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:   ":8466",
 					LogLevel: "info",
-					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity: validJWTIdentity(identityPath),
 					Policy:   PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{
 						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
@@ -631,7 +671,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:   ":8466",
 					LogLevel: "info",
-					Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity: validJWTIdentity(identityPath),
 					Policy:   PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{
 						{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
@@ -661,11 +701,11 @@ func TestValidate(t *testing.T) {
 		{
 			name: "identity type unsupported",
 			cfg: func(t *testing.T) Config {
-				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				_, policyPath := writeValidIdentityAndPolicyFiles(t)
 				return Config{
 					Listen:    ":8466",
 					LogLevel:  "info",
-					Identity:  IdentityConfig{Type: "ldap", Path: identityPath},
+					Identity:  IdentityConfig{Type: "ldap"},
 					Policy:    PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{validUpstream},
 				}
@@ -673,51 +713,269 @@ func TestValidate(t *testing.T) {
 			wantErr: "identity: type",
 		},
 		{
-			name: "identity path empty",
+			name: "identity jwt with no issuers",
 			cfg: func(t *testing.T) Config {
 				_, policyPath := writeValidIdentityAndPolicyFiles(t)
 				return Config{
 					Listen:    ":8466",
 					LogLevel:  "info",
-					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile},
+					Identity:  IdentityConfig{Type: identityTypeJWT},
 					Policy:    PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{validUpstream},
 				}
 			},
-			wantErr: "identity: path is required",
+			wantErr: "at least one issuer",
 		},
 		{
-			name: "identity path does not exist",
+			name: "issuer with neither jwksURL nor jwksFile",
 			cfg: func(t *testing.T) Config {
 				_, policyPath := writeValidIdentityAndPolicyFiles(t)
 				return Config{
-					Listen:    ":8466",
-					LogLevel:  "info",
-					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: filepath.Join(t.TempDir(), "nope.yaml")},
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", Audiences: StringList{"aud"}, IdentityTemplate: "{sub}",
+					}}},
 					Policy:    PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{validUpstream},
 				}
 			},
-			wantErr: "identity:",
+			wantErr: "exactly one of jwksURL or jwksFile",
 		},
 		{
-			name: "identity file fails its own validation",
+			name: "issuer with both jwksURL and jwksFile",
 			cfg: func(t *testing.T) Config {
-				dir := t.TempDir()
-				identityPath := filepath.Join(dir, "identities.yaml")
-				if err := os.WriteFile(identityPath, []byte("identities: []\n"), 0o600); err != nil {
-					t.Fatalf("os.WriteFile: %v", err)
-				}
 				_, policyPath := writeValidIdentityAndPolicyFiles(t)
 				return Config{
-					Listen:    ":8466",
-					LogLevel:  "info",
-					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSURL: "https://issuer.example/jwks", JWKSFile: "/tmp/jwks.json",
+						Audiences: StringList{"aud"}, IdentityTemplate: "{sub}",
+					}}},
 					Policy:    PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{validUpstream},
 				}
 			},
-			wantErr: "at least one identity",
+			wantErr: "mutually exclusive",
+		},
+		{
+			name: "issuer jwksURL not https",
+			cfg: func(t *testing.T) Config {
+				_, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSURL: "http://issuer.example/jwks",
+						Audiences: StringList{"aud"}, IdentityTemplate: "{sub}",
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "must use https",
+		},
+		{
+			name: "issuer with no audiences",
+			cfg: func(t *testing.T) Config {
+				jwksPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSFile: jwksPath, IdentityTemplate: "{sub}",
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "at least one audience",
+		},
+		{
+			name: "issuer with a symmetric algorithm",
+			cfg: func(t *testing.T) Config {
+				jwksPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSFile: jwksPath, Algorithms: []string{"HS256"},
+						Audiences: StringList{"aud"}, IdentityTemplate: "{sub}",
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "not an allowed asymmetric algorithm",
+		},
+		{
+			name: "issuer with no identityTemplate",
+			cfg: func(t *testing.T) Config {
+				jwksPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSFile: jwksPath, Audiences: StringList{"aud"},
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "identityTemplate is required",
+		},
+		{
+			name: "duplicate issuer",
+			cfg: func(t *testing.T) Config {
+				jwksPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				iss := IssuerConfig{Issuer: "https://issuer.example", JWKSFile: jwksPath, Audiences: StringList{"aud"}, IdentityTemplate: "{sub}"}
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					Identity:  IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{iss, iss}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "duplicate issuer",
+		},
+		{
+			name: "issuer valid https jwksURL",
+			cfg: func(t *testing.T) Config {
+				_, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSURL: "https://issuer.example/.well-known/jwks",
+						Audiences: StringList{"aud"}, IdentityTemplate: "{sub}",
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			// No wantErr: a structurally-valid https jwksURL passes
+			// validation (Validate does not fetch it).
+		},
+		{
+			name: "issuer loopback http jwksURL permitted",
+			cfg: func(t *testing.T) Config {
+				_, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSURL: "http://127.0.0.1:9999/jwks",
+						Audiences: StringList{"aud"}, IdentityTemplate: "{sub}",
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			// No wantErr: http is permitted for a loopback host (testing).
+		},
+		{
+			name: "issuer jwksURL empty host",
+			cfg: func(t *testing.T) Config {
+				_, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSURL: "https:///jwks",
+						Audiences: StringList{"aud"}, IdentityTemplate: "{sub}",
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "must be an absolute URL with a host",
+		},
+		{
+			name: "issuer empty audience entry",
+			cfg: func(t *testing.T) Config {
+				jwksPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSFile: jwksPath,
+						Audiences: StringList{"aud", ""}, IdentityTemplate: "{sub}",
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "audience must not be empty",
+		},
+		{
+			name: "issuer invalid leeway duration",
+			cfg: func(t *testing.T) Config {
+				jwksPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSFile: jwksPath, Leeway: "not-a-duration",
+						Audiences: StringList{"aud"}, IdentityTemplate: "{sub}",
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "leeway",
+		},
+		{
+			name: "issuer negative leeway",
+			cfg: func(t *testing.T) Config {
+				jwksPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSFile: jwksPath, Leeway: "-5s",
+						Audiences: StringList{"aud"}, IdentityTemplate: "{sub}",
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "must not be negative",
+		},
+		{
+			name: "issuer claimBinding empty pattern list",
+			cfg: func(t *testing.T) Config {
+				jwksPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSFile: jwksPath, Audiences: StringList{"aud"},
+						IdentityTemplate: "{sub}", ClaimBindings: map[string]StringList{"repository_owner": {}},
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "has no values",
+		},
+		{
+			name: "issuer claimBinding malformed glob",
+			cfg: func(t *testing.T) Config {
+				jwksPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:   ":8466",
+					LogLevel: "info",
+					Identity: IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+						Issuer: "https://issuer.example", JWKSFile: jwksPath, Audiences: StringList{"aud"},
+						IdentityTemplate: "{sub}", ClaimBindings: map[string]StringList{"repository_owner": {"[unclosed"}},
+					}}},
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{validUpstream},
+				}
+			},
+			wantErr: "claimBindings",
 		},
 		{
 			name: "policy path empty",
@@ -726,7 +984,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:    ":8466",
 					LogLevel:  "info",
-					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity:  validJWTIdentity(identityPath),
 					Upstreams: []Upstream{validUpstream},
 				}
 			},
@@ -739,7 +997,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:    ":8466",
 					LogLevel:  "info",
-					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity:  validJWTIdentity(identityPath),
 					Policy:    PolicyConfig{Path: filepath.Join(t.TempDir(), "nope.yaml")},
 					Upstreams: []Upstream{validUpstream},
 				}
@@ -759,7 +1017,7 @@ func TestValidate(t *testing.T) {
 				return Config{
 					Listen:    ":8466",
 					LogLevel:  "info",
-					Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+					Identity:  validJWTIdentity(identityPath),
 					Policy:    PolicyConfig{Path: policyPath},
 					Upstreams: []Upstream{validUpstream},
 				}
@@ -826,7 +1084,7 @@ func TestValidatePopulatesParsedBaseURL(t *testing.T) {
 	cfg := Config{
 		Listen:   ":8466",
 		LogLevel: "info",
-		Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+		Identity: validJWTIdentity(identityPath),
 		Policy:   PolicyConfig{Path: policyPath},
 		Upstreams: []Upstream{
 			{Host: "github.com", BaseURL: "https://github.com:8443", Credential: validCredential},
@@ -845,13 +1103,20 @@ func TestValidatePopulatesParsedBaseURL(t *testing.T) {
 	}
 }
 
-func TestValidatePopulatesAuthenticatorAndEngine(t *testing.T) {
+// TestValidatePopulatesEngineAndBuildAuthenticator confirms Validate()
+// builds the policy engine (a pure file load, kept in Validate()) and
+// that BuildAuthenticator then constructs a working JWT authenticator
+// from the validated identity block. The two are deliberately split:
+// Validate() runs for the offline `haybale policy check`, which must
+// never reach out to a JWKS, so building the (potentially network-backed)
+// authenticator is BuildAuthenticator's separate job.
+func TestValidatePopulatesEngineAndBuildAuthenticator(t *testing.T) {
 	t.Setenv(testTokenEnv, testTokenEnvValue)
 	identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
 	cfg := Config{
 		Listen:    ":8466",
 		LogLevel:  "info",
-		Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+		Identity:  validJWTIdentity(identityPath),
 		Policy:    PolicyConfig{Path: policyPath},
 		Upstreams: []Upstream{{Host: "github.com", BaseURL: "https://github.com", Credential: validCredential}},
 	}
@@ -859,11 +1124,16 @@ func TestValidatePopulatesAuthenticatorAndEngine(t *testing.T) {
 		t.Fatalf("Validate() unexpected error: %v", err)
 	}
 
-	if cfg.Identity.Authenticator() == nil {
-		t.Error("Identity.Authenticator() = nil after successful Validate()")
-	}
 	if cfg.Policy.Engine() == nil {
 		t.Error("Policy.Engine() = nil after successful Validate()")
+	}
+
+	auth, err := cfg.Identity.BuildAuthenticator(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("BuildAuthenticator() unexpected error: %v", err)
+	}
+	if auth == nil {
+		t.Error("BuildAuthenticator() = nil after successful Validate()")
 	}
 }
 
@@ -877,7 +1147,7 @@ func TestValidatePopulatesCredentialSource(t *testing.T) {
 	cfg := Config{
 		Listen:   ":8466",
 		LogLevel: "info",
-		Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+		Identity: validJWTIdentity(identityPath),
 		Policy:   PolicyConfig{Path: policyPath},
 		Upstreams: []Upstream{
 			{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
@@ -920,7 +1190,7 @@ func TestValidatePopulatesGitHubAppCredentialSource(t *testing.T) {
 	cfg := Config{
 		Listen:   ":8466",
 		LogLevel: "info",
-		Identity: IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+		Identity: validJWTIdentity(identityPath),
 		Policy:   PolicyConfig{Path: policyPath},
 		Upstreams: []Upstream{
 			{Host: "github.com", BaseURL: "https://github.com", Credential: CredentialConfig{
@@ -965,7 +1235,7 @@ func TestValidatePopulatesCertificate(t *testing.T) {
 		LogLevel:     "info",
 		TLS:          TLSConfig{CertPath: certPath, KeyPath: keyPath},
 		DrainTimeout: "90s",
-		Identity:     IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+		Identity:     validJWTIdentity(identityPath),
 		Policy:       PolicyConfig{Path: policyPath},
 		Upstreams:    []Upstream{{Host: "github.com", BaseURL: "https://github.com", Credential: validCredential}},
 	}
@@ -993,7 +1263,7 @@ func TestValidateLeavesTLSDisabledWhenEmpty(t *testing.T) {
 	cfg := Config{
 		Listen:    ":8466",
 		LogLevel:  "info",
-		Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+		Identity:  validJWTIdentity(identityPath),
 		Policy:    PolicyConfig{Path: policyPath},
 		Upstreams: []Upstream{{Host: "github.com", BaseURL: "https://github.com", Credential: validCredential}},
 	}
@@ -1053,8 +1323,12 @@ func TestLoad(t *testing.T) {
 listen: ":9999"
 logLevel: warn
 identity:
-  type: static-token-file
-  path: ` + identityPath + `
+  type: jwt
+  issuers:
+    - issuer: https://issuer.example
+      jwksFile: ` + identityPath + `
+      audiences: [https://haybale.internal]
+      identityTemplate: "{sub}"
 policy:
   path: ` + policyPath + `
 upstreams:
@@ -1091,11 +1365,15 @@ upstreams:
 	if cfg.Upstreams[1].CredentialSource() == nil {
 		t.Error("Upstreams[1].CredentialSource() = nil after Load()")
 	}
-	if cfg.Identity.Authenticator() == nil {
-		t.Error("Identity.Authenticator() = nil after Load()")
-	}
+	// Load runs Validate() but deliberately does NOT build the JWT
+	// authenticator (that is BuildAuthenticator's separate, network-capable
+	// job — see TestValidatePopulatesEngineAndBuildAuthenticator); the
+	// engine, a pure file load, is populated here.
 	if cfg.Policy.Engine() == nil {
 		t.Error("Policy.Engine() = nil after Load()")
+	}
+	if len(cfg.Identity.Issuers) != 1 || cfg.Identity.Issuers[0].Issuer != "https://issuer.example" {
+		t.Errorf("Identity.Issuers = %+v, want one issuer https://issuer.example", cfg.Identity.Issuers)
 	}
 }
 
@@ -1110,8 +1388,12 @@ func TestLoadWithTLSOverride(t *testing.T) {
 	path := filepath.Join(dir, "haybale.yaml")
 	yamlContent := `
 identity:
-  type: static-token-file
-  path: ` + identityPath + `
+  type: jwt
+  issuers:
+    - issuer: https://issuer.example
+      jwksFile: ` + identityPath + `
+      audiences: [https://haybale.internal]
+      identityTemplate: "{sub}"
 policy:
   path: ` + policyPath + `
 upstreams:
@@ -1148,8 +1430,12 @@ func TestLoadWithTLSOverrideLeavesUnsetFieldsAlone(t *testing.T) {
 	path := filepath.Join(dir, "haybale.yaml")
 	yamlContent := `
 identity:
-  type: static-token-file
-  path: ` + identityPath + `
+  type: jwt
+  issuers:
+    - issuer: https://issuer.example
+      jwksFile: ` + identityPath + `
+      audiences: [https://haybale.internal]
+      identityTemplate: "{sub}"
 policy:
   path: ` + policyPath + `
 tls:
@@ -1182,8 +1468,12 @@ func TestLoadWithDrainTimeoutOverride(t *testing.T) {
 	path := filepath.Join(dir, "haybale.yaml")
 	yamlContent := `
 identity:
-  type: static-token-file
-  path: ` + identityPath + `
+  type: jwt
+  issuers:
+    - issuer: https://issuer.example
+      jwksFile: ` + identityPath + `
+      audiences: [https://haybale.internal]
+      identityTemplate: "{sub}"
 policy:
   path: ` + policyPath + `
 drainTimeout: 5m
@@ -1212,8 +1502,12 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	path := filepath.Join(dir, "haybale.yaml")
 	yamlContent := `
 identity:
-  type: static-token-file
-  path: ` + identityPath + `
+  type: jwt
+  issuers:
+    - issuer: https://issuer.example
+      jwksFile: ` + identityPath + `
+      audiences: [https://haybale.internal]
+      identityTemplate: "{sub}"
 policy:
   path: ` + policyPath + `
 upstreams:
@@ -1291,5 +1585,111 @@ func TestLoadMalformedYAML(t *testing.T) {
 	_, err := Load(path)
 	if err == nil {
 		t.Fatal("Load() = nil error, want error for malformed YAML")
+	}
+}
+
+// TestStringListUnmarshalScalar exercises StringList's scalar branch (a
+// bare YAML scalar decoding into a one-element slice) — the form
+// StringList exists to support (audiences: single-value), which the
+// bracketed-sequence fixtures elsewhere never cover.
+func TestStringListUnmarshalScalar(t *testing.T) {
+	var scalar StringList
+	if err := yaml.Unmarshal([]byte("just-one"), &scalar); err != nil {
+		t.Fatalf("Unmarshal scalar: %v", err)
+	}
+	if len(scalar) != 1 || scalar[0] != "just-one" {
+		t.Errorf("scalar StringList = %v, want [just-one]", scalar)
+	}
+
+	var seq StringList
+	if err := yaml.Unmarshal([]byte("[a, b, c]"), &seq); err != nil {
+		t.Fatalf("Unmarshal sequence: %v", err)
+	}
+	if len(seq) != 3 || seq[0] != "a" || seq[2] != "c" {
+		t.Errorf("sequence StringList = %v, want [a b c]", seq)
+	}
+}
+
+// TestBuildAuthenticatorEnforcesClaimBindings closes the config->identity
+// translation gap: it builds a real authenticator via BuildAuthenticator
+// from a Config whose issuer sets claimBindings, then confirms the built
+// authenticator actually enforces them — a token missing the bound claim
+// is rejected, one carrying it is accepted. This verifies the
+// map[string]StringList -> map[string][]string copy in BuildAuthenticator,
+// not just the identity package's own binding logic.
+func TestBuildAuthenticatorEnforcesClaimBindings(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa.GenerateKey: %v", err)
+	}
+	jwk, err := jwkset.NewJWKFromKey(key.Public(), jwkset.JWKOptions{
+		Metadata: jwkset.JWKMetadataOptions{KID: "k1", ALG: jwkset.AlgES256, USE: jwkset.UseSig},
+	})
+	if err != nil {
+		t.Fatalf("jwkset.NewJWKFromKey: %v", err)
+	}
+	store := jwkset.NewMemoryStorage()
+	if err := store.KeyWrite(context.Background(), jwk); err != nil {
+		t.Fatalf("KeyWrite: %v", err)
+	}
+	raw, err := store.JSONPublic(context.Background())
+	if err != nil {
+		t.Fatalf("JSONPublic: %v", err)
+	}
+	jwksPath := filepath.Join(t.TempDir(), "jwks.json")
+	if err := os.WriteFile(jwksPath, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	ident := IdentityConfig{Type: identityTypeJWT, Issuers: []IssuerConfig{{
+		Issuer:           "https://issuer.example",
+		JWKSFile:         jwksPath,
+		Audiences:        StringList{"https://haybale.internal"},
+		IdentityTemplate: "{sub}",
+		ClaimBindings:    map[string]StringList{"repository_owner": {"rxbynerd"}},
+	}}}
+	if err := ident.validate(); err != nil {
+		t.Fatalf("identity validate: %v", err)
+	}
+	auth, err := ident.BuildAuthenticator(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("BuildAuthenticator: %v", err)
+	}
+
+	mint := func(owner string) string {
+		now := time.Now()
+		claims := jwt.MapClaims{
+			"iss": "https://issuer.example", "aud": "https://haybale.internal",
+			"sub": "run-1", "iat": now.Unix(), "exp": now.Add(time.Hour).Unix(),
+		}
+		if owner != "" {
+			claims["repository_owner"] = owner
+		}
+		tok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+		tok.Header["kid"] = "k1"
+		signed, err := tok.SignedString(key)
+		if err != nil {
+			t.Fatalf("sign: %v", err)
+		}
+		return signed
+	}
+
+	req := func(token string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/github.com/o/r.git/info/refs?service=git-upload-pack", nil)
+		r.SetBasicAuth("git", token)
+		return r
+	}
+
+	// Binding satisfied -> authenticated.
+	if _, err := auth.Authenticate(context.Background(), req(mint("rxbynerd"))); err != nil {
+		t.Errorf("Authenticate with satisfied claim binding: %v", err)
+	}
+	// Binding violated -> rejected.
+	if _, err := auth.Authenticate(context.Background(), req(mint("someone-else"))); err == nil {
+		t.Error("Authenticate with violated claim binding succeeded, want failure")
+	}
+	// Bound claim absent -> rejected.
+	if _, err := auth.Authenticate(context.Background(), req(mint(""))); err == nil {
+		t.Error("Authenticate with missing bound claim succeeded, want failure")
 	}
 }

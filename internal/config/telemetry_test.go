@@ -82,7 +82,7 @@ func TestValidateRejectsBadTelemetryProtocol(t *testing.T) {
 	cfg := Config{
 		Listen:    ":8466",
 		LogLevel:  "info",
-		Identity:  IdentityConfig{Type: identityTypeStaticTokenFile, Path: identityPath},
+		Identity:  validJWTIdentity(identityPath),
 		Policy:    PolicyConfig{Path: policyPath},
 		Upstreams: []Upstream{{Host: "github.com", BaseURL: "https://github.com", Credential: validCredential}},
 		Telemetry: TelemetryConfig{Endpoint: "localhost:4317", Protocol: "carrier-pigeon"},

@@ -446,6 +446,107 @@ func TestAuthorizeFirstMatchWins(t *testing.T) {
 	}
 }
 
+// TestAuthorizeRepoScopeIntersection exercises the JWT repo-scope
+// narrowing (effective = policy ∩ scope): a scope narrower than policy
+// removes repos, a wider scope never adds any (policy still binds), an
+// empty scope denies everything, and a nil scope is a no-op.
+func TestAuthorizeRepoScopeIntersection(t *testing.T) {
+	// Policy allows read+write across all of acme on github.com.
+	rules := []Rule{
+		{Identities: []string{"run-1"}, Repos: []string{"github.com/acme/*"}, Permissions: []Permission{PermissionRead, PermissionWrite}},
+	}
+	engine, err := NewGlobEngine(rules)
+	if err != nil {
+		t.Fatalf("NewGlobEngine() error = %v", err)
+	}
+
+	widgets := gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}
+	gadgets := gitproto.Repo{Host: "github.com", Owner: "acme", Name: "gadgets"}
+
+	tests := []struct {
+		name        string
+		scope       []string
+		repo        gitproto.Repo
+		wantAllowed bool
+		wantReason  string
+	}{
+		{
+			name:        "nil scope is a no-op (policy alone decides)",
+			scope:       nil,
+			repo:        widgets,
+			wantAllowed: true,
+		},
+		{
+			name:        "scope narrower than policy: repo inside scope allowed",
+			scope:       []string{"github.com/acme/widgets"},
+			repo:        widgets,
+			wantAllowed: true,
+		},
+		{
+			name:        "scope narrower than policy: repo outside scope denied",
+			scope:       []string{"github.com/acme/widgets"},
+			repo:        gadgets,
+			wantAllowed: false,
+			wantReason:  "repo outside token scope",
+		},
+		{
+			name:        "scope wider than policy never widens: policy still binds",
+			scope:       []string{"github.com/*/*"},
+			repo:        gitproto.Repo{Host: "github.com", Owner: "other", Name: "thing"},
+			wantAllowed: false,
+			wantReason:  "no matching rule (default deny)",
+		},
+		{
+			name:        "empty scope denies every repo",
+			scope:       []string{},
+			repo:        widgets,
+			wantAllowed: false,
+			wantReason:  "repo outside token scope",
+		},
+		{
+			name:        "scope glob matches",
+			scope:       []string{"github.com/acme/*"},
+			repo:        gadgets,
+			wantAllowed: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id := identity.Identity{ID: "run-1", RepoScope: tt.scope}
+			decision := engine.Authorize(id, tt.repo, gitproto.Read)
+			if decision.Allowed != tt.wantAllowed {
+				t.Errorf("Authorize().Allowed = %v, want %v (reason %q)", decision.Allowed, tt.wantAllowed, decision.Reason)
+			}
+			if tt.wantReason != "" && decision.Reason != tt.wantReason {
+				t.Errorf("Authorize().Reason = %q, want %q", decision.Reason, tt.wantReason)
+			}
+		})
+	}
+}
+
+// TestAuthorizeRepoScopeDenialCarriesMatchedRule confirms a scope denial
+// is audit-distinguishable: it carries the rule that policy would have
+// matched (so a log can show "policy allowed, token scope narrowed it
+// out"), unlike a default-deny which carries a nil Rule.
+func TestAuthorizeRepoScopeDenialCarriesMatchedRule(t *testing.T) {
+	rules := []Rule{
+		{Identities: []string{"run-1"}, Repos: []string{"github.com/acme/*"}, Permissions: []Permission{PermissionRead}},
+	}
+	engine, err := NewGlobEngine(rules)
+	if err != nil {
+		t.Fatalf("NewGlobEngine() error = %v", err)
+	}
+	id := identity.Identity{ID: "run-1", RepoScope: []string{"github.com/acme/widgets"}}
+	decision := engine.Authorize(id, gitproto.Repo{Host: "github.com", Owner: "acme", Name: "gadgets"}, gitproto.Read)
+	if decision.Allowed {
+		t.Fatal("Authorize() = Allowed, want denied by scope")
+	}
+	if decision.Rule == nil {
+		t.Error("scope denial carried a nil Rule; want the policy rule that matched, for audit distinguishability")
+	}
+}
+
 func TestRuleString(t *testing.T) {
 	r := Rule{Identities: []string{"run-*"}, Repos: []string{"github.com/acme/*"}, Permissions: []Permission{PermissionRead}}
 	s := r.String()

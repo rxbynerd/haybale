@@ -143,13 +143,39 @@ func runServe(cmd *cobra.Command, path string) error {
 	// existed. Must run once, at startup, before the proxy serves traffic.
 	wireCredentialSourceMetrics(credentialSources, providers.Metrics)
 
-	// Load already ran Validate(), which populates these from the
-	// identity/policy blocks — nil here would indicate a caller bug
-	// (Validate() didn't run), not a runtime condition. proxy.New itself
-	// rejects a nil authenticator/policyEngine at construction, so that
-	// caller bug now surfaces here as an error rather than a panic on
-	// the first request.
-	p, err := proxy.New(upstreams, credentialSources, cfg.Identity.Authenticator(), cfg.Policy.Engine(), logger, providers.Metrics)
+	// The shutdown context is established here, before the authenticator is
+	// built, precisely so it can govern the JWKS refresh goroutines below.
+	// signal.NotifyContext, not signal.Notify: ctx.Done() fires exactly
+	// once, on the first SIGTERM or SIGINT — all serveWithGracefulDrain
+	// needs (a second signal during an in-progress drain is not handled
+	// specially; an operator who needs a hard stop has kill -9 regardless).
+	// Deliberately NOT cmd.Context(): root.go runs the command tree via
+	// rootCmd.Execute() (not ExecuteContext), so cmd.Context() is an
+	// uncancelled context.Background() — binding the refresh goroutines to
+	// it would leak them, since keySource exposes no explicit Close and
+	// context cancellation is their only teardown mechanism.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Build the JWT authenticator now, at startup: this performs each
+	// issuer's initial JWKS fetch (fail-fast — an unreachable or empty
+	// JWKS refuses to serve traffic rather than failing per-request) and
+	// launches the background refresh goroutines, bound to ctx so they stop
+	// when the server shuts down (SIGTERM/SIGINT cancels ctx, ending every
+	// URL-backed issuer's refresh loop). Deliberately not done in
+	// config.Validate() (see IdentityConfig.BuildAuthenticator): that path
+	// also runs for the offline `haybale policy check`, which must never
+	// reach out to a JWKS endpoint. The policy engine, by contrast, is
+	// pure file loading and stays in Validate() — Engine() below reuses
+	// exactly what Validate() built.
+	authenticator, err := cfg.Identity.BuildAuthenticator(ctx, logger)
+	if err != nil {
+		return fmt.Errorf("build authenticator: %w", err)
+	}
+	// proxy.New rejects a nil authenticator/policyEngine at construction,
+	// so a caller bug (Validate() didn't run, leaving Engine() nil)
+	// surfaces here as an error rather than a panic on the first request.
+	p, err := proxy.New(upstreams, credentialSources, authenticator, cfg.Policy.Engine(), logger, providers.Metrics)
 	if err != nil {
 		return fmt.Errorf("build proxy: %w", err)
 	}
@@ -163,16 +189,10 @@ func runServe(cmd *cobra.Command, path string) error {
 		return err
 	}
 
-	// signal.NotifyContext, not signal.Notify: ctx.Done() fires exactly
-	// once, on the first SIGTERM or SIGINT, which is all
-	// serveWithGracefulDrain needs — a second signal during an already
-	// -in-progress drain is not handled specially (it does not, for
-	// instance, force an immediate hard shutdown); an operator who needs
-	// that has srv.Close()/a process kill -9 available to them regardless
-	// of anything this handler does.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
+	// ctx (the SIGTERM/SIGINT-cancelled context established above, before
+	// the authenticator's refresh goroutines were bound to it) also drives
+	// graceful drain: the same signal that stops accepting new work and
+	// begins draining in-flight requests also ends the JWKS refresh loops.
 	return serveWithGracefulDrain(ctx, srv, p, cfg.ParsedDrainTimeout(), listenAndServe, logger)
 }
 

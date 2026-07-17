@@ -71,6 +71,17 @@ func TestScrub(t *testing.T) {
 			input:    "-----BEGIN RSA PRIVATE KEY-----\nMIIBogIBAAJ...\n-----END RSA PRIVATE KEY-----",
 			wantGone: []string{"-----BEGIN RSA PRIVATE KEY-----"},
 		},
+		{ //nolint:gosec // G101: fake three-segment JWT-shaped fixture exercising Scrub's jwt_compact pattern, not a real token
+			name:     "compact jwt as a bare token",
+			input:    "authenticated eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJydW4tMSJ9.c2lnbmF0dXJlLWJ5dGVz for run-1",
+			wantGone: []string{"eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJydW4tMSJ9.c2lnbmF0dXJlLWJ5dGVz"},
+			wantKept: []string{"authenticated", "for run-1"},
+		},
+		{ //nolint:gosec // G101: fake JWT-in-URL fixture, not a real token
+			name:     "compact jwt embedded in a url password",
+			input:    "remote https://git:eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJydW4ifQ.YWJj@haybale.internal/github.com/o/r.git",
+			wantGone: []string{"eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJydW4ifQ.YWJj"},
+		},
 		{
 			name:     "no secret material",
 			input:    "proxied request identity=run-1 host=github.com owner=acme repo=widgets verb=read status=200",

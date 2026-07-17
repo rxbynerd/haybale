@@ -2,8 +2,10 @@
 // a real `git clone` subprocess against an in-process haybale proxy that
 // forwards to a real `git http-backend` CGI upstream — no mocked git
 // protocol, no stubbed proxy behaviour, and (since M2) the real
-// identity.StaticTokenAuthenticator and policy.GlobEngine wired in ahead
-// of the passthrough, not test stubs. Since M3, the fake upstream
+// identity.JWTAuthenticator and policy.GlobEngine wired in ahead
+// of the passthrough, not test stubs — a per-test file-backed JWKS and a
+// freshly-minted ES256 token stand in for a control plane (see
+// mintTestToken). Since M3, the fake upstream
 // (upstream_test.go's newUpstream) also genuinely requires Basic auth,
 // with a real upstream.StaticSource configured to satisfy it — see
 // credential_test.go for the upstream-credential acceptance and negative

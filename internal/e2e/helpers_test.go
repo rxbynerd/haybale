@@ -2,13 +2,22 @@ package e2e
 
 import (
 	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"io"
 	"log/slog"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/MicahParks/jwkset"
+	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/rxbynerd/haybale/internal/identity"
 	"github.com/rxbynerd/haybale/internal/observability"
@@ -25,21 +34,73 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// mintTestToken mints a fresh identity token for id via the real
-// identity.NewToken/NewStaticTokenAuthenticator — not a test stub, since
-// this harness's whole purpose is exercising production code against a
-// real git subprocess — and returns an Authenticator backed by only that
-// one identity, alongside the raw token a git remote URL's Basic-auth
-// password should carry.
+// testJWTIssuer is the issuer string every minted e2e token carries; it
+// is arbitrary (a file-backed JWKS is used, so nothing is fetched), but
+// must match between the authenticator and the token.
+const testJWTIssuer = "https://control-plane.e2e.internal"
+
+// testJWTAudience is the audience every minted e2e token carries.
+const testJWTAudience = "https://haybale.e2e.internal"
+
+// mintTestToken builds a real, file-backed JWTAuthenticator and mints a
+// fresh, currently-valid ES256 token whose identity (via a "{sub}"
+// template) is id — exercising the production JWT verifier, not a stub,
+// since this harness's whole purpose is running production code against a
+// real git subprocess. It returns the Authenticator alongside the compact
+// token a git remote URL's Basic-auth password should carry. A per-call
+// signing key is generated fresh and its public half written to a JWKS
+// file the authenticator trusts.
 func mintTestToken(t *testing.T, id string) (identity.Authenticator, string) {
 	t.Helper()
-	token, digestHex, err := identity.NewToken()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		t.Fatalf("identity.NewToken(): %v", err)
+		t.Fatalf("ecdsa.GenerateKey(): %v", err)
 	}
-	auth, err := identity.NewStaticTokenAuthenticator(map[string]string{id: "sha256:" + digestHex})
+	jwk, err := jwkset.NewJWKFromKey(key.Public(), jwkset.JWKOptions{
+		Metadata: jwkset.JWKMetadataOptions{KID: "e2e-key", ALG: jwkset.AlgES256, USE: jwkset.UseSig},
+	})
 	if err != nil {
-		t.Fatalf("identity.NewStaticTokenAuthenticator(): %v", err)
+		t.Fatalf("jwkset.NewJWKFromKey(): %v", err)
+	}
+	store := jwkset.NewMemoryStorage()
+	if err := store.KeyWrite(context.Background(), jwk); err != nil {
+		t.Fatalf("store.KeyWrite(): %v", err)
+	}
+	raw, err := store.JSONPublic(context.Background())
+	if err != nil {
+		t.Fatalf("store.JSONPublic(): %v", err)
+	}
+	jwksPath := filepath.Join(t.TempDir(), "jwks.json")
+	if err := os.WriteFile(jwksPath, raw, 0o600); err != nil {
+		t.Fatalf("os.WriteFile(jwks.json): %v", err)
+	}
+
+	auth, err := identity.NewJWTAuthenticator(context.Background(), []identity.IssuerConfig{{
+		Issuer:           testJWTIssuer,
+		JWKSFile:         jwksPath,
+		Algorithms:       []string{"ES256"},
+		Audiences:        []string{testJWTAudience},
+		Leeway:           time.Minute,
+		IdentityTemplate: "{sub}",
+	}}, discardLogger())
+	if err != nil {
+		t.Fatalf("identity.NewJWTAuthenticator(): %v", err)
+	}
+
+	now := time.Now()
+	tok := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{
+		"iss": testJWTIssuer,
+		"aud": testJWTAudience,
+		"sub": id,
+		"jti": "e2e-" + id,
+		"iat": now.Unix(),
+		"exp": now.Add(time.Hour).Unix(),
+	})
+	tok.Header["kid"] = "e2e-key"
+	token, err := tok.SignedString(key)
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
 	}
 	return auth, token
 }
@@ -140,7 +201,7 @@ func waitForLogSubstring(buf *syncBuffer, want string) string {
 }
 
 // withToken returns rawURL with token embedded as the Basic-auth
-// password. The username is arbitrary — identity.StaticTokenAuthenticator
+// password. The username is arbitrary — identity's credential extraction
 // ignores it, and so does git — so a fixed placeholder is used
 // throughout rather than plumbing a meaningless value through every
 // call site.

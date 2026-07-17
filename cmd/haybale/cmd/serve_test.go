@@ -26,6 +26,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MicahParks/jwkset"
+	"github.com/golang-jwt/jwt/v5"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/rxbynerd/haybale/internal/config"
@@ -90,10 +92,65 @@ func writeTestTLSCertKeyFiles(t *testing.T) (certPath, keyPath string) {
 	return certPath, keyPath
 }
 
-// fakeTokenDigestHex is a structurally valid (64 hex char) SHA-256
-// digest good enough for a test identities.yaml fixture, which only
-// needs to parse — it never needs to correspond to any real token.
-const fakeTokenDigestHex = "1122334411223344112233441122334411223344112233441122334411223344"
+// newJWTTestAuth builds a single-issuer, file-backed JWTAuthenticator and
+// mints a matching, currently-valid ES256 token whose `sub` is id — the
+// JWT counterpart of the old static-token test helper, for the serve
+// integration tests that drive a real authenticated request through the
+// proxy. The signing key is generated fresh per call and never leaves the
+// test.
+func newJWTTestAuth(t *testing.T, id string) (identity.Authenticator, string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa.GenerateKey: %v", err)
+	}
+	jwk, err := jwkset.NewJWKFromKey(key.Public(), jwkset.JWKOptions{
+		Metadata: jwkset.JWKMetadataOptions{KID: "k1", ALG: jwkset.AlgES256, USE: jwkset.UseSig},
+	})
+	if err != nil {
+		t.Fatalf("jwkset.NewJWKFromKey: %v", err)
+	}
+	store := jwkset.NewMemoryStorage()
+	if err := store.KeyWrite(context.Background(), jwk); err != nil {
+		t.Fatalf("store.KeyWrite: %v", err)
+	}
+	raw, err := store.JSONPublic(context.Background())
+	if err != nil {
+		t.Fatalf("store.JSONPublic: %v", err)
+	}
+	jwksPath := filepath.Join(t.TempDir(), "jwks.json")
+	if err := os.WriteFile(jwksPath, raw, 0o600); err != nil {
+		t.Fatalf("os.WriteFile(jwks.json): %v", err)
+	}
+
+	auth, err := identity.NewJWTAuthenticator(context.Background(), []identity.IssuerConfig{{
+		Issuer:           "https://issuer.example",
+		JWKSFile:         jwksPath,
+		Algorithms:       []string{"ES256"},
+		Audiences:        []string{"https://haybale.internal"},
+		Leeway:           time.Minute,
+		IdentityTemplate: "{sub}",
+	}}, discardLogger())
+	if err != nil {
+		t.Fatalf("identity.NewJWTAuthenticator: %v", err)
+	}
+
+	now := time.Now()
+	tok := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{
+		"iss": "https://issuer.example",
+		"aud": "https://haybale.internal",
+		"sub": id,
+		"jti": "test-jti",
+		"iat": now.Unix(),
+		"exp": now.Add(time.Hour).Unix(),
+	})
+	tok.Header["kid"] = "k1"
+	signed, err := tok.SignedString(key)
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+	return auth, signed
+}
 
 func TestParseLogLevel(t *testing.T) {
 	tests := []struct {
@@ -124,20 +181,24 @@ func TestParseLogLevel(t *testing.T) {
 func buildTestConfig(t *testing.T, tokenEnv string) *config.Config {
 	t.Helper()
 	dir := t.TempDir()
-	identityPath := filepath.Join(dir, "identities.yaml")
-	identityContent := "identities:\n  - id: run-1\n    tokenDigest: sha256:" + fakeTokenDigestHex + "\n"
-	if err := os.WriteFile(identityPath, []byte(identityContent), 0o600); err != nil {
-		t.Fatalf("os.WriteFile(identities.yaml): %v", err)
-	}
 	policyPath := filepath.Join(dir, "policy.yaml")
 	if err := os.WriteFile(policyPath, []byte("rules: []\n"), 0o600); err != nil {
 		t.Fatalf("os.WriteFile(policy.yaml): %v", err)
 	}
 
+	// The jwksFile need not exist: these tests only exercise Validate()
+	// (which is structural for the identity block — it does not read the
+	// JWKS) plus buildUpstreams/buildCredentialSources. The live JWKS
+	// fetch happens in BuildAuthenticator, which these tests never call.
 	return &config.Config{
 		LogLevel: "info",
-		Identity: config.IdentityConfig{Type: "static-token-file", Path: identityPath},
-		Policy:   config.PolicyConfig{Path: policyPath},
+		Identity: config.IdentityConfig{Type: "jwt", Issuers: []config.IssuerConfig{{
+			Issuer:           "https://issuer.example",
+			JWKSFile:         filepath.Join(dir, "jwks.json"),
+			Audiences:        config.StringList{"https://haybale.internal"},
+			IdentityTemplate: "{sub}",
+		}}},
+		Policy: config.PolicyConfig{Path: policyPath},
 		Upstreams: []config.Upstream{
 			{Host: "github.com", BaseURL: "https://github.com", Credential: config.CredentialConfig{Type: "static", TokenEnv: tokenEnv}},
 			{Host: "git.internal.example", BaseURL: "https://git.internal.example:8443", Credential: config.CredentialConfig{Type: "static", Username: "git", TokenEnv: tokenEnv}},
@@ -366,14 +427,7 @@ func TestServeWithGracefulDrainWaitsForInFlightRequest(t *testing.T) {
 	}
 
 	const testID = "run-drain-test"
-	token, digestHex, err := identity.NewToken()
-	if err != nil {
-		t.Fatalf("identity.NewToken(): %v", err)
-	}
-	auth, err := identity.NewStaticTokenAuthenticator(map[string]string{testID: "sha256:" + digestHex})
-	if err != nil {
-		t.Fatalf("identity.NewStaticTokenAuthenticator(): %v", err)
-	}
+	auth, token := newJWTTestAuth(t, testID)
 	eng, err := policy.NewGlobEngine([]policy.Rule{
 		{Identities: []string{testID}, Repos: []string{"host/owner/repo"}, Permissions: []policy.Permission{policy.PermissionRead}},
 	})
@@ -495,14 +549,7 @@ func TestServeWithGracefulDrainExceedsFiniteTimeout(t *testing.T) {
 	}
 
 	const testID = "run-drain-timeout-test"
-	token, digestHex, err := identity.NewToken()
-	if err != nil {
-		t.Fatalf("identity.NewToken(): %v", err)
-	}
-	auth, err := identity.NewStaticTokenAuthenticator(map[string]string{testID: "sha256:" + digestHex})
-	if err != nil {
-		t.Fatalf("identity.NewStaticTokenAuthenticator(): %v", err)
-	}
+	auth, token := newJWTTestAuth(t, testID)
 	eng, err := policy.NewGlobEngine([]policy.Rule{
 		{Identities: []string{testID}, Repos: []string{"host/owner/repo"}, Permissions: []policy.Permission{policy.PermissionRead}},
 	})

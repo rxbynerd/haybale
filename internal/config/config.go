@@ -14,8 +14,11 @@
 package config
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
+	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -154,33 +157,300 @@ func (c TLSConfig) Certificate() *tls.Certificate {
 	return c.certificate
 }
 
-// identityTypeStaticTokenFile is the only Identity.Type value v0.1
-// supports: a static, file-backed set of identity -> token-digest
-// mappings (internal/identity.StaticTokenAuthenticator).
-const identityTypeStaticTokenFile = "static-token-file"
+// identityTypeJWT is the only Identity.Type value haybale supports: the
+// control plane issues each workload a signed JWT and haybale verifies it
+// against the issuer's JWKS (internal/identity.JWTAuthenticator). The
+// discriminator is retained (rather than dropped now that it names a
+// single type) so a future SPIFFE/mTLS authenticator slots in as a second
+// value without a config-shape break.
+const identityTypeJWT = "jwt"
+
+// defaultJWTLeeway is the clock-skew tolerance applied to a JWT's
+// exp/nbf/iat checks when an issuer sets no leeway of its own. 60s
+// comfortably absorbs ordinary NTP drift between the issuer and haybale
+// without materially extending a short-lived token's usable window.
+const defaultJWTLeeway = 60 * time.Second
+
+// defaultJWTAlgorithms is the signing-algorithm allowlist applied to an
+// issuer that names none explicitly: the two asymmetric algorithms a
+// control plane (or GitHub Actions) realistically signs with. HMAC
+// variants and `none` are deliberately absent and never defaulted in —
+// accepting a symmetric or unsigned token is the algorithm-confusion
+// attack this allowlist exists to prevent.
+var defaultJWTAlgorithms = []string{"RS256", "ES256"}
+
+// allowedJWTAlgorithms is the closed set an issuer's algorithms may be
+// drawn from: asymmetric signatures only. Validate() rejects any
+// algorithm outside this set — in particular every HMAC variant (whose
+// "key" would be the public verification key, the classic confusion
+// attack) and `none`.
+var allowedJWTAlgorithms = map[string]bool{
+	"RS256": true, "RS384": true, "RS512": true,
+	"ES256": true, "ES384": true, "ES512": true,
+	"PS256": true, "PS384": true, "PS512": true,
+	"EdDSA": true,
+}
+
+// StringList is a YAML scalar-or-sequence: it unmarshals both a bare
+// scalar (`repository_owner: rxbynerd`) and a sequence
+// (`aud: [a, b]`) into a []string, so a claim binding or audience that
+// names a single value need not be written as a one-element list.
+type StringList []string
+
+// UnmarshalYAML accepts either a scalar or a sequence node.
+func (s *StringList) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		*s = StringList{value.Value}
+		return nil
+	}
+	var list []string
+	if err := value.Decode(&list); err != nil {
+		return err
+	}
+	*s = list
+	return nil
+}
 
 // IdentityConfig selects and configures haybale's identity.Authenticator.
 type IdentityConfig struct {
 	// Type is a discriminator selecting which Authenticator
-	// implementation to build; the only supported value in v0.1 is
-	// "static-token-file".
+	// implementation to build; the only supported value is "jwt".
 	Type string `yaml:"type"`
-	// Path is the identities.yaml file Validate() loads the
-	// Authenticator from, when Type is "static-token-file".
-	Path string `yaml:"path"`
-
-	// authenticator caches the identity.Authenticator Validate() built
-	// from Path, so callers (cmd/haybale/cmd/serve.go in particular)
-	// reuse that exact value instead of re-parsing Path — the same
-	// pattern Upstream.parsedBaseURL/ParsedBaseURL already establishes.
-	authenticator identity.Authenticator
+	// Issuers is the set of trusted JWT issuers, each with its own JWKS
+	// trust material, algorithm allowlist, and audience expectation.
+	// Required (non-empty) when Type is "jwt".
+	Issuers []IssuerConfig `yaml:"issuers"`
 }
 
-// Authenticator returns the identity.Authenticator a prior successful
-// call to Validate() built from Path, or nil if Validate() has not yet
-// run (or did not return nil) for this IdentityConfig.
-func (c IdentityConfig) Authenticator() identity.Authenticator {
-	return c.authenticator
+// IssuerConfig is one trusted JWT issuer's configuration. Validate()
+// checks every field's shape (see IdentityConfig validation in
+// Validate); BuildAuthenticator turns the validated set into the live
+// identity.JWTAuthenticator, performing the initial JWKS fetch.
+type IssuerConfig struct {
+	// Issuer is the exact string a token's `iss` claim must equal. Also
+	// used to select this issuer's trust material from the token's
+	// unverified `iss`. Required and unique across issuers.
+	Issuer string `yaml:"issuer"`
+	// JWKSURL is the https (or loopback) URL haybale fetches this issuer's
+	// public keys from, refreshed in the background. Exactly one of
+	// JWKSURL/JWKSFile must be set.
+	JWKSURL string `yaml:"jwksURL"`
+	// JWKSFile is a static JWKS document on disk, read once at startup —
+	// the airgapped/e2e alternative to JWKSURL. Exactly one of
+	// JWKSURL/JWKSFile must be set.
+	JWKSFile string `yaml:"jwksFile"`
+	// Algorithms is the signing-algorithm allowlist. Defaults to
+	// [RS256, ES256]; every entry must be an asymmetric algorithm in
+	// allowedJWTAlgorithms.
+	Algorithms []string `yaml:"algorithms"`
+	// Audiences is the set of acceptable `aud` values; a token must carry
+	// at least one. Required (non-empty): an issuer that accepted any
+	// audience would let a token minted for some other relying party in.
+	Audiences StringList `yaml:"audiences"`
+	// Leeway is the clock-skew tolerance for exp/nbf/iat, a Go duration
+	// string. Defaults to 60s. Must not be negative.
+	Leeway string `yaml:"leeway"`
+	// Typ optionally requires a specific JOSE `typ` header (e.g.
+	// "at+jwt"), compared case-insensitively. Empty disables the check.
+	Typ string `yaml:"typ"`
+	// ClaimBindings maps a claim name to the value(s) (exact or glob) its
+	// string value must match at least one of. Every binding must match or
+	// authentication fails — this is what pins an open issuer (e.g. GitHub
+	// Actions) to the callers an operator intends to trust.
+	ClaimBindings map[string]StringList `yaml:"claimBindings"`
+	// IdentityTemplate renders the authenticated Identity.ID from verified
+	// claims, e.g. "gha:{repository}" or "{sub}". Required.
+	IdentityTemplate string `yaml:"identityTemplate"`
+	// RepoScopeClaim optionally names a claim carrying a list of
+	// "{host}/{owner}/{repo}" globs that narrow authorization (policy ∩
+	// claim). Empty disables per-token narrowing for this issuer.
+	RepoScopeClaim string `yaml:"repoScopeClaim"`
+
+	// parsedLeeway caches the time.Duration Validate() parsed from Leeway,
+	// for the same reuse-not-reparse reason Config.parsedDrainTimeout
+	// exists.
+	parsedLeeway time.Duration
+}
+
+// validate fail-fasts on an identity block that is unusable at startup.
+// It performs only STRUCTURAL validation — field shapes, defaults,
+// glob/template/URL well-formedness — and deliberately does NOT fetch a
+// JWKS URL or build the live authenticator: that is BuildAuthenticator's
+// job, called only by `haybale serve`. Keeping the network fetch out of
+// Validate() is what lets `haybale policy check` load the same config
+// offline (it needs only the policy engine, never a live JWKS), and lets
+// the refresh goroutines a URL-backed issuer launches be bound to the
+// server's context rather than a background one. It mutates the receiver
+// to fill in defaults (Algorithms, parsedLeeway), so it takes a pointer.
+func (c *IdentityConfig) validate() error {
+	if c.Type != identityTypeJWT {
+		return fmt.Errorf("identity: type %q is not supported (must be %q)", c.Type, identityTypeJWT)
+	}
+	if len(c.Issuers) == 0 {
+		return fmt.Errorf("identity: at least one issuer is required for type %q", identityTypeJWT)
+	}
+	seen := make(map[string]bool, len(c.Issuers))
+	for i := range c.Issuers {
+		if err := c.Issuers[i].validate(i); err != nil {
+			return err
+		}
+		if seen[c.Issuers[i].Issuer] {
+			return fmt.Errorf("identity: issuers[%d]: duplicate issuer %q", i, c.Issuers[i].Issuer)
+		}
+		seen[c.Issuers[i].Issuer] = true
+	}
+	return nil
+}
+
+// validate checks one issuer's fields and fills in its defaults
+// (Algorithms, parsedLeeway). i is the issuer's index, used to prefix
+// error messages the same way the rest of Validate() does.
+func (ic *IssuerConfig) validate(i int) error {
+	if ic.Issuer == "" {
+		return fmt.Errorf("identity: issuers[%d]: issuer is required", i)
+	}
+	prefix := fmt.Sprintf("identity: issuers[%d] (issuer %q)", i, ic.Issuer)
+
+	switch {
+	case ic.JWKSURL == "" && ic.JWKSFile == "":
+		return fmt.Errorf("%s: exactly one of jwksURL or jwksFile is required", prefix)
+	case ic.JWKSURL != "" && ic.JWKSFile != "":
+		return fmt.Errorf("%s: jwksURL and jwksFile are mutually exclusive", prefix)
+	}
+	if ic.JWKSURL != "" {
+		if err := validateJWKSURL(ic.JWKSURL); err != nil {
+			return fmt.Errorf("%s: jwksURL: %w", prefix, err)
+		}
+	}
+
+	if len(ic.Audiences) == 0 {
+		return fmt.Errorf("%s: at least one audience is required (an issuer that accepted any audience would admit tokens minted for another relying party)", prefix)
+	}
+	for _, a := range ic.Audiences {
+		if a == "" {
+			return fmt.Errorf("%s: audience must not be empty", prefix)
+		}
+	}
+
+	// Default the algorithm allowlist, then confirm every entry is an
+	// allowed asymmetric algorithm — never an HMAC variant or `none`.
+	if len(ic.Algorithms) == 0 {
+		ic.Algorithms = append([]string(nil), defaultJWTAlgorithms...)
+	}
+	for _, alg := range ic.Algorithms {
+		if !allowedJWTAlgorithms[alg] {
+			return fmt.Errorf("%s: algorithm %q is not an allowed asymmetric algorithm (HMAC and none are never accepted)", prefix, alg)
+		}
+	}
+
+	ic.parsedLeeway = defaultJWTLeeway
+	if ic.Leeway != "" {
+		d, err := time.ParseDuration(ic.Leeway)
+		if err != nil {
+			return fmt.Errorf("%s: leeway %q is not a valid duration: %w", prefix, ic.Leeway, err)
+		}
+		if d < 0 {
+			return fmt.Errorf("%s: leeway %q must not be negative", prefix, ic.Leeway)
+		}
+		ic.parsedLeeway = d
+	}
+
+	if ic.IdentityTemplate == "" {
+		return fmt.Errorf("%s: identityTemplate is required", prefix)
+	}
+	if err := identity.ValidateIdentityTemplate(ic.IdentityTemplate); err != nil {
+		return fmt.Errorf("%s: identityTemplate %q: %w", prefix, ic.IdentityTemplate, err)
+	}
+
+	for claim, patterns := range ic.ClaimBindings {
+		if claim == "" {
+			return fmt.Errorf("%s: claimBindings contains an empty claim name", prefix)
+		}
+		if len(patterns) == 0 {
+			return fmt.Errorf("%s: claimBindings[%q] has no values", prefix, claim)
+		}
+		for _, p := range patterns {
+			if p == "" {
+				return fmt.Errorf("%s: claimBindings[%q] contains an empty pattern", prefix, claim)
+			}
+			if err := identity.ValidateGlob(p); err != nil {
+				return fmt.Errorf("%s: claimBindings[%q] pattern %q: %w", prefix, claim, p, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// validateJWKSURL requires a well-formed absolute URL that is https, or
+// http only for a loopback host — the same explicit-egress discipline the
+// rest of haybale follows, and a named safeguard against pointing trust
+// material at a plaintext (spoofable) endpoint. Loopback http is allowed
+// solely so an e2e/test harness can host a JWKS on 127.0.0.1 without TLS.
+func validateJWKSURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%q is not a valid URL: %w", raw, err)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%q must be an absolute URL with a host", raw)
+	}
+	switch {
+	case u.Scheme == "https":
+		return nil
+	case u.Scheme == "http" && isLoopbackHost(u.Hostname()):
+		return nil
+	default:
+		return fmt.Errorf("%q must use https (http is permitted only for a loopback host)", raw)
+	}
+}
+
+// isLoopbackHost reports whether host is localhost or a loopback IP
+// literal (127.0.0.0/8, ::1) — the only hosts for which validateJWKSURL
+// permits a plaintext http JWKS URL.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// BuildAuthenticator constructs the live identity.JWTAuthenticator from a
+// validated identity block: it performs each issuer's initial JWKS fetch
+// (fail-fast — an unreachable or empty JWKS returns an error here) and
+// launches the background refresh goroutine of every URL-backed issuer,
+// bound to ctx so it stops when the server shuts down. It must be called
+// after Validate() (which populates Algorithms/parsedLeeway defaults) —
+// `haybale serve` does exactly that, and it is deliberately separate from
+// Validate() so the offline `haybale policy check` path never triggers a
+// network fetch. logger receives refresh warnings and debug auth traces.
+func (c IdentityConfig) BuildAuthenticator(ctx context.Context, logger *slog.Logger) (identity.Authenticator, error) {
+	issuers := make([]identity.IssuerConfig, 0, len(c.Issuers))
+	for _, ic := range c.Issuers {
+		var bindings map[string][]string
+		if len(ic.ClaimBindings) > 0 {
+			bindings = make(map[string][]string, len(ic.ClaimBindings))
+			for claim, patterns := range ic.ClaimBindings {
+				bindings[claim] = append([]string(nil), patterns...)
+			}
+		}
+		issuers = append(issuers, identity.IssuerConfig{
+			Issuer:           ic.Issuer,
+			JWKSURL:          ic.JWKSURL,
+			JWKSFile:         ic.JWKSFile,
+			Algorithms:       append([]string(nil), ic.Algorithms...),
+			Audiences:        append([]string(nil), ic.Audiences...),
+			Leeway:           ic.parsedLeeway,
+			Typ:              ic.Typ,
+			ClaimBindings:    bindings,
+			IdentityTemplate: ic.IdentityTemplate,
+			RepoScopeClaim:   ic.RepoScopeClaim,
+		})
+	}
+	return identity.NewJWTAuthenticator(ctx, issuers, logger)
 }
 
 // PolicyConfig configures haybale's policy.Engine.
@@ -537,21 +807,8 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	switch c.Identity.Type {
-	case identityTypeStaticTokenFile:
-		if c.Identity.Path == "" {
-			return fmt.Errorf("identity: path is required for type %q", identityTypeStaticTokenFile)
-		}
-		auth, err := identity.LoadStaticTokenAuthenticator(c.Identity.Path)
-		if err != nil {
-			// LoadStaticTokenAuthenticator's own errors are already
-			// prefixed "identity: ...", so returning err directly (not
-			// wrapping it again) avoids a doubled prefix.
-			return err
-		}
-		c.Identity.authenticator = auth
-	default:
-		return fmt.Errorf("identity: type %q is not supported (must be %q)", c.Identity.Type, identityTypeStaticTokenFile)
+	if err := c.Identity.validate(); err != nil {
+		return err
 	}
 
 	if c.Policy.Path == "" {

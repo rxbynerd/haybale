@@ -195,44 +195,110 @@ transfer timeout.
 
 ## Identity
 
+haybale authenticates a caller by verifying a **JSON Web Token (JWT)**
+the control plane issued to it, against the issuer's public keys. haybale
+mints nothing and holds no secrets of its own — it is a pure verifier
+trusting one or more issuers' JWKS. See `docs/jwt-identity.md` for the
+exact token contract a control plane must implement, and
+`docs/github-actions.md` for the GitHub Actions OIDC recipe.
+
 ```yaml
 identity:
-  type: static-token-file
-  path: identities.yaml
+  type: jwt
+  issuers:
+    - issuer: https://token.actions.githubusercontent.com
+      jwksURL: https://token.actions.githubusercontent.com/.well-known/jwks
+      algorithms: [RS256]                 # default [RS256, ES256]
+      audiences: [https://haybale.internal]
+      leeway: 60s                          # default 60s
+      typ: ""                              # optional required JOSE typ
+      claimBindings:                       # ALL must match; exact or glob
+        repository_owner: rxbynerd
+        runner_environment: github-hosted
+      identityTemplate: "gha:{repository}"
+    - issuer: https://control-plane.example.internal
+      jwksFile: /etc/haybale/control-plane-jwks.json
+      algorithms: [ES256]
+      audiences: [https://haybale.internal]
+      typ: at+jwt
+      identityTemplate: "{sub}"            # sub = run-<RunID>
+      repoScopeClaim: haybale.dev/repos    # optional per-token narrowing
 ```
 
-`static-token-file` is the only supported `type` today. `path` points at
-a YAML file of identity IDs and their token digests:
+`jwt` is the only supported `type`. `issuers` lists every trusted issuer;
+each is validated independently and a token is only ever checked against
+the issuer its `iss` claim names.
 
-```yaml
-# identities.yaml
-identities:
-  - id: run-9f2c1a
-    tokenDigest: sha256:601ed2eb0237bdc2a29c718763b4890384abca0a61e38938a0e22526be20c9f4
-```
+Per-issuer fields:
 
-(A full, valid 64-hex-char SHA-256 digest — the exact shape `haybale
-token new` prints. `decodeDigest` rejects anything shorter, so a
-truncated placeholder like `sha256:3f9c...` would fail to load if
-copy-pasted.)
+| Field              | Default        | Meaning |
+|--------------------|----------------|---------|
+| `issuer`           | (required)     | The exact string a token's `iss` must equal. Also selects the issuer's trust material. Unique across issuers. |
+| `jwksURL`          | —              | `https` URL haybale fetches this issuer's public keys from, refreshed in the background. Exactly one of `jwksURL`/`jwksFile`. `http` is permitted only for a loopback host (testing). |
+| `jwksFile`         | —              | A static JWKS document on disk, read once at startup — the airgapped/e2e alternative to `jwksURL`. |
+| `algorithms`       | `[RS256,ES256]`| Signing-algorithm allowlist. **Asymmetric only** — every HMAC variant and `none` are rejected outright (accepting one is the algorithm-confusion attack this allowlist prevents). |
+| `audiences`        | (required)     | Acceptable `aud` values; a token must carry at least one. An issuer with no audience would admit tokens minted for another relying party. |
+| `leeway`           | `60s`          | Clock-skew tolerance for `exp`/`nbf`/`iat`. |
+| `typ`              | (unset)        | If set, the JOSE `typ` header the token must carry (compared case-insensitively, e.g. `at+jwt`). |
+| `claimBindings`    | (none)         | Map of claim → required value(s) (exact or `path.Match` glob). **Every** binding must match or authentication fails. |
+| `identityTemplate` | (required)     | Renders the authenticated identity's ID from verified claims, e.g. `gha:{repository}` or `{sub}`. Referenced claims must be present and string-typed. |
+| `repoScopeClaim`   | (unset)        | Names a claim carrying repo-scope globs that **narrow** authorization (see "Policy" and `repoScopeClaim` below). |
 
-Only the digest is ever persisted — haybale never stores or logs a raw
-token. To provision a new identity:
+A request authenticates by presenting its JWT as either the HTTP Basic
+password (the username is ignored — this is what `git` itself sends) or an
+`Authorization: Bearer <token>` header.
 
-```
-haybale token new --id run-9f2c1a
-```
+### What haybale checks, per RFC 8725
 
-This prints the raw token once (to hand to the caller — e.g. as an
-environment variable inside a sandbox) and the `identities.yaml` stanza
-to add in its place. The raw token is never itself stored anywhere;
-losing it means minting a new one.
+For every token, against **only** the selected issuer's trust material:
 
-A request authenticates by presenting the token as either the HTTP Basic
-password (the username is ignored — this is what `git` itself sends) or
-an `Authorization: Bearer <token>` header. haybale hashes whatever was
-presented with SHA-256 and compares it, in constant time, against every
-configured identity's digest.
+- The `alg` header is in the issuer's allowlist (asymmetric only) — checked
+  before the signature, so `none` and HMAC confusion never reach a key.
+- The signature verifies against the JWKS key named by the `kid` header.
+- `exp` is present and unexpired (mandatory), `nbf`/`iat` are honored, all
+  within `leeway`.
+- `aud` carries at least one configured audience.
+- `iss` equals the issuer whose keys just verified it.
+- `typ` matches, if the issuer requires one.
+- Every `claimBinding` matches, and every claim `identityTemplate`
+  references is present and string-typed.
+
+Any failure yields a `401` with no detail about *why* — the reason is
+logged server-side only, never returned to the caller.
+
+### `claimBindings` — why they are not optional in practice
+
+An open issuer like GitHub Actions will mint a validly-signed token, with
+your audience, for **any** workflow on github.com. The signature proves
+only that GitHub issued it, not that *you* trust the repo it came from.
+`claimBindings` are what pin an issuer to the callers you intend — e.g.
+`repository_owner: rxbynerd` and `runner_environment: github-hosted`.
+Never configure a github.com issuer without them. See `docs/security.md`.
+
+### `repoScopeClaim` — per-token narrowing
+
+If an issuer sets `repoScopeClaim`, a token may carry a claim listing
+`{host}/{owner}/{repo}` globs. haybale **intersects** that list with the
+YAML policy: a repo the policy would allow is still denied if it falls
+outside the token's scope (`effective = policy ∩ scope`). A token can only
+ever narrow its access this way, never widen it — the policy remains the
+ceiling. An absent claim leaves policy to decide alone; an explicit empty
+list denies every repo.
+
+### JWKS refresh and failure behavior
+
+A `jwksURL` is fetched once at startup (fail-fast — an unreachable or
+empty JWKS refuses to start) and then refreshed in the background,
+honoring the endpoint's `Cache-Control` and refetching on an unseen `kid`
+(rate-limited). If refresh later **starts failing**, haybale keeps serving
+the last successfully fetched key set and logs each failure at `warn`
+(`jwks background refresh failed`) — availability over strict freshness.
+
+A per-issuer `staleIfErrorFor` bound (fail closed once keys have been
+un-refreshable for N) and the optional `discoveryCheck` startup self-check
+are **planned but not yet implemented**; see the "Known limitation" note
+in `docs/security.md`. Until then, alert on the `jwks background refresh
+failed` warning if you need to react to a stale-trust-material condition.
 
 ## Policy
 
@@ -389,8 +455,16 @@ tls:
 drainTimeout: 2m   # optional; omit entirely to wait indefinitely instead (the default)
 
 identity:
-  type: static-token-file
-  path: /etc/haybale/identities.yaml
+  type: jwt
+  issuers:
+    - issuer: https://token.actions.githubusercontent.com
+      jwksURL: https://token.actions.githubusercontent.com/.well-known/jwks
+      algorithms: [RS256]
+      audiences: [https://haybale.internal]
+      claimBindings:
+        repository_owner: rxbynerd
+        runner_environment: github-hosted
+      identityTemplate: "gha:{repository}"
 
 policy:
   path: /etc/haybale/policy.yaml
@@ -405,16 +479,9 @@ upstreams:
 ```
 
 ```yaml
-# /etc/haybale/identities.yaml
-identities:
-  - id: run-9f2c1a
-    tokenDigest: sha256:601ed2eb0237bdc2a29c718763b4890384abca0a61e38938a0e22526be20c9f4
-```
-
-```yaml
 # /etc/haybale/policy.yaml
 rules:
-  - identities: ["run-*"]
-    repos: ["github.com/acme/*"]
+  - identities: ["gha:rxbynerd/*"]
+    repos: ["github.com/rxbynerd/*"]
     permissions: [read, write]
 ```
