@@ -1,35 +1,27 @@
-# Runbook: GitHub Actions OIDC live acceptance (gated)
+# Runbook: GitHub Actions OIDC live acceptance
 
-**Status: gated — manual, requires a network-reachable haybale and a
-scratch repo. Do not run without owner go-ahead.**
+This manual test verifies that a GitHub Actions workflow can authenticate to
+haybale with an OIDC token and perform private repository operations without a
+personal access token.
 
-This runbook proves the end-to-end goal of issue #2: a GitHub Actions
-workflow, holding no PAT, authenticates to haybale with its ambient OIDC
-token and performs a credential-less cross-repo clone/push. It is the live
-counterpart to the local `just e2e-github` acceptance
-(`docs/runbook-github-acceptance.md`) and mirrors that runbook's evidence
--capture style.
-
-Unlike the local acceptance (which stands up a throwaway ES256 issuer via
-`scripts/mint-e2e-jwt`), this one uses the **real** GitHub Actions issuer,
-so it additionally exercises live JWKS fetch/refresh against
-`https://token.actions.githubusercontent.com`.
+Run it only with owner approval against dedicated scratch repositories. The
+workflow must be able to reach the haybale listener.
 
 ## Preconditions
 
-- A haybale deployment **reachable from a GitHub Actions runner**. Two
-  shapes work; record which you used:
-  - haybale exposed at a public (or GitHub-reachable) HTTPS address, hit by
-    a github-hosted runner; or
-  - haybale on a private network, hit by a **self-hosted** runner adjacent
-    to it (in which case `runner_environment` is `self-hosted`, not
-    `github-hosted` — adjust the `claimBindings` accordingly).
-- A GitHub App installed on the scratch repos, configured as haybale's
-  upstream `github-app` credential (as in the v0.1 acceptance).
-- Two scratch repos under your org: one to clone, one to push to (or one
-  repo exercised for both verbs).
+- A haybale deployment reachable from the selected runner:
+  - use HTTPS and a GitHub-hosted runner for a publicly reachable endpoint; or
+  - use a self-hosted runner adjacent to a private haybale deployment.
+- A GitHub App installed on the scratch repositories and configured as
+  haybale's `github-app` upstream credential.
+- One or two private scratch repositories for clone and push operations.
+- A haybale audience value chosen for this deployment, such as
+  `https://haybale.internal`.
 
-## haybale config
+## Configure haybale
+
+Configure GitHub's OIDC issuer and bind it to the organization and runner class
+under test:
 
 ```yaml
 identity:
@@ -40,54 +32,78 @@ identity:
       algorithms: [RS256]
       audiences: [https://haybale.internal]
       claimBindings:
-        repository_owner: <your-org>
-        runner_environment: github-hosted   # or self-hosted, per above
+        repository_owner: YOUR_ORG
+        runner_environment: github-hosted # use self-hosted when applicable
       identityTemplate: "gha:{repository}"
+
 policy:
-  path: policy.yaml
+  path: /etc/haybale/policy.yaml
 ```
 
+Grant only the workflow repositories and operations being tested:
+
 ```yaml
-# policy.yaml — grant only the scratch repos, only the verbs under test
 rules:
-  - identities: ["gha:<your-org>/<clone-repo>"]
-    repos: ["github.com/<your-org>/<clone-repo>"]
+  - identities: ["gha:YOUR_ORG/WORKFLOW_REPO"]
+    repos: ["github.com/YOUR_ORG/CLONE_REPO"]
     permissions: [read]
-  - identities: ["gha:<your-org>/<push-repo>"]
-    repos: ["github.com/<your-org>/<push-repo>"]
+  - identities: ["gha:YOUR_ORG/WORKFLOW_REPO"]
+    repos: ["github.com/YOUR_ORG/PUSH_REPO"]
     permissions: [read, write]
 ```
 
-haybale must start cleanly — the initial JWKS fetch from GitHub is
-fail-fast, so a successful start already proves outbound reachability to
-the Actions JWKS endpoint.
+Start haybale and confirm `GET /healthz` returns `200`. Startup performs the
+initial GitHub JWKS fetch, so a clean start also confirms that the deployment
+can reach the issuer.
 
-## Workflow
+## Run the workflow
 
-In the scratch repo, add the workflow from `docs/github-actions.md`
-(`id-token: write`, `core.getIDToken('https://haybale.internal')`, token
-fed as the git Basic-auth password against haybale's URL). Exercise both a
-clone of the read-only repo and a push to the writable one, requesting a
-**fresh** token immediately before each git operation (5-minute TTL).
+Add a temporary workflow to `WORKFLOW_REPO` based on the
+[GitHub Actions integration](github-actions.md). It must:
 
-## Evidence to capture
+1. grant `id-token: write`;
+2. request a token for haybale's configured audience immediately before each
+   Git operation;
+3. mark the token as a secret;
+4. pass it to Git as an `Authorization: Bearer` header; and
+5. avoid any PAT, deploy key, or GitHub App token in workflow secrets.
 
-Mirroring the v0.1 `e2e-github` runbook:
+Exercise a clone from `CLONE_REPO` and a push to `PUSH_REPO`. Request a new OIDC
+token before each operation because GitHub OIDC tokens are short-lived.
 
-1. **Workflow run**: the Actions log showing the clone and push succeeding
-   with no PAT in the environment (only the OIDC-minted token).
-2. **haybale logs**: for each request, a `proxied request` line carrying
-   `identity=gha:<org>/<repo>`, `issuer=https://token.actions.githubusercontent.com`,
-   the verb, and `status=200`; and the `token_minted` upstream events —
-   never a raw token in any line.
-3. **Negative check**: a workflow in a repo **outside** the `claimBindings`
-   (or a token requested for the wrong audience) is rejected `401`,
-   proving the bindings are load-bearing.
-4. **Scope check (optional)**: if the deployment uses `repoScopeClaim`, a
-   token scoped to one repo is denied `404` on another the policy would
-   otherwise allow.
+## Positive evidence
+
+Capture:
+
+1. the workflow run URL and job log showing successful clone and push;
+2. haybale `proxied request` records with the expected
+   `identity=gha:YOUR_ORG/WORKFLOW_REPO`, verified issuer, repository, verb, and
+   `status=200`;
+3. `token_minted` events for required GitHub App scopes, with no token value;
+   and
+4. the pushed commit SHA confirmed independently through GitHub's UI or API.
+
+Do not copy OIDC tokens, authorization headers, private keys, or installation
+tokens into the evidence.
+
+## Negative checks
+
+Perform at least one of these checks:
+
+- request an OIDC token for the wrong audience and confirm haybale returns
+  `401`;
+- run the workflow from a repository outside `claimBindings` and confirm a
+  `401`; or
+- request a repository outside policy and confirm a `404`.
+
+If `repoScopeClaim` is configured, also test a token whose repository scope
+excludes a repository otherwise allowed by policy; haybale should return `404`.
 
 ## Cleanup
 
-Remove the scratch workflow and any scratch repos/branches created.
-Rotate the GitHub App key if it was exposed anywhere during setup.
+- Remove the temporary workflow and test branches.
+- Delete or reset scratch repositories according to their retention policy.
+- Remove temporary policy grants.
+- Remove any public route created solely for the test.
+- Rotate the GitHub App key if its handling during the test did not meet normal
+  secret-management requirements.

@@ -1,200 +1,163 @@
 # Stirrup integration
 
-haybale exists to close a gap Stirrup's own documentation names
-explicitly: Stirrup sandboxes are credential-free by construction — the
-only environment variables the container executor injects are
-`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`
-(`harness/internal/executor/container.go`) — so cloning a *private*
-repository today means either an unauthenticated `preRun` `git clone`
-(which simply fails against a private repo) or smuggling a real git
-credential onto the sandbox's disk, which Stirrup's own security model
-rejects: `ValidateRunConfig` structurally rejects a `secret://` reference
-in a hook `command`, and Stirrup's `docs/security.md` says plainly that
-"Clone/deploy credentials belong in control-plane runtime bindings … never
-in `RunConfig`" — a binding that, at the time of writing, doesn't exist.
-haybale is that binding, deployed as its own component rather than a
-Stirrup code change.
+This guide describes how to route Git smart-HTTP traffic from a Stirrup
+sandbox through haybale without placing an upstream Git credential in the
+sandbox.
 
-This integration is **documentation only** — nothing here requires a
-change to Stirrup itself. It uses two mechanisms Stirrup already has
-(the Ring 2 egress allowlist, and `hooks.preRun`) plus one Git already
-has (env-sourced config via `GIT_CONFIG_COUNT`).
+The integration uses:
 
-> **Authentication is now JWT-based.** haybale no longer mints its own
-> static tokens; it verifies a signed **JWT** that a control plane issued
-> to the run, against that issuer's JWKS (`docs/jwt-identity.md`). The
-> sandbox wiring below is unchanged in shape — the credential is still fed
-> as the Basic-auth password — but the credential is now a control-plane
-> JWT, not a `haybale token new` string.
->
-> Stirrup does not yet have a control plane that can issue such JWTs (the
-> `stirrup` binary is a gRPC client with no signing/JWKS infrastructure),
-> so this document describes the **target** integration. Until an external
-> control plane can mint per-run JWTs per the contract, the concrete,
-> deployable-today issuer is **GitHub Actions OIDC**
-> (`docs/github-actions.md`); Stirrup-side issuance is tracked separately
-> and is out of scope for haybale.
+- Stirrup's HTTP/HTTPS proxy and egress allowlist;
+- a JWT issued for the run by a trusted control plane;
+- Git's environment-based configuration; and
+- a haybale policy identity derived from the run token.
 
-## Deployment
+The surrounding control plane must implement the [JWT issuer
+contract](jwt-identity.md). If runs originate in GitHub Actions, the
+[GitHub Actions OIDC integration](github-actions.md) can supply the token
+instead.
 
-Run haybale as its own Deployment/Service, in the same namespace as (and
-reachable the same way as) Stirrup's `stirrup-egress-proxy` Deployment
-(`app=stirrup-egress-proxy`, see `examples/k8s/egress-proxy/` in the
-Stirrup repo) — i.e. inside the cluster boundary the sandbox's egress
-proxy itself lives behind, not exposed publicly. Configure TLS
-(`docs/configuration.md`) unless haybale's listener is genuinely
-reachable only from that trusted, cluster-internal network.
+## Deployment model
 
-A sandbox's outbound HTTP/HTTPS traffic (git included — `git`'s smart-HTTP
-transport honours `HTTP_PROXY`/`HTTPS_PROXY` like any well-behaved HTTP
-client) is always routed through `stirrup-egress-proxy` when
-`network.mode: allowlist`, and that proxy forwards a request only if its
-destination FQDN (and port, if non-443 — see below) matches an entry in
-the run's `network.allowlist`
-(`docs/safety-rings.md`'s Ring 2 section in the Stirrup repo). So:
+Deploy haybale where both the Stirrup egress proxy and the configured Git hosts
+are reachable. A cluster-internal service is the usual topology. Configure
+listener TLS unless the client-to-haybale network is private and trusted; see
+the [security model](security.md#tls).
 
-- **Add haybale's address to `network.allowlist`** — e.g.
-  `haybale.internal:8466` (the FQDN matching rule defaults to port 443
-  when unsuffixed, so haybale's actual listen port must be included
-  explicitly unless it's fronted by something on 443).
-- **Leave `github.com` off the allowlist.** Every git remote URL the
-  sandbox uses is rewritten (see "Sandbox wiring" below) to point at
-  haybale instead of `github.com` directly, so nothing inside the
-  sandbox needs `github.com` in the allowlist at all — and *not* adding
-  it means haybale is the only path to GitHub content this run has,
-  rather than an optional one a misconfigured tool could route around.
+For a run using an egress allowlist:
 
-**Cooperative-enforcement caveat, inherited from Ring 2 as-is:** the
-egress allowlist (and so this whole integration) depends on the
-in-container client honouring `HTTP_PROXY`/`HTTPS_PROXY`. Stirrup's own
-docs are explicit that a misbehaving client — raw TCP, a custom DNS
-resolver, an env-stripped subprocess — can still reach the container's
-bridge gateway directly, because "the current implementation enforces
-fail-closed via the proxy env vars only." This integration doesn't
-change that posture one way or the other: it rides on whatever
-enforcement Ring 2 provides today, no more and no less. A well-behaved
-`git clone`/`git push` is fully covered; a sandbox process that
-deliberately dials out on a raw socket is a Ring 2 gap this integration
-inherits, not one haybale introduces.
+1. Add haybale's service address and port, for example
+   `haybale.internal:8466`.
+2. Do not add `github.com` when all GitHub access must go through haybale.
+3. Ensure the sandbox's Git process retains `HTTP_PROXY`, `HTTPS_PROXY`, and
+   `NO_PROXY` as required by the Stirrup deployment.
 
-## Provisioning (operator, per run)
+This control inherits the enforcement properties of Stirrup's network mode.
+Git honors the proxy variables, but software that bypasses the configured HTTP
+proxy must be constrained by the sandbox network layer if direct egress is a
+concern.
 
-For each run that needs access, the control plane (not the agent, and not
-anything inside the sandbox) does two things ahead of time:
+## Per-run provisioning
 
-1. Issue a JWT for that run, per `docs/jwt-identity.md`: signed with the
-   control plane's key, `iss` equal to haybale's configured issuer, `aud`
-   equal to haybale's configured audience, and `sub: run-<RunID>` (so an
-   `identityTemplate: "{sub}"` renders the identity as `run-<RunID>`).
-   `<RunID>` is Stirrup's own `RunConfig.RunID` — using it keeps haybale's
-   audit log (`identity=run-<RunID>` on every proxied request and security
-   event) correlated with Stirrup's own per-run tracing. The JWT is handed
-   to whatever provisions the sandbox's environment (see below); haybale
-   holds only the issuer's public keys, never the signing key.
+Before starting a run, the control plane should:
 
-   Optionally, the control plane can narrow a single run below the YAML
-   policy by including a `repoScopeClaim` array on the token
-   (`docs/jwt-identity.md`) — per-run blast-radius reduction that a static
-   token could not express.
+1. issue a short-lived JWT for the run;
+2. make the token available to the sandbox as `HAYBALE_TOKEN`; and
+3. ensure haybale policy grants the derived identity only the repositories and
+   operations required by the run.
 
-2. Add a `policy.yaml` rule scoping `run-<RunID>` to exactly the
-   repo(s) and verb(s) that run needs — nothing broader:
+A typical issuer configuration derives the identity directly from `sub`:
 
-   ```yaml
-   rules:
-     - identities: ["run-<RunID>"]
-       repos: ["github.com/acme/widgets"]
-       permissions: [read]
-   ```
-
-   Use `haybale policy check --id run-<RunID> --repo <host/owner/repo>
-   --verb <read|write>` to confirm the rule does what's intended before
-   the run starts (`docs/configuration.md`).
-
-## Sandbox wiring — pure env, nothing on disk
-
-The sandbox needs two things: haybale's token, and git configuration
-that (a) redirects a `https://github.com/...` remote to haybale and (b)
-supplies the token as a credential on that redirected request. Both are
-expressible purely as environment variables — no file ever needs to be
-written to the sandbox's disk, which matters because anything a hook
-*does* write to disk stays readable by every later `run_command` for the
-rest of the run.
-
+```yaml
+identity:
+  type: jwt
+  issuers:
+    - issuer: https://control-plane.example.internal
+      jwksURL: https://control-plane.example.internal/.well-known/jwks.json
+      algorithms: [ES256]
+      audiences: [https://haybale.internal]
+      typ: at+jwt
+      identityTemplate: "{sub}"
+      repoScopeClaim: haybale.dev/repos
 ```
-HAYBALE_TOKEN=<the run's JWT, issued by the control plane per docs/jwt-identity.md>
+
+For Stirrup run `01JABC...`, the control plane can issue `sub:
+run-01JABC...`. Policy then uses the same identity:
+
+```yaml
+rules:
+  - identities: ["run-01JABC..."]
+    repos: ["github.com/acme/widgets"]
+    permissions: [read]
+```
+
+Use a `repoScopeClaim` in the token when the control plane knows the exact
+repository set for a run. The token scope narrows the YAML policy and cannot
+grant access by itself.
+
+Validate a policy decision before starting the run:
+
+```sh
+haybale policy check --config haybale.yaml \
+  --id run-01JABC... \
+  --repo github.com/acme/widgets \
+  --verb read
+```
+
+## Sandbox Git configuration
+
+Git 2.31 and later can receive configuration entirely through environment
+variables. The following values rewrite GitHub HTTPS URLs to haybale and supply
+the run JWT only to haybale's URL:
+
+```sh
+HAYBALE_TOKEN=<short-lived run JWT>
 
 GIT_CONFIG_COUNT=2
 GIT_CONFIG_KEY_0=url.http://haybale.internal:8466/github.com/.insteadOf
 GIT_CONFIG_VALUE_0=https://github.com/
 GIT_CONFIG_KEY_1=credential.http://haybale.internal:8466/.helper
-GIT_CONFIG_VALUE_1=!f() { echo username=x-access-token; echo "password=$HAYBALE_TOKEN"; }; f
+GIT_CONFIG_VALUE_1='!f() { echo username=x-access-token; echo "password=$HAYBALE_TOKEN"; }; f'
 ```
 
-- `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` is Git's own
-  mechanism (since Git 2.31) for supplying arbitrary config entries via
-  environment variables, with no `~/.gitconfig` or `.git/config` write
-  required.
-- `url.<base>.insteadOf` rewrites any remote URL starting with
-  `https://github.com/` to `http://haybale.internal:8466/github.com/`
-  instead — haybale's host-in-path scheme
-  (`docs/configuration.md`'s "Upstreams" section) means this one rewrite
-  rule is enough for every repo under `github.com`, not one rule per
-  repo.
-- `credential.<url-prefix>.helper` scopes the credential helper to
-  exactly haybale's URL (the *rewritten* URL Git actually requests,
-  which is what credential-helper matching is keyed on) — not a blanket
-  `credential.helper` that would also fire for unrelated remotes. The
-  helper itself is an inline shell one-liner (the `!` prefix runs it
-  through the shell) that echoes the token straight from
-  `$HAYBALE_TOKEN`; it never touches disk, and its output goes to Git
-  over a pipe, never into the run's transcript.
+For a TLS listener, use `https://haybale.internal/...` in both keys.
 
-With this in place, Stirrup's existing `hooks.preRun` needs no changes
-at all:
+`url.<base>.insteadOf` rewrites:
+
+```text
+https://github.com/acme/widgets.git
+```
+
+to:
+
+```text
+http://haybale.internal:8466/github.com/acme/widgets.git
+```
+
+The credential helper is scoped to haybale's rewritten URL. It does not run for
+unrelated remotes. Both the rewrite and helper remain in process environment;
+no `.gitconfig`, `.netrc`, or credential file is required.
+
+With these variables present, a normal pre-run hook needs no proxy-specific
+command:
 
 ```json
 {
   "hooks": {
     "preRun": [
-      { "name": "clone", "command": "git clone https://github.com/acme/widgets.git .", "timeoutSeconds": 60 }
+      {
+        "name": "clone",
+        "command": "git clone https://github.com/acme/widgets.git .",
+        "timeoutSeconds": 60
+      }
     ]
   }
 }
 ```
 
-`git` resolves `https://github.com/acme/widgets.git` through
-`insteadOf` to `http://haybale.internal:8466/github.com/acme/widgets.git`,
-authenticates that request with the credential helper's output, and the
-request goes out through the sandbox's proxy env exactly like any other
-outbound HTTPS call — the hook author never needs to know haybale is
-involved at all. It Just Works.
+## Secret-handling requirements
 
-*How `HAYBALE_TOKEN`/`GIT_CONFIG_*` actually land in the sandbox's
-environment is an operator/deployment concern outside haybale's own
-scope* — e.g. a Kubernetes `Sandbox` custom resource's pod-template
-overlay, or (v0.2, see below) a first-class RunConfig field. This
-document specifies what those variables must contain, not how the
-surrounding infrastructure delivers them.
+- Treat `HAYBALE_TOKEN` as a bearer credential until it expires.
+- Do not include its value in `RunConfig`, hook commands, transcripts, or
+  persistent files.
+- Avoid shell tracing (`set -x`) around credential-helper setup.
+- Issue a token with a lifetime appropriate to the run and repository scope as
+  narrow as practical.
+- Remove the token from any long-lived parent process after sandbox launch when
+  the deployment mechanism permits it.
 
-## v0.2 futures
+The sandbox token works only against haybale. haybale replaces it with an
+upstream credential after authentication and authorization. The upstream
+credential remains inside the haybale process.
 
-Two follow-ups are explicitly out of scope for this integration as
-written, tracked for later:
+## Verification
 
-- **Control-plane JWT issuance.** The remaining gap is Stirrup-side: a
-  Stirrup control plane that mints a per-run JWT (per
-  `docs/jwt-identity.md`) and publishes a JWKS haybale trusts, so a run's
-  identity is provisioned automatically rather than an operator editing
-  `policy.yaml` by hand per run. haybale is already the verifier (behind
-  the `identity.Authenticator` seam `JWTAuthenticator` implements today —
-  see `internal/identity/identity.go`); what does not yet exist is the
-  issuer. Signed JWTs also make Stirrup's guessable-`RunID` a non-issue —
-  the signature, not the subject string, is the credential.
-- **Cedar policy backend.** haybale's `policy.Engine` interface
-  (`internal/policy/policy.go`) is deliberately narrow so a Cedar-backed
-  implementation can replace `GlobEngine` without touching
-  `internal/proxy` — unifying haybale's authorization model with
-  Stirrup's own Cedar-based Ring 3 (`docs/safety-rings.md`), including
-  Stirrup's `User::"<runId>"` principal shape, instead of running two
-  separate policy languages side by side.
+For an integration smoke test:
+
+1. run `haybale policy check` for the run identity and target repository;
+2. clone through the original GitHub URL with the environment rewrite active;
+3. verify haybale logs the expected identity, repository, and `read` operation;
+4. attempt a repository outside policy and confirm Git receives `404`; and
+5. inspect the sandbox for `.netrc`, `.git-credentials`, or an upstream token.
+
+For a full GitHub App round trip, use the [live GitHub acceptance
+runbook](runbook-github-acceptance.md).

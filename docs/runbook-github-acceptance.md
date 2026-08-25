@@ -1,319 +1,161 @@
-# Runbook: real-GitHub acceptance (M6)
+# Runbook: live GitHub App acceptance
 
-This is haybale's final acceptance test: a **credential-less container**
-(only `HAYBALE_URL`/`HAYBALE_TOKEN` in its environment — no GitHub
-credential anywhere) clones and pushes a **real private GitHub
-repository** entirely through a locally-running haybale, using a **real
-GitHub App** to mint the upstream credential. It is the end-to-end proof
-that every other milestone's unit/integration tests only approximated
-against fakes.
+This manual acceptance test starts haybale locally, then runs a container that
+clones and pushes a private GitHub repository through it. The container receives
+a haybale JWT but no GitHub credential. haybale uses a real GitHub App to mint
+the upstream installation tokens.
 
-`just e2e-github` (`scripts/e2e-github.sh`) runs it. It is deliberately
-**not** wired into CI — it needs a real GitHub App private key, a real
-private repo, and a container runtime that can reach back out to the
-host, none of which CI has.
+Run the test only against a dedicated scratch repository. It creates and pushes
+a commit. The test is not part of CI because it requires a GitHub App private
+key, a private repository, GitHub CLI credentials, and a container runtime.
 
-## 1. Creating a GitHub App for this (skip if reusing "haybale dev")
+## Prerequisites
 
-haybale's own repo already has a live App for this purpose — see
-["Using the existing App"](#2-using-the-existing-app-haybale-dev) below.
-A different operator repeating this acceptance elsewhere creates their
-own:
+- Go and `just`
+- Docker or Podman
+- [GitHub CLI](https://cli.github.com/) authenticated as an account that can
+  inspect the scratch repository
+- a private scratch repository with a `main` branch and at least one commit
+- a GitHub App installed on that repository
 
-1. GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App**.
-2. **GitHub App name**: anything unique (e.g. `haybale dev`). **Homepage
-   URL**: anything valid (unused) — e.g. the haybale repo's URL.
-   **Callback URL**: leave blank. **Webhook**: **uncheck "Active"** —
-   this App only ever mints installation tokens; it has no use for
-   webhook deliveries.
-3. **Repository permissions**: set **Contents: Read and write**,
-   **Metadata: Read-only** (Metadata is implicitly required and
-   auto-selected). Grant nothing else — this is the least-privilege set
-   `internal/upstream.GitHubAppSource` actually asks for (see
-   `docs/security.md`'s "Least-privilege GitHub App token minting").
-4. **Where can this GitHub App be installed?**: "Only on this account"
-   is sufficient for a personal test.
-5. Create the App, note its **App ID** (shown at the top of the App's
-   settings page).
-6. Scroll to **Private keys** → **Generate a private key**. This
-   downloads a `.pem` file **once** — save it somewhere outside any git
-   repository and `chmod 600` it immediately:
+The GitHub App needs only these repository permissions:
 
-   ```
-   chmod 600 ~/Downloads/your-app.private-key.pem
+- **Contents:** Read and write
+- **Metadata:** Read-only (automatically required by GitHub)
+
+Webhooks and a callback URL are not needed.
+
+## Create or configure the GitHub App
+
+1. Open **Settings → Developer settings → GitHub Apps → New GitHub App**.
+2. Choose a unique name and a valid homepage URL.
+3. Disable webhooks and leave the callback URL empty.
+4. Grant **Contents: Read and write** and no optional permission beyond it.
+5. Restrict installation to the dedicated scratch repository where possible.
+6. Record the App ID.
+7. Generate a private key and store it outside every source repository.
+8. Restrict the key file to its owner:
+
+   ```sh
+   chmod 600 /secure/path/github-app.pem
    ```
 
-   haybale's own `internal/config.Validate()` refuses to start if this
-   file is group- or world-readable (CWE-732) — see
-   `docs/configuration.md`'s "Upstreams" section.
-7. **Install the App**: from the App's settings page, "Install App" →
-   pick the account/org → **"Only select repositories"** → choose the
-   private repo(s) this acceptance test should touch (or "All
-   repositories" if you'll create new scratch repos over time, as this
-   project does — see step 2 below).
-8. Create a **private** scratch repository dedicated to this test (never
-   reuse a repo with real content):
+haybale rejects group- or world-accessible private keys.
 
-   ```
-   gh repo create <owner>/haybale-e2e --private --description "haybale acceptance test scratch repo"
-   ```
+Create and seed a scratch repository if necessary:
 
-   Seed it with an initial commit so there's a `HEAD` to clone from —
-   any commit works; `scripts/e2e-github.sh` doesn't care what's in the
-   repo beyond a `main` branch existing.
+```sh
+gh repo create OWNER/haybale-e2e --private \
+  --description "haybale acceptance test scratch repository"
 
-## 2. Using the existing App ("haybale dev")
-
-This project already has a live App: **"haybale dev"**, **App ID
-`4278664`**, installed on the `rxbynerd` (installation `146047506`) and
-`ghostworks` (installation `146047537`) accounts with
-`repository_selection=all` and `contents:write`+`metadata:read` — so any
-repo under either account is reachable, including a freshly created one.
-The private key lives outside this repository; it is referenced **only**
-via the `HAYBALE_APP_KEY_PATH` environment variable, never checked in and
-never printed by anything in this codebase.
-
-The acceptance target is the dedicated private scratch repo
-`rxbynerd/haybale-e2e` (`docs/runbook-github-acceptance.md`'s own
-existence is the reason it exists — nothing else touches it). Traffic
-from `just e2e-github` only ever reads/writes that one repo: the
-generated `policy.yaml` grants the run's identity `read`+`write` on
-exactly `github.com/rxbynerd/haybale-e2e` and nothing else — default deny
-covers every other repo the App could technically reach.
-
-## 3. Running it
-
-Prerequisites: `just build` succeeds, `gh` is authenticated (`gh auth
-status`), and a container runtime is installed — this dev environment
-uses **podman** (docker is not installed), at `/opt/podman/bin/podman`.
-The key at `HAYBALE_APP_KEY_PATH` must be `chmod 600` (see step 6 in
-[Section 1](#1-creating-a-github-app-for-this-skip-if-reusing-haybale-dev),
-which applies whether or not you created the App yourself) —
-`haybale serve` refuses to start otherwise (`internal/config.Validate()`,
-CWE-732). The script itself checks `just build`'s output, the container
-runtime, and `gh`'s presence/auth upfront, before minting a token or
-touching the scratch repo, so a missing precondition fails fast rather
-than after a real commit has already been pushed.
-
-```
-HAYBALE_APP_KEY_PATH=/path/to/haybale-dev.private-key.pem just e2e-github
+git clone git@github.com:OWNER/haybale-e2e.git
+cd haybale-e2e
+printf '# haybale acceptance scratch\n' > README.md
+git add README.md
+git commit -m 'Initialize acceptance repository'
+git push -u origin main
 ```
 
-Optional environment variables (all have working defaults for this
-project's own App/repo — see `scripts/e2e-github.sh`'s header comment
-for the full list):
+## Run the test
 
-| Variable                     | Default                    | Purpose |
-|-------------------------------|-----------------------------|---------|
-| `HAYBALE_APP_KEY_PATH`         | *(required)*                | Path to the GitHub App's PEM private key. |
-| `HAYBALE_CONTAINER_RUNTIME`    | `podman`                    | `docker` or `podman`. |
-| `HAYBALE_APP_ID`               | `4278664` ("haybale dev")   | GitHub App ID. |
-| `HAYBALE_E2E_REPO`             | `rxbynerd/haybale-e2e`      | `owner/repo` on `github.com` to round-trip against. |
-| `HAYBALE_E2E_PORT`             | derived from the script's own PID | Port haybale listens on for this run — randomized by default so two concurrent runs don't race on the same port; override to pin a specific one. |
-| `HAYBALE_E2E_SCRATCH`          | `.e2e-github.$PID`         | Scratch dir for this run's generated token/config/log — PID-suffixed by default so concurrent runs don't clobber each other's in-flight files; `.gitignore`'d by a stable `.e2e-github*/` prefix pattern. |
+Build haybale, then provide the App ID, repository, and key path explicitly:
 
-### What it does
+```sh
+just build
 
-1. Mints a run-scoped identity **JWT** — via `scripts/mint-e2e-jwt`, a
-   local ES256 issuer standing in for a control plane (haybale itself
-   mints nothing; it verifies) — and writes a scratch
-   `jwks.json`/`policy.yaml`/`haybale.yaml`. The `haybale.yaml` configures
-   a single `jwt` issuer trusting that `jwks.json`; the policy grants that
-   one identity `read`+`write` on exactly `HAYBALE_E2E_REPO`, nothing
-   else. All files (and the minted token) live under a per-run scratch dir
-   (default `.e2e-github.$PID`, PID being this script's own — override via
-   `HAYBALE_E2E_SCRATCH`), `.gitignore`'d and deleted on every exit path,
-   success or failure.
-2. Starts `haybale serve` on the host, in the background, and polls
-   `/healthz` until it's up.
-3. Runs a single `podman run --rm` (or `docker run --rm`) container of
-   `alpine/git`, passing **only** `HAYBALE_URL` (haybale's address, as
-   `http://host.containers.internal:$PORT` — see "Container→host
-   networking" below) and `HAYBALE_TOKEN` (the raw minted token) as
-   `--env`. Entirely from inside that container's own shell:
-   - configures git via `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/
-     `GIT_CONFIG_VALUE_n` — an `insteadOf` rewrite from
-     `https://github.com/` to haybale's URL, and a credential helper
-     that echoes `HAYBALE_TOKEN` as the Basic-auth password — mirroring
-     `docs/stirrup-integration.md`'s "Sandbox wiring" exactly. **Nothing
-     is written to disk for this**: no `~/.gitconfig`, no credential
-     file, purely environment variables the container's own shell
-     exports for itself, derived from the two it was given;
-   - clones `HAYBALE_E2E_REPO` (rewritten through haybale), commits a
-     marker line, and pushes back — both legs going through haybale,
-     which mints and injects the real GitHub credential on the egress
-     hop only;
-   - checks its own filesystem and environment for git-host credential
-     material (see "Credential-less assertion" below) and prints
-     `CREDENTIAL_CHECK: PASS` or `FAIL`.
-4. Confirms the pushed commit SHA is actually `HEAD` of the repo's
-   `main` branch via `gh api` — a channel entirely independent of
-   haybale, run from the host with the operator's own `gh` credentials,
-   not anything haybale minted.
-5. Tears down: escalates shutdown of both the `haybale serve` process and
-   the container run — `SIGTERM`, then a bounded few-second poll, then
-   `SIGKILL` as a last resort — and unconditionally removes the scratch
-   dir, via a `trap` that fires on success, failure, or interruption.
-   `haybale serve` itself runs with a finite `--drain-timeout` for this
-   test harness (unlike production's own indefinite-by-default drain —
-   see `cmd/haybale/cmd/serve.go`), so teardown is bounded even before
-   the trap's own escalation is needed. Safely re-runnable any number of
-   times, including concurrently (see `HAYBALE_E2E_PORT`/
-   `HAYBALE_E2E_SCRATCH` above).
-
-### Credential-less assertion
-
-The container checks, before it exits:
-
-- `~/.netrc` and `~/.git-credentials` do not exist (the `GIT_CONFIG_*`
-  approach never creates either).
-- No file reachable from `/` — every real mount, not just the root
-  filesystem, including `alpine/git`'s own anonymous `/git` volume and
-  `/tmp` (where the clone/push actually happens) regardless of whether
-  a given runtime mounts it separately — newly contains a GitHub token
-  shape (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`) or a PEM
-  private-key header, compared against a baseline scan taken before the
-  container touches the network at all. `/proc`, `/sys`, `/dev` are
-  excluded by *name* (they're pseudo-filesystems, not real storage),
-  not by `find -xdev`'s device-boundary logic, so a real volume mounted
-  anywhere else is never silently skipped the way `-xdev` would skip
-  it. The comparison is content-aware, not just path-aware: a file
-  already flagged at baseline (see below) is re-hashed after the run,
-  so a secret appended into an already-known path is caught too, not
-  only a secret introduced under a brand-new path. A broken scan itself
-  (e.g. a missing `find`/`grep`) is a distinct, loud failure — never
-  silently indistinguishable from a genuinely clean 0-match pass.
-  (The baseline exists because the stock `alpine/git` image's own `ssh`
-  binaries contain PEM-format-detection string literals that otherwise
-  false-positive on the PEM pattern — diffing against that baseline
-  means only material introduced or changed by *this run* counts as a
-  finding.)
-- No environment variable's value matches any of the same patterns.
-
-The minted upstream credential — a real `ghs_…` GitHub App installation
-token — is exactly the shape this check would catch, and it is never
-handed to the container: haybale injects it only on the egress hop to
-GitHub, entirely inside the haybale process. The one secret the
-container does hold, `HAYBALE_TOKEN`, is deliberately not in this
-checklist: it's a haybale-scoped bearer token whose blast radius is this
-run's one `policy.yaml` rule, not a credential that works against
-GitHub — precisely the distinction this whole project exists to enforce.
-
-### Container→host networking
-
-`podman` (like Docker Desktop, but unlike Linux Docker's default bridge)
-runs containers inside a VM, so `127.0.0.1`/`localhost` from inside the
-container refers to the container itself, not the host running
-`haybale serve`. The fix is `host.containers.internal` — podman's own
-host-gateway DNS alias, confirmed by resolving it from inside an
-`alpine/git` container:
-
-```
-$ podman run --rm --entrypoint sh alpine/git -c 'getent hosts host.containers.internal'
-192.168.127.254   host.containers.internal  host.containers.internal
+HAYBALE_APP_ID=123456 \
+HAYBALE_APP_KEY_PATH=/secure/path/github-app.pem \
+HAYBALE_E2E_REPO=OWNER/haybale-e2e \
+HAYBALE_CONTAINER_RUNTIME=podman \
+just e2e-github
 ```
 
-and confirmed end-to-end against a real listener on the host:
+Use `HAYBALE_CONTAINER_RUNTIME=docker` for Docker.
 
-```
-$ podman run --rm --entrypoint sh alpine/git -c 'wget -S -O- http://host.containers.internal:18470/healthz'
-Connecting to host.containers.internal:18470 (192.168.127.254:18470)
-  HTTP/1.1 200 OK
-  ...
-```
+Optional controls:
 
-`scripts/e2e-github.sh` therefore sets `HAYBALE_URL=http://host.containers.internal:$PORT`
-rather than `127.0.0.1`. Docker Desktop resolves the same hostname
-out of the box; plain Linux Docker needs `--add-host
-host.containers.internal:host-gateway` on older versions (Docker
-≥20.10 wires this up automatically for `host-gateway`, but under the
-literal name `host.docker.internal` unless configured otherwise) — if a
-future operator hits `HAYBALE_CONTAINER_RUNTIME=docker` and the resolve
-fails, point `HAYBALE_URL` at `host.docker.internal` instead, or add the
-explicit `--add-host` mapping.
+| Variable | Purpose |
+|---|---|
+| `HAYBALE_BIN` | haybale binary path; defaults to `./haybale` |
+| `HAYBALE_E2E_PORT` | host listener port; defaults to a PID-derived port |
+| `HAYBALE_E2E_SCRATCH` | generated config, token, and log directory; defaults to `.e2e-github.$PID` |
 
-## 4. Captured evidence: a real successful run
+The script removes its scratch directory on success, failure, or interruption.
+The `.gitignore` pattern also excludes it as defense in depth.
 
-The transcript below is `just e2e-github`'s actual, unedited stdout from
-a real run against the live "haybale dev" App and the real
-`rxbynerd/haybale-e2e` repo (only the leading `go build`/recipe-echo
-lines from `just` are trimmed). No redaction was needed — nothing
-secret is ever printed by the script itself, since `HAYBALE_TOKEN` is
-only ever handed to the container as an environment variable, never
-echoed, and the upstream GitHub App token never leaves haybale's own
-process.
+## What the script verifies
 
-```
-e2e-github: using container runtime: podman
-e2e-github: minting identity token for run-e2e-1783869513-82250
-e2e-github: starting haybale serve on :8650
-e2e-github: haybale is healthy (pid 82270)
-e2e-github: running credential-less container (podman, image docker.io/alpine/git)
-== container: git version ==
-git version 2.54.0
-== container: configuring git via env only (nothing written to disk) ==
-== container: git clone https://github.com/rxbynerd/haybale-e2e.git (rewritten through haybale) ==
-Cloning into '/tmp/work'...
-== container: pushing commit e58acb2b58e7d87274d50ff63f22ddcd2eaf0486 ==
-To http://host.containers.internal:8650/github.com/rxbynerd/haybale-e2e.git
-   93ea12c..e58acb2  HEAD -> main
-PUSHED_SHA:e58acb2b58e7d87274d50ff63f22ddcd2eaf0486
-== container: credential-less check ==
+The script:
+
+1. creates a temporary ES256 signing key, a public JWKS file, and a short-lived
+   run JWT;
+2. writes a policy that grants that run identity read and write access to only
+   `HAYBALE_E2E_REPO`;
+3. starts haybale with the local JWKS and the real GitHub App configuration;
+4. starts an `alpine/git` container with only `HAYBALE_URL` and
+   `HAYBALE_TOKEN` supplied by the host;
+5. configures Git through `GIT_CONFIG_*` environment variables, without writing
+   credentials or Git configuration to disk;
+6. clones the private repository, commits a marker, and pushes it through
+   haybale;
+7. checks the container filesystem and environment for GitHub token and private
+   key patterns;
+8. confirms the pushed SHA through an independent `gh api` request; and
+9. shuts down the container and haybale, escalating to a forced stop if graceful
+   teardown does not complete promptly.
+
+A successful run ends with:
+
+```text
 CREDENTIAL_CHECK: PASS
-e2e-github: container pushed commit e58acb2b58e7d87274d50ff63f22ddcd2eaf0486
-e2e-github: confirming round-trip via gh api (bypasses haybale entirely)
-e2e-github: github.com HEAD of rxbynerd/haybale-e2e@main is e58acb2b58e7d87274d50ff63f22ddcd2eaf0486
-e2e-github: round-trip CONFIRMED: e58acb2b58e7d87274d50ff63f22ddcd2eaf0486 is HEAD of rxbynerd/haybale-e2e@main
-e2e-github: haybale security/audit log excerpt for this run:
-time=2026-07-12T16:18:40.962+01:00 level=WARN msg="security event" event=token_minted host=github.com owner=rxbynerd repo=haybale-e2e verb=read appID=4278664 installationID=146047506
-time=2026-07-12T16:18:41.247+01:00 level=INFO msg="proxied request" identity=run-e2e-1783869513-82250 host=github.com owner=rxbynerd repo=haybale-e2e verb=read status=200 bytesIn=0 bytesOut=191 durationMs=285
-time=2026-07-12T16:18:41.389+01:00 level=INFO msg="proxied request" identity=run-e2e-1783869513-82250 host=github.com owner=rxbynerd repo=haybale-e2e verb=read status=200 bytesIn=181 bytesOut=145 durationMs=138
-time=2026-07-12T16:18:41.546+01:00 level=INFO msg="proxied request" identity=run-e2e-1783869513-82250 host=github.com owner=rxbynerd repo=haybale-e2e verb=read status=200 bytesIn=223 bytesOut=1895 durationMs=152
-time=2026-07-12T16:18:41.774+01:00 level=WARN msg="security event" event=token_minted host=github.com owner=rxbynerd repo=haybale-e2e verb=write appID=4278664 installationID=146047506
-time=2026-07-12T16:18:42.007+01:00 level=INFO msg="proxied request" identity=run-e2e-1783869513-82250 host=github.com owner=rxbynerd repo=haybale-e2e verb=write status=200 bytesIn=0 bytesOut=334 durationMs=233
-time=2026-07-12T16:18:42.680+01:00 level=INFO msg="proxied request" identity=run-e2e-1783869513-82250 host=github.com owner=rxbynerd repo=haybale-e2e verb=write status=200 bytesIn=594 bytesOut=66 durationMs=669
+...
 e2e-github: ALL CHECKS PASSED
 ```
 
-This run post-dates the M6 remediation pass (bounded/escalated teardown,
-backgrounded container step, the all-mounts content-aware credential
-scan, upfront `gh` preconditions, and PID-derived scratch dir/port
-defaults) and confirms none of it regressed the acceptance — note the
-listen port (`8650`) is the PID-derived default described above in
-action, not a fixed value; a different invocation will show a different
-port.
+It also prints a security-log excerpt. Expect one or more `proxied request`
+records and `token_minted` events. No JWT, GitHub installation token, or private
+key should appear in the output.
 
-### Reading the credential lifecycle out of this log
+## Credential-isolation checks
 
-- **mint**: the two `event=token_minted` lines are `GitHubAppSource.mint`
-  (`internal/upstream/githubapp.go`) actually calling
-  `POST /app/installations/146047506/access_tokens` against the real
-  GitHub API — once for the clone's `read` scope, once for the push's
-  `write` scope — each scoped to exactly `rxbynerd/haybale-e2e` and
-  nothing else (see `docs/security.md`'s "Least-privilege GitHub App
-  token minting"). The minted `ghs_…` token itself never appears in this
-  log, by construction — `mint`'s own doc comment is explicit that it's
-  never included in the event or in any error.
-- **cache**: three `verb=read` "proxied request" lines follow the single
-  `read` mint — `GET info/refs?service=git-upload-pack`, then the pack
-  negotiation round-trip(s) `git`'s protocol v2 makes for a clone — but
-  only **one** mint. The second and third read requests reused the
-  cached token (`internal/upstream/tokencache.go`) rather than minting
-  again; the same pattern repeats for the two `verb=write` requests (the
-  push handshake's `GET info/refs?service=git-receive-pack` — itself
-  classified `write`, see `docs/security.md` — and the `POST
-  git-receive-pack` that follows) sharing the single `write` mint.
-- **inject**: every "proxied request" line reports `status=200` — the
-  real GitHub upstream accepted the credential haybale injected on each
-  request's egress hop (`internal/proxy/proxy.go`'s `rewrite`). Had
-  injection failed or the upstream rejected the credential, this would
-  instead be a `502` via an `upstream_auth_failed` security event (see
-  `docs/security.md`), never a `401` reaching back to the container.
+The container verifies that:
 
-This same run's independent `gh api` check (bypassing haybale entirely,
-using the operator's own `gh` credentials) confirmed
-`e58acb2b58e7d87274d50ff63f22ddcd2eaf0486` — the exact SHA the container
-reported pushing — as `HEAD` of `rxbynerd/haybale-e2e`'s `main` branch,
-closing the loop: the commit that left the credential-less container
-really did land on the real, private GitHub repository, having never
-carried a GitHub credential of its own at any point.
+- `.netrc` and `.git-credentials` do not exist;
+- no newly created or modified file contains a known GitHub token prefix or PEM
+  private-key header; and
+- no environment value contains those upstream credential patterns.
+
+The run JWT is intentionally present as `HAYBALE_TOKEN`. It authenticates only
+to haybale and is limited by the generated policy. The check is specifically
+for credentials that work directly against GitHub.
+
+## Container-to-host networking
+
+The script uses `host.containers.internal` so the container can reach the
+haybale listener on the host. Podman and Docker Desktop commonly provide this
+name. If it does not resolve in your Docker installation, configure a host
+mapping supported by that runtime, for example:
+
+```sh
+docker run --add-host host.containers.internal:host-gateway ...
+```
+
+The test listener uses plain HTTP because the container and local haybale
+process communicate only across the developer machine's container bridge. This
+does not relax the TLS guidance for deployed environments.
+
+## Troubleshooting
+
+- **haybale rejects the key permissions:** run `chmod 600` on the App key and
+  verify that the mounted or resolved file preserves that mode.
+- **installation lookup returns 404:** confirm the App is installed on the exact
+  owner/repository named by `HAYBALE_E2E_REPO`.
+- **token mint returns 403 or 422:** confirm the App has Contents read/write and
+  that `HAYBALE_APP_ID` matches the private key.
+- **container cannot reach haybale:** verify the runtime's host-gateway DNS name
+  and set `HAYBALE_E2E_PORT` to an available port.
+- **independent confirmation fails:** run `gh auth status` and verify the active
+  account can read the private repository.
+
+Because the test pushes a real commit, inspect or reset the scratch repository
+after testing according to your retention policy.

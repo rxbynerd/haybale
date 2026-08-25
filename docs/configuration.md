@@ -3,19 +3,18 @@
 haybale is configured by a single YAML file, plus a small number of
 `haybale serve` flags that override specific fields in it:
 
-```
+```console
 haybale serve --config haybale.yaml
 ```
 
 `--config` defaults to `haybale.yaml` in the current directory. The file is
 loaded once, at startup: `haybale serve` fails fast (refuses to start,
-exit code 1) if the config — including the identity and policy files it
-points at — is missing, malformed, or otherwise invalid, rather than
+exit code 1) if the config or a required policy, key, certificate, or JWKS file
+is missing, malformed, or otherwise invalid, rather than
 starting up and failing unpredictably on the first request.
 
-This document describes every field haybale's config package
-(`internal/config`) actually parses and validates. If a field isn't
-listed here, haybale doesn't read it.
+This document describes every supported configuration field. Unknown fields
+are not part of haybale's configuration contract and should not be used.
 
 ## Top-level fields
 
@@ -39,7 +38,8 @@ telemetry: { ... }         # optional, OpenTelemetry export, see "Telemetry" bel
 `logLevel` controls the `log/slog` level haybale logs at. Every log line
 — including request logs and security events — passes through a
 scrubbing handler that redacts token/credential material before it
-reaches the log sink, regardless of level (see `docs/security.md`).
+reaches the log sink, regardless of level (see the [security
+model](security.md#logging)).
 
 ## Flags that override config
 
@@ -76,17 +76,15 @@ is missing, unreadable, or the pair doesn't match. It then serves HTTPS
 (`http.Server.ListenAndServeTLS`) with `tls.Config.MinVersion` pinned to
 TLS 1.2.
 
-`keyPath` must not be group- or world-readable: Validate() also stats
-the key file and fails startup if its mode has any group or other
-permission bit set (CWE-732). `chmod 600` (owner read/write only) before
-pointing `keyPath` at it.
+`keyPath` must not have any group or other permission bit set. Use
+`chmod 600` (owner read/write only) before pointing `keyPath` at it.
 
 TLS (or its absence) never changes the server's read/write timeout
 behaviour: haybale sets `ReadHeaderTimeout: 10s` (bounding only how long
 the server waits to read a request's headers) and deliberately no
 read/write/idle timeout at all, with or without TLS — pack transfers can
-run to gigabytes and take arbitrarily long. See `docs/security.md` for
-when plain HTTP is (and isn't) an acceptable choice.
+run to gigabytes and take arbitrarily long. See the [security
+model](security.md#tls) for when plain HTTP is acceptable.
 
 ## Graceful drain
 
@@ -134,9 +132,9 @@ telemetry:
 
 The `telemetry` block turns on OpenTelemetry export of traces, metrics, and
 logs to an OTLP collector. It is entirely optional: **leaving it out (or
-leaving `endpoint` empty) disables telemetry**, and haybale runs exactly as
-it did before — the metric instruments become no-ops, no OTLP connection is
-dialled, and per-request logging stays stderr-only. What the enabled
+leaving `endpoint` empty) disables telemetry**: metric instruments become
+no-ops, no OTLP connection is dialled, and per-request logging stays
+stderr-only. What the enabled
 pipeline emits is described in [`observability.md`](observability.md).
 
 | Field              | Default   | Notes                                                                                   |
@@ -197,10 +195,10 @@ transfer timeout.
 
 haybale authenticates a caller by verifying a **JSON Web Token (JWT)**
 the control plane issued to it, against the issuer's public keys. haybale
-mints nothing and holds no secrets of its own — it is a pure verifier
-trusting one or more issuers' JWKS. See `docs/jwt-identity.md` for the
-exact token contract a control plane must implement, and
-`docs/github-actions.md` for the GitHub Actions OIDC recipe.
+mints no identity tokens and holds no identity signing key — it is a pure
+verifier trusting one or more issuers' JWKS. See the [JWT identity
+contract](jwt-identity.md) for issuer requirements and the [GitHub Actions
+OIDC recipe](github-actions.md) for that integration.
 
 ```yaml
 identity:
@@ -273,7 +271,8 @@ your audience, for **any** workflow on github.com. The signature proves
 only that GitHub issued it, not that *you* trust the repo it came from.
 `claimBindings` are what pin an issuer to the callers you intend — e.g.
 `repository_owner: rxbynerd` and `runner_environment: github-hosted`.
-Never configure a github.com issuer without them. See `docs/security.md`.
+Never configure the public GitHub Actions issuer without them. See [Claim
+bindings](security.md#claim-bindings).
 
 ### `repoScopeClaim` — per-token narrowing
 
@@ -294,11 +293,9 @@ honoring the endpoint's `Cache-Control` and refetching on an unseen `kid`
 the last successfully fetched key set and logs each failure at `warn`
 (`jwks background refresh failed`) — availability over strict freshness.
 
-A per-issuer `staleIfErrorFor` bound (fail closed once keys have been
-un-refreshable for N) and the optional `discoveryCheck` startup self-check
-are **planned but not yet implemented**; see the "Known limitation" note
-in `docs/security.md`. Until then, alert on the `jwks background refresh
-failed` warning if you need to react to a stale-trust-material condition.
+There is no maximum stale-key duration and no OIDC discovery self-check. Alert
+on `jwks background refresh failed` and see [JWKS
+handling](security.md#jwks-handling) for the resulting trust tradeoff.
 
 ## Policy
 
@@ -313,12 +310,12 @@ evaluated against every authenticated request:
 ```yaml
 # policy.yaml
 rules:
-  - identities: ["run-*"]
-    repos: ["github.com/acme/*"]
-    permissions: [read, write]
   - identities: ["run-readonly-*"]
     repos: ["github.com/acme/public-docs"]
     permissions: [read]
+  - identities: ["run-writer-*"]
+    repos: ["github.com/acme/*"]
+    permissions: [read, write]
 ```
 
 - `identities`: glob patterns (Go's `path.Match` syntax) matched against
@@ -347,21 +344,22 @@ itself is rejected before any data is exchanged.
 
 Every denial — whether no rule matched at all, or a rule matched but
 didn't grant the requested verb — maps to the same `404 Not Found` a
-genuinely nonexistent repo would produce. See `docs/security.md` for why.
+genuinely nonexistent repo would produce. See [Authorization and repository
+privacy](security.md#authorization-and-repository-privacy).
 
 Use `haybale policy check` to dry-run a decision without making a real
 request:
 
-```
+```console
 haybale policy check --config haybale.yaml \
   --id run-9f2c1a --repo github.com/acme/widgets --verb read
 ```
 
-This loads `--config` the same way `haybale serve` does (so it's
-checking the exact policy engine that would actually be running) and
-prints `ALLOW`/`DENY`, the matched rule (or `none (default deny)`), and
-the reason. It makes no network call and never touches an upstream
-credential.
+This loads and validates the full `--config` the same way `haybale serve` does,
+then prints `ALLOW`/`DENY`, the matched rule (or `none (default deny)`), and the
+reason. Upstream secret environment variables and private-key files must
+therefore be available for validation. The command does not fetch JWKS data,
+contact an upstream, or mint a credential.
 
 ## Upstreams
 
@@ -408,10 +406,8 @@ client presented to haybale, which is discarded immediately after
   in particular — ignore the Basic-auth username and check only the
   password, so the default works well for authenticating with just a
   token there. `git-http-backend` itself performs no HTTP authentication
-  at all; whether an internal `git-http-backend` deployment also ignores
-  the username depends entirely on whatever fronts it and actually
-  checks the credential (see `internal/e2e/upstream_test.go`'s fake
-  upstream, which checks both).
+  at all; whether an internal `git-http-backend` deployment ignores the
+  username depends on the authentication service in front of it.
 - `tokenEnv` (required): the name of an environment variable haybale
   reads the secret from, at startup. **The token must never be written
   inline in the YAML file** — a `token:` field set directly in the
@@ -427,9 +423,8 @@ per-request and scoped to the minimum needed:
 - `privateKeyPath` (required): path to the App's PEM-encoded RSA private
   key. Read and parsed once, at startup — a missing file or one that
   isn't a valid RSA key fails startup immediately. The file must not be
-  group- or world-readable either (same CWE-732 check `tls.keyPath`
-  gets, and for the same reason): `chmod 600` it before pointing
-  `privateKeyPath` at it.
+  have any group or other permission bit set: use `chmod 600` before
+  pointing `privateKeyPath` at it.
 - `apiBaseURL` (optional, default `https://api.github.com`): override for
   a GitHub Enterprise Server instance, e.g. `https://ghe.example.com/api/v3`.
 
