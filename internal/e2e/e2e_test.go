@@ -1,15 +1,7 @@
-// Package e2e is haybale's crown-jewel integration harness: it exercises
-// a real `git clone` subprocess against an in-process haybale proxy that
-// forwards to a real `git http-backend` CGI upstream — no mocked git
-// protocol, no stubbed proxy behaviour, and (since M2) the real
-// identity.JWTAuthenticator and policy.GlobEngine wired in ahead
-// of the passthrough, not test stubs — a per-test file-backed JWKS and a
-// freshly-minted ES256 token stand in for a control plane (see
-// mintTestToken). Since M3, the fake upstream
-// (upstream_test.go's newUpstream) also genuinely requires Basic auth,
-// with a real upstream.StaticSource configured to satisfy it — see
-// credential_test.go for the upstream-credential acceptance and negative
-// cases that landed alongside that requirement.
+// Package e2e exercises real Git subprocesses against an in-process haybale
+// proxy and a git-http-backend CGI upstream. Tests use JWTAuthenticator,
+// GlobEngine, a per-test file-backed JWKS, and a Basic-auth-protected upstream
+// rather than protocol, authentication, or authorization stubs.
 package e2e
 
 import (
@@ -35,10 +27,9 @@ const (
 	repoName = "widgets"
 )
 
-// TestCloneThroughProxy is the real-git acceptance test for M1: a bare
-// repo with one commit is served by a real git-http-backend CGI process;
-// haybale proxies to it; a real `git clone` subprocess goes through
-// haybale using the host-in-path URL scheme. The test asserts the clone
+// TestCloneThroughProxy serves a one-commit bare repository through a real
+// git-http-backend CGI process. A real `git clone` subprocess reaches it
+// through haybale's host-in-path URL scheme. The test asserts the clone
 // succeeds with the exact upstream commit SHA, and that the Git-Protocol
 // header reached the upstream unmodified (dropping it would silently
 // downgrade protocol v2 to v1).
@@ -87,14 +78,8 @@ func TestCloneThroughProxy(t *testing.T) {
 	}
 }
 
-// TestPushThroughProxy is the real-git write-path acceptance test for
-// M1, mirroring TestCloneThroughProxy's harness but exercising
-// git-receive-pack (git push) instead of git-upload-pack (git clone).
-// Until this test, the write path had no real-git regression coverage in
-// this harness — only clone did — despite being the path M2's policy
-// gate and M3's credential injection change first and most
-// consequentially. The test asserts the push succeeds and the upstream
-// bare repo's HEAD SHA now matches the pushed commit.
+// TestPushThroughProxy exercises git-receive-pack with a real Git
+// subprocess and confirms the upstream bare repository receives the commit.
 func TestPushThroughProxy(t *testing.T) {
 	gitPath, httpBackendPath := requireGit(t)
 

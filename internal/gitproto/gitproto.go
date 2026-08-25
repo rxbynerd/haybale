@@ -14,9 +14,8 @@
 // does not match one of the three shapes above — in particular the dumb
 // protocol (raw object/ref fetches) and any attempt at path traversal.
 //
-// This package is intentionally dependency-free (stdlib only): it is the
-// security-load-bearing seam that M2's policy engine and M3's credential
-// injection build on, so its behaviour must stay easy to audit.
+// The package is dependency-free so its security-sensitive request
+// classification remains easy to audit.
 package gitproto
 
 import (

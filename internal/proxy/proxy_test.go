@@ -107,11 +107,7 @@ func mustNewWithCredentials(t *testing.T, upstreams map[string]*url.URL, credent
 	return p
 }
 
-// testIdentityID is the Identity every allowAllAuthenticator call
-// returns, so tests that don't care about identity/policy semantics
-// (most of the tests in this file, which predate M2 and exercise the
-// passthrough path) can assert on a stable, known identity where
-// relevant.
+// testIdentityID is the stable Identity returned by allowAllAuthenticator.
 const testIdentityID = "test-identity"
 
 // allowAllAuthenticator authenticates any request as testIdentityID
@@ -222,13 +218,8 @@ func TestInvalidRequestMaps404(t *testing.T) {
 	}
 }
 
-// TestUpstreamUnreachableMaps502 pins the current (unasserted-until-now)
-// baseline for what happens when a request's host resolves to a
-// configured upstream, but the upstream itself is unreachable (dial
-// failure). httputil.ReverseProxy's default ErrorHandler maps this to a
-// 502 today; this is the seam M3 tightens (upstream 401/403 -> 502,
-// WWW-Authenticate stripped) per the plan's security invariants, so it
-// needs a pinned baseline before that logic lands on top.
+// TestUpstreamUnreachableMaps502 confirms ReverseProxy maps an upstream dial
+// failure to 502.
 func TestUpstreamUnreachableMaps502(t *testing.T) {
 	// Stand up a server and close it immediately: its URL is well-formed
 	// but nothing is listening, so any request against it fails to dial
@@ -374,10 +365,7 @@ func TestForwardsToUpstreamStrippingHostSegment(t *testing.T) {
 // posture documented on rewrite(): haybale must never inject client
 // IP/host/proto upstream. A client-supplied X-Forwarded-For (or
 // X-Forwarded-Host/X-Forwarded-Proto) must not reach the upstream —
-// neither the client's original value nor a haybale-originated
-// replacement. This guards against a future refactor "fixing" the
-// absence of pr.SetXForwarded() the way the original R9 finding
-// suggested, which would leak client IP/host/proto to the upstream.
+// neither the client's original value nor a haybale-originated replacement.
 func TestClientXForwardedHeadersAreSuppressed(t *testing.T) {
 	up := &recordingUpstream{}
 	upstreamSrv := httptest.NewServer(up.handler())
@@ -413,19 +401,15 @@ func TestClientXForwardedHeadersAreSuppressed(t *testing.T) {
 	}
 }
 
-// TestInboundAuthorizationHeaderIsReplacedByInjectedCredential exercises
-// B-1 (M2) and its M3 continuation: the client's inbound Authorization
-// header — the haybale auth token Authenticate just checked, whether
+// TestInboundAuthorizationHeaderIsReplacedByInjectedCredential confirms the
+// client's inbound Authorization header — whether
 // presented as HTTP Basic or as an `Authorization: Bearer <token>`
 // header — must never reach the upstream. httputil.ReverseProxy only
 // strips the RFC hop-by-hop header set by default, and Authorization is
 // end-to-end, not hop-by-hop, so without an explicit strip it clones
 // straight through, letting anything with visibility into the upstream
-// leg replay the haybale credential directly against haybale itself. As
-// of M3 the header isn't merely absent afterwards — rewrite() replaces
-// it with the credential the configured CredentialSource returned, so
-// this test also pins that the upstream sees exactly that injected
-// value and nothing derived from the client's own token.
+// leg replay the haybale credential directly against haybale itself.
+// rewrite replaces it with the configured upstream credential.
 func TestInboundAuthorizationHeaderIsReplacedByInjectedCredential(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -727,9 +711,8 @@ func TestProxiedRequestLogsRepoVerbStatus(t *testing.T) {
 	}
 }
 
-// TestAuthenticationFailureMaps401 exercises the M2 authn gate: a
-// request whose Authenticate call fails must get a 401 with a
-// WWW-Authenticate challenge, so a git client knows to (re)prompt for
+// TestAuthenticationFailureMaps401 confirms a failed authentication gets a
+// 401 with a WWW-Authenticate challenge, so a Git client knows to prompt for
 // credentials rather than treating the response as a generic error.
 func TestAuthenticationFailureMaps401(t *testing.T) {
 	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"}), denyAllAuthenticator{}, allowAllPolicy{}, discardLogger())
@@ -792,8 +775,8 @@ func TestAuthenticationFailureIsLogged(t *testing.T) {
 	}
 }
 
-// TestPolicyDenialMaps404 exercises the M2 authz gate: an authenticated
-// request Authorize denies must get a 404 — never a 403, which would let
+// TestPolicyDenialMaps404 confirms an authorization denial gets a 404 —
+// never a 403, which would let
 // a caller distinguish "exists but denied" from "does not exist".
 func TestPolicyDenialMaps404(t *testing.T) {
 	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"}), allowAllAuthenticator{}, denyAllPolicy{}, discardLogger())
@@ -888,8 +871,8 @@ func TestPolicyDenialIsLogged(t *testing.T) {
 	}
 }
 
-// TestPolicyDenialResponseMatchesUnknownHost404 pins the core M2
-// security invariant: a policy-denied request must produce a response
+// TestPolicyDenialResponseMatchesUnknownHost404 confirms a policy-denied
+// request produces a response
 // byte-identical (status, body, and the headers http.NotFound sets) to
 // an unknown-host 404. Both branches call the exact same http.NotFound
 // helper with nothing written to the ResponseWriter beforehand, so a
@@ -990,8 +973,8 @@ func TestPolicyDenialNeverReachesUpstream(t *testing.T) {
 	}
 }
 
-// TestNewRejectsNilAuthenticator exercises H-2: New must fail at
-// construction time when handed a nil Authenticator, rather than
+// TestNewRejectsNilAuthenticator confirms New fails at construction when
+// handed a nil Authenticator, rather than
 // succeeding and panicking on the first non-/healthz request that
 // reaches it.
 func TestNewRejectsNilAuthenticator(t *testing.T) {
@@ -1008,9 +991,8 @@ func TestNewRejectsNilAuthenticator(t *testing.T) {
 	}
 }
 
-// TestNewRejectsNilPolicyEngine mirrors TestNewRejectsNilAuthenticator
-// for the other required dependency New's H-2 fix guards: a nil
-// policy.Engine must also fail at construction time.
+// TestNewRejectsNilPolicyEngine confirms a nil policy.Engine fails at
+// construction.
 func TestNewRejectsNilPolicyEngine(t *testing.T) {
 	upstreams := newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"})
 	p, err := New(upstreams, credentialsForHosts(upstreams), allowAllAuthenticator{}, nil, discardLogger(), observability.NewNoopMetrics())
@@ -1025,9 +1007,8 @@ func TestNewRejectsNilPolicyEngine(t *testing.T) {
 	}
 }
 
-// TestCredentialSourceErrorMaps502 exercises the M3 invariant that a
-// CredentialSource.Credentials error — e.g. M4's mint failure, or a
-// misconfigured static token — must surface as a 502, never a 401: the
+// TestCredentialSourceErrorMaps502 confirms a CredentialSource error
+// surfaces as a 502, never a 401: the
 // client has no upstream credential of its own to supply, so a 401
 // would just make git hang on (or fail) a credential prompt it cannot
 // answer.
@@ -1131,9 +1112,8 @@ func respondingUpstreamHandler(status int, setWWWAuthenticate bool) http.Handler
 	}
 }
 
-// TestPostInjectionUpstream401Maps502AndStripsWWWAuthenticate exercises
-// the core M3 response-mapping invariant: rewrite() always injects a
-// credential before every proxied request reaches upstream, so a 401
+// TestPostInjectionUpstream401Maps502AndStripsWWWAuthenticate confirms rewrite
+// injects a credential before every proxied request reaches upstream, so a 401
 // arriving back means the upstream rejected haybale's own injected
 // credential — not something the client did. That must never surface to
 // the client as an ordinary 401 (which would make git re-prompt for a
@@ -1168,8 +1148,8 @@ func TestPostInjectionUpstream401Maps502AndStripsWWWAuthenticate(t *testing.T) {
 	}
 }
 
-// TestPostInjectionUpstream401StripsAllUpstreamHeaders exercises the H1
-// hardening: modifyResponse must not merely delete WWW-Authenticate from
+// TestPostInjectionUpstream401StripsAllUpstreamHeaders confirms
+// modifyResponse does not merely delete WWW-Authenticate from
 // the upstream's 401 response, it must reset the client-visible headers
 // to a minimal known-safe set. A compromised, misconfigured, or
 // lookalike upstream could set Set-Cookie or any other header on its
@@ -1211,9 +1191,9 @@ func TestPostInjectionUpstream401StripsAllUpstreamHeaders(t *testing.T) {
 	}
 }
 
-// TestPostInjectionUpstream401DrainsBodyForConnectionReuse exercises the
-// other half of H1: the discarded upstream 401 body must be drained to
-// EOF before its reader is closed, so the proxy's Transport can return
+// TestPostInjectionUpstream401DrainsBodyForConnectionReuse confirms the
+// discarded upstream 401 body is drained to EOF before its reader is closed,
+// so the proxy's Transport can return
 // the proxy->upstream connection to its keep-alive pool. net/http's
 // Transport treats a response body that is closed before being read to
 // completion as unreusable and redials on the next request — a bad or

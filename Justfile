@@ -22,19 +22,15 @@ image-build:
 test:
     go test ./...
 
-# Race-detector pass over the full module. haybale is small enough
-# (single module, no goroutine-heavy subsystems yet beyond the proxy and
-# e2e harness) that sweeping ./... under -race is cheap — unlike
-# Stirrup's targeted package list, there's no need to scope this down.
+# Race-detector pass over the full module.
 test-race:
     go test -race ./...
 
 lint:
     golangci-lint run ./...
 
-# e2e-github runs the M6 acceptance: a credential-less container clones
-# and pushes a real private GitHub repo through a locally-running
-# haybale, using a real GitHub App — see
+# Runs the live GitHub App acceptance: a credential-less container clones
+# and pushes a private repository through a local haybale. See
 # docs/runbook-github-acceptance.md and scripts/e2e-github.sh for the
 # full detail. Requires HAYBALE_APP_KEY_PATH (path to the GitHub App's
 # PEM private key) in the environment. Uses {{container}} (docker or

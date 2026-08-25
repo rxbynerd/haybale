@@ -107,8 +107,8 @@ func TestParsePolicyCheckVerb(t *testing.T) {
 	}
 }
 
-// writePolicyCheckTestConfig writes a minimal but complete haybale.yaml
-// (plus the identities.yaml/policy.yaml it references) under t.TempDir(),
+// writePolicyCheckTestConfig writes a complete haybale.yaml and referenced
+// JWKS and policy files under t.TempDir(),
 // with policyRulesYAML spliced in as policy.yaml's "rules:" body, and
 // returns the haybale.yaml path. Sets a throwaway tokenEnv value via
 // t.Setenv so the "static" upstream credential block validates.

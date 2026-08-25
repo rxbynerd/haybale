@@ -1,11 +1,6 @@
-// Package observability wires haybale's OpenTelemetry pipeline: traces,
-// metrics, and logs exported over OTLP to a collector. It is the haybale
-// counterpart of Stirrup's harness/internal/observability package and
-// follows the same conventions (one shared Resource across all three
-// signals, OTLP over gRPC or HTTP/protobuf, env-var fallbacks for
-// low-cardinality resource labels), adapted for a long-lived server rather
-// than a per-run CLI: Setup runs once at startup and Providers.Shutdown
-// runs once during graceful drain.
+// Package observability wires haybale's OpenTelemetry traces, metrics, and
+// logs to an OTLP collector. All three signals share one Resource. Setup runs
+// once at startup and Providers.Shutdown runs during graceful drain.
 //
 // Everything here degrades to a no-op when telemetry is not configured (an
 // empty Config.Endpoint): the metric instruments fall back to
@@ -34,9 +29,8 @@ const ServiceName = "haybale"
 // DefaultServiceNamespace is emitted as service.namespace when no
 // operator-supplied or env-var value is available. It matches ServiceName
 // so a default deployment still groups under a sensible namespace label
-// rather than leaving the attribute unset (which makes a backend's
-// group-by quietly drop rows). Mirrors Stirrup's DefaultServiceNamespace
-// = "stirrup" so both Equestrianism services follow the same convention.
+// rather than leaving the attribute unset, which can exclude the process
+// from backend groupings.
 const DefaultServiceNamespace = "haybale"
 
 // DefaultEnvironment is emitted as deployment.environment when no
@@ -50,8 +44,6 @@ const DefaultEnvironment = "local"
 // when a Config value is empty. These are haybale-specific env vars — they
 // are not part of the OTel SDK specification — and share the OTEL_ prefix
 // for discoverability alongside the SDK's own OTEL_RESOURCE_ATTRIBUTES.
-// They match the names Stirrup reads so a fleet running both services can
-// set one pair of env vars.
 const (
 	envEnvironment      = "OTEL_DEPLOYMENT_ENVIRONMENT"
 	envServiceNamespace = "OTEL_SERVICE_NAMESPACE"
@@ -62,7 +54,7 @@ const (
 // OTEL_DEPLOYMENT_ENVIRONMENT (an embedded newline, > 64 bytes, an `=`
 // that would corrupt OTEL_RESOURCE_ATTRIBUTES-style parsing downstream)
 // would propagate verbatim onto every exported span, metric, and log
-// batch. Mirrors Stirrup's observabilityLabelPattern.
+// batch.
 var labelPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
 var (
@@ -126,12 +118,8 @@ type ResourceOptions struct {
 // haybale attributes is returned, which still fixes the
 // "unknown_service:haybale" default that is the user-visible problem.
 //
-// The deployment-environment key is the legacy stable "deployment.environment"
-// rather than semconv v1.34.0's newer "deployment.environment.name": the
-// legacy key is what existing Grafana dashboards and collector processors
-// look for, so emitting the .name suffix would silently break operator
-// dashboards. This mirrors the identical decision documented in Stirrup's
-// BuildResource.
+// deployment.environment is retained as a compatibility contract for
+// dashboards and collector processors that consume haybale telemetry.
 func BuildResource(opts ResourceOptions) *resource.Resource {
 	env := sanitiseLabel(firstNonEmpty(opts.Environment, os.Getenv(envEnvironment)), DefaultEnvironment)
 	ns := sanitiseLabel(firstNonEmpty(opts.ServiceNamespace, os.Getenv(envServiceNamespace)), DefaultServiceNamespace)
@@ -146,9 +134,6 @@ func BuildResource(opts ResourceOptions) *resource.Resource {
 		semconv.ServiceVersion(version),
 		semconv.ServiceInstanceID(InstanceID()),
 		semconv.ServiceNamespace(ns),
-		// See the doc comment above for why this is the legacy
-		// "deployment.environment" key rather than semconv's newer
-		// DeploymentEnvironmentName.
 		attribute.String("deployment.environment", env),
 	}
 

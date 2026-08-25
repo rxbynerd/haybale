@@ -29,11 +29,8 @@ const (
 	// credential of its own to supply, so re-prompting it would only
 	// hang the client.
 	EventUpstreamAuthFailed = "upstream_auth_failed"
-	// EventTokenMinted is emitted by a CredentialSource that actively
-	// mints a short-lived credential (GitHubAppSource, M4) each time it
-	// does so, for an audit trail of "when" without ever including the
-	// minted token itself. StaticSource (M3) never mints — it returns a
-	// fixed credential — so it never emits this event.
+	// EventTokenMinted is emitted when a CredentialSource mints a
+	// short-lived credential. The event never includes the token itself.
 	EventTokenMinted = "token_minted"
 )
 

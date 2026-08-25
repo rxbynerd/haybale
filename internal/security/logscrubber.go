@@ -5,18 +5,13 @@ import "regexp"
 // redactedPlaceholder replaces every matched secret span in Scrub.
 const redactedPlaceholder = "[REDACTED]"
 
-// namedPattern pairs a regexp with a stable name, mirroring Stirrup's
-// harness/internal/security/logscrubber.go shape (name kept for
-// documentation/test clarity even though, unlike Stirrup, haybale has no
-// SecurityNotifier to report per-pattern redaction stats to).
+// namedPattern pairs a regexp with a stable name for tests and diagnostics.
 type namedPattern struct {
 	name string
 	re   *regexp.Regexp
 }
 
-// secretPatterns is the closed set of shapes Scrub redacts. Ported from
-// Stirrup's harness/internal/security/logscrubber.go, trimmed to the
-// credential shapes relevant to a git smart-HTTP proxy:
+// secretPatterns is the closed set of credential shapes Scrub redacts:
 //
 //   - HTTP auth headers (Basic/Bearer) — exactly the header
 //     internal/proxy strips from the inbound request and injects on the
@@ -27,20 +22,12 @@ type namedPattern struct {
 //     URLs commonly carry a token this way
 //     (https://x-access-token:ghs_xxx@host/owner/repo.git), and neither
 //     the Basic nor Bearer pattern above matches that shape.
-//   - a compact JWT (eyJ-prefixed, three dot-joined base64url segments) —
-//     what a caller now presents as its haybale credential. The identity
-//     layer only ever logs a token's verified claims, never the compact
-//     token, so this catches a raw token that reaches a log through a bug
-//     or a dependency's error string.
+//   - a compact JWT (eyJ-prefixed, three dot-joined base64url segments).
 //   - GitHub's own token prefixes (ghp_/gho_/ghu_/ghs_/ghr_ and the
 //     github_pat_ fine-grained PAT shape) — what a real personal access
 //     token, OAuth token, user-to-server token, GitHub App installation
-//     token (ghs_, what M4's GitHubAppSource mints), or refresh token
-//     looks like, in case one is ever echoed into an error string from a
-//     dependency this package doesn't control.
-//   - a PEM private key block — M4's github-app credential type carries
-//     a privateKeyPath; if that key's contents were ever passed to a log
-//     call by mistake, this is the last line of defense.
+//     token (ghs_), or refresh token looks like.
+//   - a PEM private key block.
 //
 // This list is intentionally small and specific rather than a permissive
 // high-entropy-string catch-all: haybale's own logging call sites are
@@ -57,13 +44,8 @@ var secretPatterns = []namedPattern{
 	{"bearer_token_header", regexp.MustCompile(`(?i)Bearer\s+[A-Za-z0-9._~+/=-]+`)},
 	// A compact JWT — three base64url segments joined by dots, with the
 	// leading segment always starting "eyJ" (the base64url of `{"`, the
-	// start of every JOSE header). This is what a caller now presents as
-	// its haybale credential, so a bug that ever logged the raw token
-	// (rather than only the verified claims the identity layer emits)
-	// would leak it; this is the defense-in-depth backstop. Placed after
-	// basic_auth_header/bearer_token_header so a JWT carried inside one of
-	// those headers is caught by the header pattern first, and this
-	// catches a bare token that reached a log some other way.
+	// start of every JOSE header). It follows the auth-header patterns so
+	// they redact a wrapped JWT first, while this catches a bare token.
 	{"jwt_compact", regexp.MustCompile(`\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+`)},
 	// Covers every current GitHub token-prefix shape (classic PAT ghp_,
 	// OAuth gho_, user-to-server ghu_, App installation ghs_, refresh

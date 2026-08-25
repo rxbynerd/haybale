@@ -43,8 +43,9 @@ const (
 	OutcomeAuthnFailed = "authn_failed"
 	// OutcomePolicyDenied — the policy Engine denied the request: 404.
 	OutcomePolicyDenied = "policy_denied"
-	// OutcomeUpstreamAuthFailed — no upstream credential could be presented
-	// (mint error, or the upstream rejected the injected credential): 502.
+	// OutcomeUpstreamAuthFailed — no upstream credential could be acquired
+	// before forwarding (for example, a mint error): 502. An upstream
+	// rejection after forwarding is OutcomeProxied with status 502.
 	OutcomeUpstreamAuthFailed = "upstream_auth_failed"
 )
 
@@ -116,8 +117,7 @@ func NewNoopMetrics() *Metrics {
 // NewTestMetrics builds a Metrics backed by an in-memory ManualReader,
 // returning both so a test in any package can drive the record methods and
 // then Collect and assert the emitted data points without standing up an
-// OTLP collector. Mirrors Stirrup's NewOTelTraceEmitterForTest. Not for
-// production use — production builds go through Setup.
+// OTLP collector. Production builds go through Setup.
 func NewTestMetrics() (*Metrics, *sdkmetric.ManualReader) {
 	reader := sdkmetric.NewManualReader()
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))

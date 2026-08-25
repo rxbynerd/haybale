@@ -17,8 +17,8 @@ import (
 // golang-jwt jwt.Keyfunc that maps a token's `kid` header to the public
 // key that must have signed it. Each issuer has its own keySource, so a
 // token is only ever verified against the keys of the issuer its
-// (unverified) `iss` claim selected — never "try every issuer's keys",
-// which is what closes the cross-issuer key-confusion attack (D2).
+// (unverified) `iss` claim selected — never "try every issuer's keys" —
+// preventing cross-issuer key confusion.
 //
 // keyfunc.Keyfunc (both the URL- and file-backed implementations) already
 // satisfies exactly what JWTAuthenticator needs, so keySource is a thin

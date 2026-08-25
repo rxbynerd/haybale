@@ -1550,11 +1550,8 @@ func mustParseDuration(t *testing.T, s string) time.Duration {
 func TestLoadRejectsInvalidConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "haybale.yaml")
-	// No upstreams: Validate() must fail, and Load() must surface it.
-	// Also omits identity/policy blocks, but the missing-upstreams error
-	// is checked first in Validate() only because it's asserted here —
-	// the point of this test is that Load() propagates whatever error
-	// Validate() returns, not which specific error fires first.
+	// The fixture omits upstreams, identity, and policy. Validate checks
+	// upstreams first, and Load must surface that validation error.
 	if err := os.WriteFile(path, []byte("listen: \":8466\"\n"), 0o600); err != nil {
 		t.Fatalf("os.WriteFile: %v", err)
 	}
@@ -1610,11 +1607,9 @@ func TestStringListUnmarshalScalar(t *testing.T) {
 	}
 }
 
-// TestBuildAuthenticatorEnforcesClaimBindings closes the config->identity
-// translation gap: it builds a real authenticator via BuildAuthenticator
-// from a Config whose issuer sets claimBindings, then confirms the built
-// authenticator actually enforces them — a token missing the bound claim
-// is rejected, one carrying it is accepted. This verifies the
+// TestBuildAuthenticatorEnforcesClaimBindings builds an authenticator from
+// config and confirms it enforces translated claim bindings: a matching token
+// is accepted while a missing or mismatched claim is rejected. This verifies the
 // map[string]StringList -> map[string][]string copy in BuildAuthenticator,
 // not just the identity package's own binding logic.
 func TestBuildAuthenticatorEnforcesClaimBindings(t *testing.T) {

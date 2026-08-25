@@ -4,11 +4,6 @@
 // against the control plane's public keys (a JWKS URL) — so a request's
 // Identity is derived from the token's verified claims, never from the
 // raw credential, which is discarded immediately after it is checked.
-//
-// This package is a v0.2 extraction seam: the Authenticator interface is
-// deliberately narrow (context + request in, Identity out) so a future
-// SPIFFE/mTLS or Cedar-backed implementation can replace
-// JWTAuthenticator without touching internal/proxy.
 package identity
 
 import (
@@ -51,12 +46,7 @@ type Identity struct {
 // verify against a configured identity.
 //
 // Implementations must never log the raw credential they extract from r.
-// The comparison strategy is implementation-defined but must not leak a
-// credential's validity through the timing of secret-dependent branches:
-// a StaticTokenAuthenticator-style implementation would compare digests
-// in constant time, whereas JWTAuthenticator's asymmetric-signature
-// verification is not a secret comparison at all (the verifying key is
-// public), so no constant-time discipline applies to it.
+// Any secret comparisons must use an appropriate constant-time operation.
 type Authenticator interface {
 	Authenticate(ctx context.Context, r *http.Request) (*Identity, error)
 }

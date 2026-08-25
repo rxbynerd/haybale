@@ -11,10 +11,8 @@ import (
 // that guarantees a token or credential accidentally handed to a log
 // call anywhere in haybale is still redacted before it reaches any sink,
 // rather than relying solely on every call site getting that right.
-// Every haybale logger should be wrapped in a ScrubHandler (see
-// cmd/haybale/cmd/serve.go), exactly as Stirrup wraps its own harness
-// logger in harness/internal/observability.ScrubHandler — this is that
-// same pattern, trimmed to haybale's single-sink, no-OTel logging needs.
+// Every haybale logger should be wrapped in a ScrubHandler before records
+// fan out to stderr or OpenTelemetry.
 //
 // ScrubHandler never logs a full URL either: Scrub's url_userinfo
 // pattern redacts credentials embedded in a URL's userinfo component,

@@ -1,8 +1,5 @@
-// This file holds the M2 negative acceptance tests the plan calls out
-// explicitly: a bad or absent token must fail authentication (401), a
-// policy-denied repo must be indistinguishable from a genuinely
-// nonexistent one (the existence-oracle check), and a read-only
-// identity must be able to clone but never push.
+// These negative integration tests cover authentication failure, repository
+// privacy for policy denials, and read-only authorization.
 package e2e
 
 import (
@@ -210,8 +207,7 @@ func TestPolicyDeniedRepoResponseMatchesNonexistentRepo404(t *testing.T) {
 	}
 }
 
-// TestReadOnlyIdentityCanCloneButNotPush exercises the third M2
-// negative acceptance case: an identity whose policy rule grants only
+// TestReadOnlyIdentityCanCloneButNotPush gives an identity only
 // "read" can clone successfully, but a subsequent push is denied — as a
 // 404 (never a 403, and never distinguishable from a policy-denied or
 // nonexistent repo), and the upstream bare repo's HEAD must be

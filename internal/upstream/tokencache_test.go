@@ -135,9 +135,8 @@ func TestTokenCacheEarlyRefreshBoundary(t *testing.T) {
 	}
 }
 
-// TestTokenCacheWriteSatisfiesRead asserts a cached WRITE token also
-// satisfies a subsequent READ request for the same repo, with no new
-// mint — the cache-reduction rule the M4 plan calls out by name.
+// TestTokenCacheWriteSatisfiesRead confirms a cached write token satisfies a
+// subsequent read request for the same repo without another mint.
 func TestTokenCacheWriteSatisfiesRead(t *testing.T) {
 	clock := newFakeClock(time.Unix(0, 0))
 	cache := newTokenCache(clock.Now)
@@ -188,10 +187,8 @@ func TestTokenCacheReadDoesNotSatisfyWrite(t *testing.T) {
 	}
 }
 
-// TestTokenCacheSingleflightCollapsesConcurrentMints fires N concurrent
-// Get calls for the same (host, owner, repo, verb) and asserts exactly
-// one mint call happened — the rest waited and shared its result. Run
-// under `go test -race` per the M4 plan.
+// TestTokenCacheSingleflightCollapsesConcurrentMints fires concurrent Get
+// calls for the same key and confirms they share one mint result.
 func TestTokenCacheSingleflightCollapsesConcurrentMints(t *testing.T) {
 	clock := newFakeClock(time.Unix(0, 0))
 	cache := newTokenCache(clock.Now)
@@ -251,13 +248,11 @@ func TestTokenCacheSingleflightCollapsesConcurrentMints(t *testing.T) {
 	}
 }
 
-// TestTokenCacheFollowerHonorsOwnContextDeadline is B1(b): a singleflight
+// TestTokenCacheFollowerHonorsOwnContextDeadline confirms a singleflight
 // "follower" — a Get call for a key that already has a mint in flight —
 // must return its OWN ctx error as soon as its own deadline fires,
-// instead of blocking until the in-flight ("leader") mint completes.
-// Before the Group.Do -> Group.DoChan+select fix, Do's follower path has
-// no reference to the follower's ctx at all, so this test would hang
-// until release is closed, well past the follower's ~50ms deadline.
+// instead of blocking until the in-flight ("leader") mint completes. This
+// requires waiting on DoChan and the follower's context concurrently.
 func TestTokenCacheFollowerHonorsOwnContextDeadline(t *testing.T) {
 	clock := newFakeClock(time.Unix(0, 0))
 	cache := newTokenCache(clock.Now)
@@ -308,10 +303,8 @@ func TestTokenCacheFollowerHonorsOwnContextDeadline(t *testing.T) {
 	}
 }
 
-// TestTokenCacheSingleflightDoesNotCollapseDifferentKeys is H2: unlike
-// TestTokenCacheSingleflightCollapsesConcurrentMints (which proves
-// same-key collapse), this proves DIFFERENT (repo, verb) keys do NOT
-// collapse — concurrent Get calls across distinct repos and distinct
+// TestTokenCacheSingleflightDoesNotCollapseDifferentKeys confirms different
+// repo and verb keys do not collapse: concurrent calls across distinct
 // verbs for the same repo must each produce their own mint. verb is
 // deliberately folded into the singleflight key (see get's doc comment)
 // specifically so a concurrent read and write don't collapse into each

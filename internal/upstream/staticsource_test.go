@@ -45,7 +45,7 @@ func TestNewStaticSource(t *testing.T) {
 // TestStaticSourceCredentialsIsFixed asserts the core StaticSource
 // contract: the same configured username/password comes back regardless
 // of which repo or verb is asked about — there is no per-repo/per-verb
-// behaviour to a static credential, unlike GitHubAppSource (M4).
+// behaviour to a static credential, unlike GitHubAppSource.
 func TestStaticSourceCredentialsIsFixed(t *testing.T) {
 	src, err := NewStaticSource("x-access-token", "secret-token")
 	if err != nil {
