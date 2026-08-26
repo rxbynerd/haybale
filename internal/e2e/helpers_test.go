@@ -160,9 +160,8 @@ func credentialsForHost(t *testing.T, hostKey, username, password string) map[st
 	return map[string]upstream.CredentialSource{hostKey: newStaticCredentialSource(t, username, password)}
 }
 
-// syncBuffer is a mutex-guarded byte buffer safe for the concurrent
-// access pattern the M3 credential tests exercise: haybale's own
-// goroutine (serving the proxied request) writes its post-response log
+// syncBuffer is safe for the concurrent access created when haybale's request
+// goroutine writes its post-response log
 // line only after the client can already see the completed response —
 // an ordinary streaming-HTTP race, not a haybale bug — so a plain
 // bytes.Buffer trips `go test -race` here exactly as it does in

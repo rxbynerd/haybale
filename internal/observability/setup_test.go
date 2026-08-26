@@ -209,10 +209,8 @@ func TestConfigValidateCleartextHeaders(t *testing.T) {
 	}
 }
 
-// TestExporterBuildersRejectUnknownProtocol covers the default branch of
-// each per-signal builder directly — Setup's own Validate() now rejects a
-// bad protocol before these are reached, so they are exercised here to keep
-// that defensive branch alive.
+// TestExporterBuildersRejectUnknownProtocol covers each per-signal builder's
+// defensive default branch, which Setup validation normally makes unreachable.
 func TestExporterBuildersRejectUnknownProtocol(t *testing.T) {
 	t.Parallel()
 	cfg := Config{Endpoint: "localhost:1", Protocol: "bogus"}

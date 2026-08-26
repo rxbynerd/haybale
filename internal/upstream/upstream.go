@@ -5,13 +5,8 @@
 // injects whatever CredentialSource.Credentials returns in its place —
 // see internal/proxy's rewrite and modifyResponse.
 //
-// CredentialSource is the v0.2/M4 extraction seam: StaticSource (M3)
-// always returns the same fixed credential; GitHubAppSource (M4) will
-// mint a short-lived GitHub App installation token per (repo, verb) and
-// cache it internally (with singleflight, per the plan). Implementations
-// own their own caching; callers — internal/proxy in particular — must
-// never cache a returned BasicAuth themselves, since only the
-// CredentialSource knows when its own value has gone stale.
+// Implementations own credential caching. Callers must not cache a returned
+// BasicAuth because only its CredentialSource knows when it expires.
 package upstream
 
 import (

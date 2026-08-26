@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# e2e-github.sh — M6 acceptance: a credential-less container clones and
-# pushes a real private GitHub repo through a locally-running haybale,
-# using a real GitHub App. See docs/runbook-github-acceptance.md for the
-# full runbook this recipe is evidence for, including how to create the
-# GitHub App it depends on.
+# e2e-github.sh — live acceptance in which a credential-less container
+# clones and pushes a private GitHub repository through a local haybale using
+# a real GitHub App. See docs/runbook-github-acceptance.md for setup.
 #
 # Invoked via `just e2e-github`; deliberately not wired into CI (it needs
 # a real GitHub App private key, a real private repo, and a container
@@ -42,11 +40,10 @@
 #
 # Optional env:
 #   HAYBALE_CONTAINER_RUNTIME   docker or podman (default: podman).
-#   HAYBALE_APP_ID              GitHub App ID (default: 4278664, "haybale dev").
+#   HAYBALE_APP_ID              GitHub App ID (project default: 4278664).
 #   HAYBALE_E2E_REPO            owner/repo on github.com to round-trip
-#                               against (default: rxbynerd/haybale-e2e —
-#                               see docs/runbook-github-acceptance.md for
-#                               how that repo was created).
+#                               against (project default:
+#                               rxbynerd/haybale-e2e).
 #   HAYBALE_BIN                 path to the haybale binary (default: ./haybale).
 #   HAYBALE_E2E_PORT            port haybale listens on for this run
 #                               (default: derived from this script's own
@@ -150,13 +147,10 @@ SCRATCH_ABS="$(cd "$SCRATCH_DIR" && pwd)"
 HAYBALE_PID=""
 CONTAINER_PID=""
 # Run-scoped name for the container step (see step 3 below), so cleanup()
-# can ask the runtime to kill it directly by name. Verified empirically
-# on this dev machine's rootless podman-machine setup: the container
-# process runs inside podman's VM, decoupled from the `podman run`
-# client on the host, so signaling (even SIGKILL-ing) the client PID
-# alone does *not* stop the container early — it keeps running until
-# its own command finishes. `podman kill <name>` (or `docker kill`),
-# which asks the runtime itself to stop the named container, does.
+# can ask the runtime to kill it directly by name. Container processes may
+# outlive the local `podman run` or `docker run` client process, so signaling
+# the client PID alone is insufficient; cleanup asks the runtime to stop the
+# named container.
 CONTAINER_NAME="haybale-e2e-$$"
 
 # terminate_pid escalates SIGTERM -> a short bounded poll -> SIGKILL, so

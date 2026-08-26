@@ -1,9 +1,7 @@
 name: CI
 
-# Runs on every push and PR. haybale is a single small Go module (unlike
-# Stirrup's multi-module workspace), so build/test/lint all fit in one
-# reusable job list without the version-label/ldflags machinery Stirrup
-# needs for its release process.
+# Runs build, test, race-detector, and lint checks on every push and pull
+# request.
 
 on:
   push:
@@ -31,9 +29,7 @@ jobs:
       - name: Test
         run: go test ./...
 
-      # Covers internal/e2e's real `git clone` through the in-process
-      # proxy alongside a real `git http-backend` CGI upstream — the
-      # concurrency-sensitive path this milestone introduces.
+      # Covers the concurrent proxy and real-Git integration paths.
       - name: Test (race detector)
         run: go test -race ./...
 
@@ -51,9 +47,7 @@ jobs:
 
       - name: Install golangci-lint
         env:
-          # Pinned to the version contributors run locally (matches
-          # Stirrup's pinned CI version) so `just lint` and this job
-          # produce identical diagnostics.
+          # Pinned so local and CI lint runs produce identical diagnostics.
           GOLANGCI_LINT_VERSION: 2.12.2
         run: |
           set -euo pipefail

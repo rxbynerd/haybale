@@ -43,7 +43,7 @@ type IssuerConfig struct {
 	// "ES256"]). Only asymmetric algorithms are ever configured here; a
 	// token whose `alg` header is outside this list — including `none` and
 	// every HMAC variant — is rejected before its signature is checked,
-	// which is what defeats algorithm-confusion attacks (D2).
+	// preventing algorithm-confusion attacks.
 	Algorithms []string
 	// Audiences is the set of acceptable `aud` values; a token must carry
 	// at least one of them. A token with no `aud`, or an `aud` disjoint
@@ -90,8 +90,8 @@ type issuerVerifier struct {
 // exact `iss` string, and never tries a token against any issuer other
 // than the one its unverified `iss` names — so trust material, the
 // algorithm allowlist, and the audience expectation are all bound to a
-// single issuer, and a token signed by issuer B's key while claiming
-// issuer A's `iss` fails against A's key set (D2).
+// single issuer. A token signed by issuer B's key while claiming issuer A
+// therefore fails against A's key set.
 //
 // It is immutable after New returns (its maps and verifiers are only
 // read, never written, once serving) and so is safe for concurrent use.

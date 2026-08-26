@@ -3,9 +3,8 @@
 haybale exports OpenTelemetry traces, metrics, and logs over OTLP when the
 `telemetry` block is configured (see [`configuration.md`](configuration.md)
 for how to turn it on and point it at a collector). This document describes
-what the enabled pipeline emits. When telemetry is disabled, none of the
-below is produced and haybale behaves exactly as it did before — the metric
-instruments are no-ops and no exporter is dialled.
+what the enabled pipeline emits. When telemetry is disabled, these signals are
+not produced, metric instruments are no-ops, and no exporter is dialled.
 
 All three signals share one OTel Resource, so a backend can correlate them
 for a single running process:
@@ -35,7 +34,8 @@ Span attributes haybale adds:
 | `haybale.verb`             | `read` or `write`.                                          |
 | `haybale.repo.owner`       | Repository owner. On the span only, never a metric label.  |
 | `haybale.repo.name`        | Repository name. On the span only, never a metric label.   |
-| `haybale.identity`         | The authenticated identity id (the Stirrup run id).        |
+| `haybale.identity`         | The authenticated identity ID.                             |
+| `haybale.issuer`           | The verified JWT issuer, when available.                   |
 | `haybale.outcome`          | One of the outcomes listed under [Metrics](#metrics).      |
 | `http.response.status_code`| The client-visible status of a proxied request.            |
 
@@ -47,17 +47,15 @@ never appears on a span, a metric, a log, or an error.**
 
 ### Trace propagation
 
-haybale **continues** an inbound trace: a caller (a Stirrup sandbox) that
-sends a W3C `traceparent` has haybale's request span nested under its trace.
+haybale **continues** an inbound trace: a caller that sends a W3C
+`traceparent` has haybale's request span nested under its trace.
 
-haybale does **not** propagate a trace onto the leg it forwards upstream:
-the reverse-proxy transport is given an empty propagator, so no
-`traceparent`/`tracestate`/`baggage` is injected into the request sent to
-the git host. This preserves haybale's byte-for-byte passthrough invariant
-(the upstream leg carries only the headers the client sent, plus the
-`Authorization` rewrite) and avoids leaking haybale's internal trace
-topology to an external upstream. The same applies to the GitHub API calls
-the credential source makes.
+haybale does **not inject its own** trace context onto the upstream leg: the
+reverse-proxy transport uses an empty propagator, so it adds no
+`traceparent`, `tracestate`, or `baggage` to requests sent to the Git host.
+Client-supplied end-to-end headers remain subject to normal reverse-proxy
+forwarding. GitHub API calls made by the credential source also receive no
+haybale trace context.
 
 ## Metrics
 
@@ -87,7 +85,11 @@ take, so `sum by (haybale.outcome)` accounts for all traffic:
 | `rejected`            | 404         | Malformed request or unknown upstream host — before any auth check.           |
 | `authn_failed`        | 401         | The authenticator rejected the credential.                                    |
 | `policy_denied`       | 404         | The policy engine denied the request (indistinguishable from a missing repo). |
-| `upstream_auth_failed`| 502         | No working upstream credential could be presented.                            |
+| `upstream_auth_failed`| 502         | A credential source was unavailable or failed before forwarding.              |
+
+An upstream `401` or `403` rewritten by haybale to `502` has outcome `proxied`
+and status `502`, because the request reached the upstream. It also emits an
+`upstream_auth_failed` security event.
 
 A `rejected` outcome deliberately carries **no `host` label**: an
 unknown-host rejection's host segment is attacker-controlled, so labelling
@@ -100,11 +102,11 @@ requests — protocol-level companions to the domain metrics above.
 
 ## Logs
 
-haybale keeps logging structured records to stderr (via `log/slog`) exactly
-as before; when telemetry is enabled, the same records are additionally
-shipped to the OTLP logs pipeline. The handler chain is:
+haybale logs structured records to stderr via `log/slog`. When telemetry is
+enabled, the same records are also shipped to the OTLP logs pipeline. The
+handler chain is:
 
-```
+```text
 SpanContextHandler → ScrubHandler → Fanout{ stderr, OTLP bridge }
 ```
 

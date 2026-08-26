@@ -93,11 +93,8 @@ func writeTestTLSCertKeyFiles(t *testing.T) (certPath, keyPath string) {
 }
 
 // newJWTTestAuth builds a single-issuer, file-backed JWTAuthenticator and
-// mints a matching, currently-valid ES256 token whose `sub` is id — the
-// JWT counterpart of the old static-token test helper, for the serve
-// integration tests that drive a real authenticated request through the
-// proxy. The signing key is generated fresh per call and never leaves the
-// test.
+// mints a matching, currently-valid ES256 token whose `sub` is id. The signing
+// key is generated for the test and never leaves it.
 func newJWTTestAuth(t *testing.T, id string) (identity.Authenticator, string) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -210,10 +207,8 @@ func TestBuildUpstreams(t *testing.T) {
 	const tokenEnv = "HAYBALE_SERVE_TEST_TOKEN" //nolint:gosec // G101: this is an environment-variable *name*, not a credential value — the actual test token is the separate, non-secret literal passed to t.Setenv below
 	t.Setenv(tokenEnv, "test-token-value")
 	cfg := buildTestConfig(t, tokenEnv)
-	// buildUpstreams reuses the *url.URL Validate() parsed onto each
-	// Upstream (R1) rather than re-parsing BaseURL itself, so Validate()
-	// must run first here — exactly as runServe already does via
-	// config.Load.
+	// buildUpstreams reuses the *url.URL Validate() parsed onto each Upstream
+	// rather than re-parsing BaseURL, so validation must run first.
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
@@ -400,8 +395,7 @@ func TestNewServerRejectsUnvalidatedTLSConfig(t *testing.T) {
 	}
 }
 
-// TestServeWithGracefulDrainWaitsForInFlightRequest is the automated
-// equivalent of M5's "kill -TERM mid-clone" acceptance criterion: a
+// TestServeWithGracefulDrainWaitsForInFlightRequest confirms a
 // request that's already streaming a response (standing in for a large
 // git clone/push still in flight) must be allowed to finish once a
 // shutdown signal arrives, while srv.Shutdown blocks until it does — and
@@ -518,16 +512,9 @@ func TestServeWithGracefulDrainWaitsForInFlightRequest(t *testing.T) {
 	}
 }
 
-// TestServeWithGracefulDrainExceedsFiniteTimeout exercises B1's
-// previously-untested branch: an operator-configured finite
-// drainTimeout reached before an in-flight request finishes on its own.
-// Before the fix, srv.Shutdown's context.DeadlineExceeded propagated
-// straight up through runServe to Execute's generic os.Exit(1),
-// hard-killing the process indistinguishably from a crash. Now,
-// serveWithGracefulDrain must instead log a clear warning and return
-// ErrDrainTimeoutExceeded promptly — not wait indefinitely for the
-// in-flight request, which is exactly the point of configuring a finite
-// timeout in the first place.
+// TestServeWithGracefulDrainExceedsFiniteTimeout confirms a finite drain
+// timeout logs a warning and returns ErrDrainTimeoutExceeded without waiting
+// indefinitely for an in-flight request.
 func TestServeWithGracefulDrainExceedsFiniteTimeout(t *testing.T) {
 	release := make(chan struct{})
 	reachedUpstream := make(chan struct{})

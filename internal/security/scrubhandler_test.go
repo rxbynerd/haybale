@@ -85,14 +85,8 @@ func TestScrubHandlerLeavesNonStringAttrsUnchanged(t *testing.T) {
 	}
 }
 
-// TestScrubHandlerRedactsRawErrorAttr exercises the H3 fix: a raw error
-// passed as a log attribute (rather than err.Error()) has slog.Kind
-// KindAny, which scrubAttr previously returned unmodified — the
-// underlying handler still renders it via its %v-equivalent path, so any
-// secret in the error's string form reached the sink unredacted. A
-// future contributor reaching for `"err", err` out of habit (e.g. in
-// M4's GitHubAppSource, wrapping a ghinstallation/HTTP error from a real
-// GitHub API call) must not bypass the scrubber this way.
+// TestScrubHandlerRedactsRawErrorAttr confirms KindAny error values are
+// scrubbed before the underlying handler renders Error() text.
 func TestScrubHandlerRedactsRawErrorAttr(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(NewScrubHandler(slog.NewJSONHandler(&buf, nil)))
@@ -117,11 +111,8 @@ func (v secretLogValuer) LogValue() slog.Value {
 	return slog.StringValue("token=" + v.secret)
 }
 
-// TestScrubHandlerRedactsLogValuer exercises the other half of the H3
-// fix: an attribute built from a slog.LogValuer has Kind() ==
-// KindLogValuer until resolved, which also fell through scrubAttr's
-// default branch unscrubbed before this fix. scrubAttr must resolve it
-// via Value.Resolve() before deciding how to scrub it.
+// TestScrubHandlerRedactsLogValuer confirms slog.LogValuer attributes are
+// resolved before their concrete values are scrubbed.
 func TestScrubHandlerRedactsLogValuer(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(NewScrubHandler(slog.NewJSONHandler(&buf, nil)))

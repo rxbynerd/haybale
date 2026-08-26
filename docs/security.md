@@ -1,351 +1,243 @@
 # Security model
 
-This document describes haybale's threat model and the security
-invariants its implementation actually enforces, file and line
-referenced where useful. If a claim here and the code ever disagree,
-the code is the ground truth — file an issue.
+This document describes haybale's trust boundaries, enforced security
+properties, and operational limitations. Read it before exposing a haybale
+listener or granting it upstream credentials.
 
-## Threat model
+## Trust boundaries
 
-haybale sits between a credential-free caller (a Stirrup sandbox, or any
-other client that should never hold a real git-host credential) and one
-or more real git hosts. It exists because that caller needs to
-clone/push private repos without ever being handed a credential that
-works directly against the git host — see `docs/stirrup-integration.md`
-for the deployment this was built for.
+haybale sits between two independently authenticated connections:
 
-What haybale defends against:
+1. a client presents a JWT to haybale; and
+2. haybale presents a separate credential to an upstream Git host.
 
-- **A compromised or over-curious caller** using its haybale token to
-  read/write repos it isn't entitled to, or to discover which repos
-  exist beyond what it's entitled to.
-- **The caller obtaining the upstream git-host credential itself** (the
-  GitHub App installation token, or the static upstream token) — the
-  premise of the whole design is that the caller never holds a
-  credential that works directly against GitHub/the internal git host.
-- **A caller's haybale token leaking upstream**, or an **upstream
-  credential leaking back to the caller** — either direction would
-  undermine the isolation this component exists to provide.
-- **Operational blast radius**: a leaked haybale token should be
-  scoped to one policy entry (one identity's allowed repos/verbs), and a
-  minted upstream credential should be scoped to the one repo and verb
-  it was minted for.
+The client is not trusted with the upstream credential. The upstream is not
+trusted with the client JWT. The operator is trusted to configure JWT issuers,
+repository policy, upstream destinations, and secret delivery correctly.
 
-What haybale explicitly does **not** defend against (see also each
-milestone's non-goals in the project plan): pack/pkt-line content
-inspection or ref-level push rules; the dumb git protocol (rejected
-outright, see below); SSH transport; a compromised upstream git host
-itself; an operator who mis-scopes policy.yaml.
+haybale is designed to limit:
 
-- **Connection/resource exhaustion (slow-loris-shaped or otherwise).**
-  `newServer` (`cmd/haybale/cmd/serve.go`) sets `ReadHeaderTimeout: 10s`
-  and deliberately no `ReadTimeout`/`WriteTimeout`/`IdleTimeout`, no
-  `MaxHeaderBytes` override, and no cap on concurrent connections — a
-  direct, load-bearing consequence of pack transfers legitimately
-  running to gigabytes and taking arbitrarily long (see "Streaming, not
-  buffering" below). An authenticated-but-slow caller, or one that opens
-  many connections and trickles data indefinitely, can tie up server
-  resources for as long as it keeps doing so; nothing in haybale itself
-  bounds that. `ReadHeaderTimeout` is the one exception: it still bounds
-  how long a connection can sit open *before* sending a complete request
-  line, so it does guard against the narrowest slow-loris shape (a
-  connection that never finishes its headers at all).
-  Rate limiting and connection-count limits are an explicit v0.1
-  non-goal (see the project plan) — this tradeoff is deliberate, not an
-  oversight, and is expected to be enforced at the ingress/load-balancer
-  layer in front of haybale if it's a concern for a given deployment, not
-  inside haybale itself.
+- use of a client token outside the repositories and verbs assigned to its
+  identity;
+- repository discovery through authorization responses;
+- exposure of a GitHub App installation token or static upstream token to the
+  client;
+- exposure of the client's JWT to an upstream; and
+- the blast radius of a minted GitHub App token.
 
-## Sandbox token never forwarded upstream
+haybale does **not** inspect pack or pkt-line content, enforce ref-level push
+rules, support SSH or dumb HTTP, defend against a compromised upstream, or
+correct an over-broad policy. It also does not provide connection rate limits or
+a concurrent-connection cap; deploy an ingress or load balancer with those
+controls when untrusted clients can reach the listener.
 
-The caller's own credential (its haybale token, presented as an HTTP
-Basic password or `Authorization: Bearer`) is authenticated and then
-discarded — never forwarded to the upstream git host. In the proxy's
-`rewrite` step (`internal/proxy/proxy.go`), the inbound `Authorization`
-header is explicitly deleted before the outbound request is sent, and a
-completely separate, upstream-scoped credential (from the configured
-`CredentialSource`) is injected in its place. Deleting first — rather
-than relying on `SetBasicAuth`'s overwrite semantics alone — makes this
-an explicit step in the code, not an incidental side effect.
+## Authentication
 
-## Upstream credential never reaches the caller
+haybale is a JWT verifier. It holds no identity signing key. Each configured
+issuer has independent trust material and verification rules.
 
-The reverse direction is enforced two ways:
+Verification enforces:
 
-1. **`WWW-Authenticate` is never forwarded.** If the upstream ever
-   responds `401`/`403` *after* haybale already injected its own
-   credential (`modifyResponse` in `internal/proxy/proxy.go`), that can
-   only mean the upstream rejected haybale's credential — not something
-   the caller did. haybale maps this to a synthetic `502 Bad Gateway`
-   and **replaces the entire response header set** (not just deleting
-   `WWW-Authenticate`) with a minimal, known-safe set, so no
-   upstream-controlled header — `WWW-Authenticate`, `Set-Cookie`,
-   anything else a compromised or misconfigured upstream's error page
-   might set — reaches the caller.
-2. **The caller never re-prompts for a credential it cannot supply.**
-   Mapping a post-injection `401`/`403` to `502` (rather than passing the
-   `401` straight through) means `git` never re-prompts for
-   credentials — the caller has no real git credential to give it, so a
-   passthrough `401` would just hang or fail confusingly instead of
-   surfacing a clear gateway error.
+- an operator-configured, asymmetric-only algorithm allowlist;
+- signature verification against only the key set associated with the token's
+  issuer;
+- exact issuer matching and a required audience match;
+- mandatory `exp`, plus `nbf` and `iat` validation with configured clock-skew
+  leeway;
+- an optional required JOSE `typ` value;
+- all configured claim bindings;
+- valid, non-empty claims referenced by the identity template; and
+- a 64 KiB token-size limit before parsing.
 
-A `CredentialSource` failure (a GitHub App mint error, a misconfigured
-static token) is handled identically: `502`, never `401` — the caller
-still has no upstream credential of its own to supply.
+HMAC algorithms and unsigned tokens are rejected. Trust material is never
+shared across issuers, which prevents a key trusted for one issuer from
+validating a token that claims another.
 
-## Policy-denied and unknown repos are indistinguishable (no existence oracle)
+The unverified `iss` claim is used only to select a configured verifier. It is
+not emitted as a metric label or normal audit field. Logging and authorization
+use only claims from a successfully verified token.
 
-Three cases collapse to the exact same `404 Not Found`, with nothing
-written to the response beyond the status, in `internal/proxy/proxy.go`'s
-`ServeHTTP`:
+### Claim bindings
 
-- a malformed/unrecognised request shape (`gitproto.ParseRequest`
-  rejects it — includes the dumb protocol, path traversal, and any
-  request that isn't one of the three smart-HTTP endpoint shapes);
-- a request naming an upstream host that isn't configured at all;
-- a request the policy engine denies, whether because no rule matched
-  (default deny) or because a rule matched but doesn't grant the
-  requested verb.
+A valid signature proves that the issuer created a token; it does not
+necessarily prove that the workload is one the operator intended to trust. This
+is especially important for a public issuer such as GitHub Actions, where many
+workflows can request OIDC tokens.
 
-A caller probing repos it doesn't have access to therefore cannot tell
-"this repo doesn't exist" apart from "this repo exists but you can't see
-it" — deliberately, so policy.yaml's contents aren't discoverable by
-probing.
+Use `claimBindings` to constrain an issuer to trusted organizations,
+repositories, workflows, and runner environments. Every configured binding must
+match. Do not configure the public GitHub Actions issuer without suitable
+bindings.
 
-Correspondingly, **authentication failure and policy denial are
-distinct HTTP outcomes**: a missing/invalid token is a `401` (with a
-`WWW-Authenticate: Basic` challenge, so `git` retries with a
-credential), while a policy denial is the `404` described above — mixing
-these would either leak "this repo exists, you're just unauthenticated"
-information or make legitimate credential retries impossible.
+### Token repository scope
 
-## Streaming, not buffering
+An issuer can name a claim containing repository globs. When present, haybale
+intersects this token scope with the static policy:
 
-Pack data can run to gigabytes. Nothing in the request path buffers or
-parses a request/response body: `internal/proxy` wraps
-`httputil.ReverseProxy` with `FlushInterval: -1` (flush on every write,
-rather than batching — this is what keeps `git`'s sideband progress
-output live rather than arriving in bursts) and the only per-request
-work beyond routing/rewriting a body does is counting bytes as they
-stream past, for the request log (`countingReadCloser`/`statusRecorder`
-in `internal/proxy/proxy.go`) — it never reads a body into memory.
+```text
+effective access = policy access ∩ token repository scope
+```
 
-The server sets `ReadHeaderTimeout: 10s` (bounding only how long it waits
-to read a request's headers, against a client that opens a connection
-and never sends a request line) and **no read/write/idle timeout at
-all**, with or without TLS — an explicit, load-bearing choice documented
-at the constant's own definition
-(`cmd/haybale/cmd/serve.go`). Adding a read or write timeout here would
-silently cap how large a clone/push haybale can proxy.
+A token can narrow policy but cannot expand it. An absent scope claim leaves the
+policy unchanged; an explicit empty scope denies every repository.
 
-## Headers forwarded and suppressed
+## JWKS handling
 
-Every header on the inbound request is cloned onto the outbound one by
-default (`httputil.ReverseProxy`'s normal behaviour), which in particular
-means `Git-Protocol`, `Content-Type`, `Content-Encoding`, `Accept`, and
-`Accept-Encoding` always reach the upstream unmodified — dropping
-`Git-Protocol` in particular would silently downgrade a client from
-protocol v2 to v1. The proxy's transport also sets
-`DisableCompression: true` so it never decodes `Content-Encoding` itself;
-this is a byte-for-byte passthrough, not a decoding proxy.
+A URL-backed JWKS must use HTTPS, except for loopback HTTP used in local tests.
+The initial fetch is synchronous: haybale does not start if the endpoint is
+unreachable, invalid, or contains no usable keys. Background refresh honors
+`Cache-Control`, and unknown-key refreshes are rate-limited to avoid outbound
+request amplification.
 
-Two things are deliberately **not** forwarded:
+File-backed JWKS documents are read once at startup. Rotating a file-backed key
+set requires replacing the file and restarting haybale.
 
-- **`Authorization`** — replaced with the injected upstream credential,
-  as described above (this is the one header
-  `httputil.ReverseProxy`'s default hop-by-hop stripping does *not*
-  cover, since `Authorization` is end-to-end, not hop-by-hop).
-- **`X-Forwarded-*`/`Forwarded`** — haybale never calls
-  `ProxyRequest.SetXForwarded()`, so these are never added (and any such
-  header on the inbound request from the caller is simply dropped, not
-  forwarded), meaning haybale never leaks the caller's IP/host/proto to
-  the upstream.
+For URL-backed issuers, a refresh failure leaves the last successfully fetched
+key set active and emits a `jwks background refresh failed` warning. This
+preserves availability during an issuer outage, but it also means stale keys
+remain trusted for an unbounded period. If a compromised signing key is removed
+from the issuer's JWKS while haybale cannot refresh it, tokens signed by that
+key can continue to validate. Deployments that require fail-closed revocation
+should alert on refresh failures and restart or isolate the affected instance
+until trust material can be refreshed.
 
-## `info/refs?service=git-receive-pack` is a write
+A compromised JWKS endpoint is equivalent to compromise of that issuer's
+signing key. Protect its DNS, TLS, and administrative access accordingly.
 
-Per the git smart-HTTP protocol, the `GET .../info/refs?service=git-receive-pack`
-handshake that precedes every push counts as a **write**
-(`gitproto.ParseRequest` in `internal/gitproto/gitproto.go`), even though
-its HTTP method is `GET`. A read-only identity is denied at this
-handshake — before any pack data is exchanged — not merely at the
-`POST .../git-receive-pack` that would follow it.
+## Authorization and repository privacy
 
-## Logging never contains token material
+Policy rules are ordered and first-match-wins. A request is allowed only when
+the first matching identity/repository rule explicitly grants the required
+`read` or `write` permission. No match is a denial. An empty rule list is valid
+and denies all access.
 
-Every logger haybale constructs is wrapped in a scrubbing handler
-(`internal/security/scrubhandler.go`) that redacts known secret shapes —
-`Authorization: Basic`/`Bearer` headers, a credential embedded in a
-URL's userinfo (`https://user:token@host/...`), a compact JWT (the
-`eyJ`-prefixed three-segment token a caller now presents), GitHub's own
-token prefixes (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`), and PEM
-private key blocks — from any log record, regardless of level, before it
-reaches the log sink. This is defense-in-depth: the primary defense is
-that haybale's own logging call sites only ever pass
-repo/owner/host/verb/identity/issuer/status as structured attributes (see
-`internal/proxy/proxy.go`), never a raw request, URL, or credential —
-the scrubber exists for the case where that discipline slips, e.g. in an
-error string from a dependency this package doesn't control.
+The following cases all return `404 Not Found`:
 
-Full request URLs are never logged either way: log call sites pass the
-individual `host`/`owner`/`repo`/`verb` fields gitproto parsed out, not
-`r.URL` itself.
+- an invalid or unsupported Git smart-HTTP request;
+- an unknown upstream host; and
+- an authorization denial, including a token-scope denial.
 
-The **verified** claims of a JWT are assertions, not secrets, and so are
-loggable: successful authentication logs the issuer, mapped identity,
-`jti`, and `exp` — never the compact token itself. The **unverified**
-`iss` a caller presents (used only to select which issuer's keys to
-verify against) is treated as attacker-controlled: it is never used as a
-metric label (it would be an unbounded-cardinality vector) and never
-logged above debug. Only the verified issuer — drawn from the operator's
-own bounded, configured set — appears on spans, metrics, and info logs.
+This prevents clients from distinguishing a repository they cannot access from
+one that does not exist. Authentication failures remain `401 Unauthorized` with
+a Basic challenge so Git can supply a credential. Keep this distinction when
+placing another proxy in front of haybale.
 
-## JWT verification (RFC 8725)
+The `GET .../info/refs?service=git-receive-pack` push handshake is classified as
+a write, despite using GET, and is denied to read-only identities before pack
+data is exchanged.
 
-haybale is a **pure verifier**: it mints no tokens and holds no signing
-key. It trusts one or more issuers, each through that issuer's published
-public keys (a JWKS). See `docs/jwt-identity.md` for the token contract.
-Verification (`internal/identity/jwt.go`) enforces, per issuer:
+## Credential separation
 
-- an **asymmetric-only** algorithm allowlist, checked before the signature
-  — so `alg: none` and the HMAC-signed-with-the-public-key confusion
-  attack are rejected before a key is ever consulted;
-- **issuer-bound trust material**: the token's unverified `iss` only
-  *selects* a verifier; full validation then runs against **only** that
-  issuer's key set, never "try every issuer's keys", closing cross-issuer
-  key confusion;
-- **mandatory** `aud` (any-of the configured set) and `exp`; honored
-  `nbf`/`iat` within a configurable leeway; optional required `typ`;
-- a **size cap** (64 KiB) applied before the parser runs, bounding the
-  work an attacker can force with a giant, never-valid blob.
+### Client JWT is not forwarded
 
-Authentication yields an identity via each issuer's `claimBindings`
-(pinning an open issuer to trusted callers) and `identityTemplate`; the
-YAML policy engine remains the sole authorization decision point. Signature
-verification uses a **public** key, so it is not a secret comparison and no
-constant-time discipline applies to it — unlike the prior static-token
-scheme, where a digest comparison used `crypto/subtle.ConstantTimeCompare`.
+After authentication, haybale removes the inbound `Authorization` header and
+sets a new Basic-auth header from the selected upstream credential source. The
+JWT is used only on the client-to-haybale connection.
 
-## JWKS is haybale's first outbound dependency
+### Upstream credential is not returned
 
-A `jwksURL` is the first non-upstream outbound request haybale makes.
-This is a named part of the threat model:
+If credential acquisition fails, haybale returns `502 Bad Gateway`, not `401`.
+If an upstream rejects the injected credential with `401` or `403`, haybale
+also returns a synthetic `502` and replaces all response headers and the body.
+This prevents `WWW-Authenticate`, cookies, or other upstream-controlled error
+headers from reaching the client and avoids a Git credential prompt the client
+cannot satisfy.
 
-- A **compromised or spoofed JWKS endpoint** can mint an arbitrary
-  identity *for that issuer* — it is equivalent to a signing-key
-  compromise. Two things bound the blast radius: haybale keeps each
-  issuer's trust material separate (a bad JWKS for issuer A cannot forge a
-  token for issuer B), and the operator's `claimBindings` restrict which
-  callers an issuer may authenticate at all.
-- Config validation **requires `https`** for a `jwksURL` (plaintext
-  `http` is permitted only for a loopback host, for testing), so trust
-  material is never fetched over a spoofable plaintext channel.
-- The initial fetch is **fail-fast**: an unreachable or empty JWKS at
-  startup refuses to serve traffic. At runtime the key set is refreshed in
-  the background (honoring `Cache-Control`) and refetched on an unseen
-  `kid` behind a rate limit, so a burst of unknown-`kid` tokens cannot be
-  turned into an outbound-fetch amplification vector.
+Other upstream responses are streamed without this rewrite.
 
-### Known limitation: unbounded stale keys on sustained refresh failure
+### GitHub App least privilege
 
-If background refresh **starts failing** (the JWKS endpoint becomes
-unreachable), haybale currently keeps serving the **last successfully
-fetched** key set indefinitely, logging each refresh failure at `warn`
-(`jwks background refresh failed`). It favors availability: a JWKS outage
-does not lock every caller out.
+For a `github-app` credential source, each installation token request names:
 
-The security trade this makes is **unbounded trust duration** (CWE-613): if
-an issuer's signing key is compromised and rotated out of the published
-JWKS, *and* an attacker can simultaneously prevent haybale's egress to that
-one JWKS URL (a targeted partition), haybale would keep accepting tokens
-signed by the revoked key. This requires a prior key compromise plus a
-sustained, targeted network partition to exploit.
+- exactly one repository; and
+- only `contents: read` for fetch/clone or `contents: write` for push.
 
-A per-issuer `staleIfErrorFor` bound (serve last-known-good for at most
-N after refresh begins failing; `0` = fail closed immediately) is a
-**planned v0.2 follow-up**, deliberately deferred here: the value is a
-judgment call the deployment owner should sign off on, and the current
-JWKS library exposes no refresh-*success* signal to implement the bound
-correctly without a custom storage wrapper. An operator who needs
-fail-closed behavior today should monitor the `jwks background refresh
-failed` warning and rotate the deployment. The optional startup
-`discoveryCheck` (verify the configured issuer/jwksURL against the
-issuer's OIDC discovery document) is deferred on the same track.
+Tokens are cached per repository and permission, then refreshed five minutes
+before expiry. A valid write token can satisfy a read request; a read token
+never satisfies a write request. Concurrent requests for the same scope share a
+single mint operation.
 
-## Default-deny policy
+Installation IDs are cached for one hour. GitHub API calls have a 30-second
+client timeout and also honor the inbound request context.
 
-`policy.yaml`'s rules are evaluated in order, first-match-wins; a
-request matching no rule at all is denied. An **empty rules list is a
-valid configuration** — it denies everything, which is a legitimate
-(if unusual) choice, not treated as a mistake. See
-`docs/configuration.md` for the rule shape.
+## Network and protocol behavior
 
-## Least-privilege GitHub App token minting
+### TLS
 
-When an upstream's credential is `type: github-app`
-(`internal/upstream/githubapp.go`), every minted installation token is
-scoped to:
+The listener carries client JWTs and the proxy process handles upstream
+credentials. Plain HTTP is appropriate only on a network whose confidentiality
+and membership the operator controls. Configure listener TLS whenever traffic
+crosses a shared or untrusted network. TLS 1.2 is the minimum supported
+version.
 
-- **exactly one repository** — the `repositories` field in the mint
-  request names only the target repo, never the installation's full
-  repo set;
-- **the minimal permission the request's verb needs** — `contents: read`
-  for a fetch, `contents: write` for a push, never both, and nothing
-  beyond `contents`.
+The Git upstream `baseURL` should also use HTTPS unless the upstream is reached
+through an equivalently trusted private transport.
 
-A compromised minted token can therefore act on nothing but the single
-repo/permission it was minted for. Tokens are cached per
-`(host, owner, repo, verb)` and refreshed 5 minutes ahead of their actual
-expiry (`earlyRefreshWindow` in `internal/upstream/tokencache.go`) so an
-in-flight transfer never gets handed a token that goes stale mid-stream;
-a valid cached write-scoped token also satisfies a read request
-(write-satisfies-read), but never the reverse. Concurrent requests for
-the same repo/verb collapse into a single mint call
-(`golang.org/x/sync/singleflight`), so a burst of simultaneous clones
-against the same repo doesn't multiply GitHub API mint calls.
+### Streaming and timeouts
 
-Every successful mint emits a `token_minted` security event (host,
-owner, repo, verb, installation ID) — never the token itself, in the
-event or in any error `GitHubAppSource` returns.
+haybale does not buffer request or response bodies. Pack data is streamed
+through Go's reverse proxy and flushed on each write. Request and response byte
+counts are observed while streaming.
 
-## GitHub App private key handling
+The server applies a 10-second request-header timeout but no read, write, or
+idle timeout. This permits long-running, multi-gigabyte transfers, but an
+authenticated slow client can retain resources indefinitely. Use ingress-level
+connection, rate, and idle controls where that risk matters, taking care not to
+terminate legitimate large transfers.
 
-The App's private key (`credential.privateKeyPath`) is read from disk
-and parsed **once, at config-validation time**
-(`internal/config/config.go`'s `buildCredentialSource`) — a missing file
-or one that isn't a valid RSA private key fails startup immediately,
-rather than on the first mint attempt. The key material is held only
-long enough to build the JWT-signing transport
-(`ghinstallation.NewAppsTransport`) and is never logged or written
-anywhere else; the scrubber's `pem_private_key` pattern is a backstop
-for the case where it's ever accidentally passed to a log call.
+A finite `drainTimeout` also places an upper bound on graceful shutdown. Its
+default is `0s`, which waits indefinitely for active transfers.
 
-## TLS vs. plain HTTP
+### Forwarded headers
 
-haybale carries the caller's bearer token and (during
-`rewrite`/`modifyResponse`) the upstream git credential over its
-listener. **Plain HTTP is safe only when that listener is genuinely
-cluster-internal** — reachable exclusively from trusted callers over a
-network haybale's operator controls (e.g. same-namespace pod-to-pod
-traffic in Kubernetes, or a Stirrup sandbox reaching a
-same-cluster-internal Deployment as in `docs/stirrup-integration.md`).
+Smart-HTTP headers and content encodings pass through unchanged. haybale does
+not generate `Forwarded` or `X-Forwarded-*` headers, and inbound values for
+those headers are suppressed. The upstream therefore does not receive the
+client's network address or haybale listener details through those fields.
 
-Configure `tls.certPath`/`tls.keyPath` (see `docs/configuration.md`)
-whenever haybale's listener is reachable from anything less trusted than
-that — a shared network segment, a multi-tenant cluster, or any path
-crossing a network boundary an operator doesn't fully control. When
-configured, haybale serves HTTPS with `tls.Config.MinVersion` pinned to
-TLS 1.2, and — as with plain HTTP — sets no read/write/idle timeout
-beyond the same 10s `ReadHeaderTimeout`, so TLS never becomes a second
-place a large transfer could be silently capped.
+haybale does not inject its own OpenTelemetry `traceparent`, `tracestate`, or
+`baggage` on upstream Git or GitHub API requests. Ordinary client-supplied
+end-to-end headers continue to follow reverse-proxy forwarding rules.
 
-## Graceful shutdown doesn't create a window for cut-off credentials
+## Secrets at rest
 
-On `SIGTERM`/`SIGINT`, haybale marks itself draining (`/healthz` starts
-returning `503`) and then calls `http.Server.Shutdown`, which lets any
-in-flight request — including one mid-way through streaming a large pack
-— finish completely rather than being cut off. This matters for the
-security model too, not just reliability: an abruptly severed connection
-mid-push is exactly the kind of failure mode that leaves a caller
-uncertain whether a write actually landed; letting it complete removes
-that ambiguity. See `docs/configuration.md`'s "Graceful drain" section
-for the operational details (`drainTimeout`, defaults).
+Static upstream tokens and OTLP headers are read from environment variables;
+they cannot be configured inline in YAML. Listener and GitHub App private keys
+are read from files at startup. A private key file with any group or other
+permission bit set is rejected; use mode `0600` or `0400`.
+
+The GitHub App private key is parsed once to construct the signing transport.
+It is not written or logged by haybale.
+
+## Logging
+
+Application logging uses structured fields and does not intentionally include
+raw requests, complete URLs, tokens, or private keys. Every logger is wrapped
+by a scrubber that redacts:
+
+- Basic and Bearer authorization values;
+- credentials in URL userinfo;
+- compact JWTs;
+- known GitHub token prefixes; and
+- PEM private-key headers.
+
+The scrubber applies to log messages, string attributes, error attributes, and
+grouped values before records reach stderr or OTLP. It is defense in depth, not
+a substitute for avoiding secret-bearing log fields.
+
+Verified issuer, identity, token ID, expiry, repository, operation, status, and
+installation ID are non-secret audit data and may be logged. Raw tokens and
+minted token values are never audit fields.
+
+## Security events
+
+haybale emits warning-level structured events for:
+
+- `authn_failed`
+- `policy_denied`
+- `upstream_auth_failed`
+- `token_minted`
+
+Monitor repeated authentication failures, policy probes, upstream credential
+failures, token-mint spikes, and JWKS refresh warnings. See
+[Observability](observability.md) for the related traces and metrics.

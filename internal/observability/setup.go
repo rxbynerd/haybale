@@ -20,10 +20,9 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
-// ScopeName is the instrumentation scope name carried on every span,
-// metric, and log record haybale emits. A single shared scope across all
-// three signals lets a backend attribute them to one instrumentation
-// source, the same way Stirrup uses one "stirrup-harness" scope.
+// ScopeName is the instrumentation scope name carried on every span, metric,
+// and log record haybale emits. A single shared scope lets a backend attribute
+// all three signals to one instrumentation source.
 const ScopeName = "github.com/rxbynerd/haybale"
 
 // ProtocolGRPC and ProtocolHTTP are the two OTLP wire protocols Setup
@@ -189,9 +188,9 @@ func Setup(ctx context.Context, cfg Config) (*Providers, error) {
 
 	// Set globals last, once every pipeline built cleanly: otelhttp and
 	// any otel.Tracer(ScopeName) call site resolves through these. The
-	// propagator is W3C Trace Context + Baggage, the ecosystem default, so
-	// haybale both continues an inbound trace and propagates one to the
-	// upstream leg.
+	// global propagator is W3C Trace Context + Baggage so the server handler
+	// can continue an inbound trace. Upstream transports use an explicit
+	// empty propagator and do not inject haybale's context.
 	otel.SetTracerProvider(tp)
 	otel.SetMeterProvider(metrics.provider)
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
@@ -314,8 +313,7 @@ func buildLogExporter(ctx context.Context, cfg Config) (sdklog.Exporter, error) 
 // which the gRPC/HTTP exporters' WithEndpoint expects (they toggle TLS via
 // WithInsecure, not the scheme). A scheme-less endpoint (e.g.
 // "localhost:4317") is returned unchanged; a path is dropped here and
-// re-applied by the caller via WithURLPath. Duplicated from Stirrup rather
-// than shared — the two services are separate modules.
+// re-applied by the caller via WithURLPath.
 func stripURLScheme(endpoint string) string {
 	for _, scheme := range []string{"https://", "http://"} {
 		if rest, ok := strings.CutPrefix(endpoint, scheme); ok {

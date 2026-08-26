@@ -1,13 +1,5 @@
-// This file holds the M3 credential-injection acceptance tests the plan
-// calls out explicitly: the e2e upstream now genuinely requires Basic
-// auth (see upstream_test.go's newUpstream), so a successful clone/push
-// through haybale (already exercised by TestCloneThroughProxy and
-// TestPushThroughProxy in e2e_test.go) is proof injection works, not a
-// passthrough that happened to succeed because the upstream never
-// checked anything. This file adds the remaining M3 acceptance cases:
-// the control test proving the upstream's auth requirement is real, the
-// leak assertions in both directions, and the post-injection upstream
-// 401 -> 502 mapping.
+// These tests cover upstream credential injection, isolation in both
+// directions, and mapping an upstream authentication rejection to 502.
 package e2e
 
 import (
@@ -24,9 +16,8 @@ import (
 	"github.com/rxbynerd/haybale/internal/policy"
 )
 
-// TestUpstreamRequiresBasicAuthDirectly is the "passthrough-without-injection
-// fails loudly" control test the M3 plan calls for: hitting the fake
-// upstream directly, with no credentials at all, must fail with a 401.
+// TestUpstreamRequiresBasicAuthDirectly confirms that the fake upstream
+// rejects requests without its configured credential.
 // This is what makes TestCloneThroughProxy/TestPushThroughProxy's
 // success meaningful — the upstream genuinely enforces auth, so haybale
 // injecting the right credential is doing real work, not passing through
@@ -73,8 +64,7 @@ func TestUpstreamRequiresBasicAuthDirectly(t *testing.T) {
 	})
 }
 
-// TestCredentialInjectionLeakAssertions is the M3 "leak assertions both
-// directions" acceptance case: a successful proxied request must never
+// TestCredentialInjectionLeakAssertions confirms a successful request does not
 // let the upstream credential (upstreamBasicAuthToken) reach the client
 // — not in the response body, not in any response header — and the
 // upstream must never see the client's own haybale token; it must see
@@ -156,9 +146,8 @@ func TestCredentialInjectionLeakAssertions(t *testing.T) {
 	}
 }
 
-// TestPostInjectionUpstream401Maps502 is the M3 "post-injection upstream
-// 401 -> 502" acceptance case: haybale is configured with a StaticSource
-// carrying the WRONG upstream token, so the e2e upstream's Basic-auth
+// TestPostInjectionUpstream401Maps502 configures a StaticSource with an
+// invalid upstream token so the e2e upstream's Basic-auth
 // middleware rejects every request haybale forwards. The client must see
 // a 502 — never the upstream's 401 — with no WWW-Authenticate header (so
 // a real git client never re-prompts for a credential the sandbox has no

@@ -246,11 +246,8 @@ func TestNewGitHubAppSourceValidation(t *testing.T) {
 	}
 }
 
-// TestMintScopesLeastPrivilege is the single most important assertion in
-// M4: a read verb must mint a token scoped to exactly the one repo with
-// "contents": "read", and a write verb the same repo with "contents":
-// "write" — never a broader scope, regardless of what other repos or
-// permissions the installation itself might have.
+// TestMintScopesLeastPrivilege confirms reads and writes mint tokens for
+// exactly one repository with only the corresponding contents permission.
 func TestMintScopesLeastPrivilege(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -463,8 +460,8 @@ func TestCredentialsHonorsContextDeadline(t *testing.T) {
 // http.Client-level appHTTPClientTimeout backstop fires even when the
 // caller itself sets no deadline (context.Background()) — the gap
 // TestCredentialsHonorsContextDeadline above does not cover, since that
-// test only proves a caller-supplied deadline is honored. Without B1(a)'s
-// client Timeout, this call would hang for the fake's full delay (and, in
+// test only proves a caller-supplied deadline is honored. Without the client
+// timeout, this call would hang for the fake's full delay (and, in
 // production, indefinitely against a genuinely hung upstream).
 func TestCredentialsHonorsClientTimeoutWithNoCallerDeadline(t *testing.T) {
 	orig := appHTTPClientTimeout
@@ -573,9 +570,8 @@ func TestGitHubAppSourceSingleflightCollapsesConcurrentMints(t *testing.T) {
 
 // gatedInstallationServer is a minimal httptest-backed
 // GET .../installation fake, deliberately separate from githubFake: it
-// exists only so installationLookup.get can be exercised directly (per
-// H1/B1(b)'s "bypass NewGitHubAppSource entirely" approach) with a
-// handler that blocks until released, which githubFake's installation
+// exists so installationLookup.get can be exercised directly with a handler
+// that blocks until released, which githubFake's installation
 // endpoint does not support.
 type gatedInstallationServer struct {
 	calls   atomic.Int64
@@ -602,16 +598,12 @@ func (s *gatedInstallationServer) start(t *testing.T) string {
 	return srv.URL
 }
 
-// TestInstallationLookupFollowerHonorsOwnContextDeadline is B1(b)'s
-// installationLookup-side counterpart to
-// TestGitHubAppSourceSingleflightCollapsesConcurrentMints: it constructs
-// an installationLookup directly (bypassing GitHubAppSource, the same
-// approach H1 uses) and asserts a concurrent caller sharing an in-flight
-// lookup for the same owner/repo ("follower") returns its own ctx error
-// as soon as its own deadline fires, rather than blocking until the
-// in-flight lookup (the "leader"'s) completes. Without the
-// Group.Do -> Group.DoChan+select change, this test hangs until the
-// gate is released, well past the follower's ~50ms deadline.
+// TestInstallationLookupFollowerHonorsOwnContextDeadline is the
+// installationLookup counterpart to
+// TestGitHubAppSourceSingleflightCollapsesConcurrentMints. It confirms a
+// caller sharing an in-flight lookup returns its own context error promptly
+// rather than waiting for the leader. This requires waiting on DoChan and the
+// follower's context concurrently.
 func TestInstallationLookupFollowerHonorsOwnContextDeadline(t *testing.T) {
 	gated := newGatedInstallationServer()
 	baseURL := gated.start(t)
@@ -655,13 +647,8 @@ func TestInstallationLookupFollowerHonorsOwnContextDeadline(t *testing.T) {
 	}
 }
 
-// TestInstallationLookupTTLBoundary is H1: it exercises installationLookup
-// directly via newInstallationLookup(fakeClock.Now) — the type already
-// accepts an injectable clock, so no production code change is needed —
-// and asserts the exact installationCacheTTL (1h) boundary: still cached
-// one nanosecond before it, re-fetched exactly at it. Mirrors
-// TestTokenCacheEarlyRefreshBoundary's precision for tokenCache's sibling
-// cache.
+// TestInstallationLookupTTLBoundary asserts the exact one-hour cache boundary:
+// cached one nanosecond before it and fetched again at the boundary.
 func TestInstallationLookupTTLBoundary(t *testing.T) {
 	var calls atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -707,8 +694,8 @@ func TestInstallationLookupTTLBoundary(t *testing.T) {
 	}
 }
 
-// TestInstallationLookupSingleflightDoesNotCollapseDifferentKeys is H2's
-// installationLookup-side counterpart to
+// TestInstallationLookupSingleflightDoesNotCollapseDifferentKeys is the
+// installationLookup counterpart to
 // TestTokenCacheSingleflightDoesNotCollapseDifferentKeys: concurrent
 // lookups across distinct (owner, repo) pairs must each produce their own
 // upstream GET, proving the sfKey (owner + "/" + repo) construction

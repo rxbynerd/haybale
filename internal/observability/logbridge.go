@@ -17,7 +17,7 @@ import (
 //	SpanContextHandler ← security.ScrubHandler ← FanoutHandler{text, otelslog}
 //
 // so no log value reaches either sink unscrubbed, regardless of which sink
-// it is. Mirrors Stirrup's fanoutHandler.
+// it is.
 type FanoutHandler struct {
 	handlers []slog.Handler
 }

@@ -74,9 +74,8 @@ func runGit(t *testing.T, gitPath, dir string, env []string, args ...string) str
 	return string(out)
 }
 
-// runGitExpectError is runGit's mirror image for the M2 negative tests:
-// it runs `git <args>` expecting the command to fail (a denied clone or
-// push), returning the combined output for the caller to inspect — e.g.
+// runGitExpectError runs `git <args>` expecting a denied clone or push and
+// returns the combined output for the caller to inspect — e.g.
 // for the HTTP status git reported — and failing the test if the
 // command unexpectedly succeeds.
 func runGitExpectError(t *testing.T, gitPath, dir string, env []string, args ...string) string {

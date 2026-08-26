@@ -1,16 +1,8 @@
-// Package config loads and validates haybale's YAML configuration file
-// (haybale serve --config haybale.yaml).
-//
-// Validate() is fail-fast: it is called once at startup (Load does this
-// automatically) so a misconfigured deployment refuses to serve traffic
-// rather than failing unpredictably on the first request. This includes
-// the identity and policy blocks: Validate() doesn't just check their
-// paths are non-empty, it loads and parses the files at those paths (via
-// internal/identity and internal/policy), so a malformed identities.yaml
-// or policy.yaml fails startup exactly like a bad upstream baseURL does.
-// Each Upstream also carries a credential block (Upstream.Credential),
-// validated and built into an upstream.CredentialSource the same way —
-// see buildCredentialSource.
+// Package config loads and validates haybale's YAML configuration.
+// Validation resolves policy, upstream URLs and credentials, listener TLS,
+// identity settings, and telemetry settings before the server accepts traffic.
+// Network-backed JWKS sources are initialized separately by BuildAuthenticator
+// so policy checks remain offline.
 package config
 
 import (
@@ -131,13 +123,8 @@ type TLSConfig struct {
 	// CertPath.
 	KeyPath string `yaml:"keyPath"`
 
-	// certificate is the *tls.Certificate Validate() loaded from
-	// CertPath/KeyPath via tls.LoadX509KeyPair, so callers (serve.go)
-	// reuse that exact parse rather than re-reading the files a second
-	// time — the same reuse-not-reparse pattern
-	// IdentityConfig.authenticator/PolicyConfig.engine/
-	// Upstream.parsedBaseURL already establish. nil when TLS is not
-	// configured at all.
+	// certificate is loaded from CertPath and KeyPath during Validate so the
+	// server does not reread key material. It is nil when TLS is disabled.
 	certificate *tls.Certificate
 }
 
@@ -157,12 +144,8 @@ func (c TLSConfig) Certificate() *tls.Certificate {
 	return c.certificate
 }
 
-// identityTypeJWT is the only Identity.Type value haybale supports: the
-// control plane issues each workload a signed JWT and haybale verifies it
-// against the issuer's JWKS (internal/identity.JWTAuthenticator). The
-// discriminator is retained (rather than dropped now that it names a
-// single type) so a future SPIFFE/mTLS authenticator slots in as a second
-// value without a config-shape break.
+// identityTypeJWT is the supported Identity.Type value. A JWT identity is
+// verified against its configured issuer's JWKS.
 const identityTypeJWT = "jwt"
 
 // defaultJWTLeeway is the clock-skew tolerance applied to a JWT's
@@ -458,9 +441,7 @@ type PolicyConfig struct {
 	// Path is the policy.yaml file Validate() loads the Engine from.
 	Path string `yaml:"path"`
 
-	// engine caches the policy.Engine Validate() built from Path, for
-	// the same reuse-not-reparse reason IdentityConfig.authenticator
-	// does.
+	// engine caches the policy.Engine built by Validate.
 	engine policy.Engine
 }
 
@@ -590,9 +571,8 @@ const (
 	otlpProtocolHTTP = "http/protobuf"
 )
 
-// TelemetryConfig configures haybale's OpenTelemetry (OTLP) export. It is
-// entirely optional: when Endpoint is empty the whole block is inert and
-// haybale runs exactly as it did before telemetry existed.
+// TelemetryConfig configures haybale's optional OpenTelemetry (OTLP) export.
+// When Endpoint is empty the block is inert.
 type TelemetryConfig struct {
 	// Endpoint is the OTLP collector endpoint. For grpc it is a host:port
 	// (e.g. "localhost:4317") or an explicit http(s):// URL; for
@@ -843,8 +823,7 @@ const keyFileModeMask = 0o077
 // is exactly the class of misconfiguration this package's
 // fail-fast-at-startup philosophy exists to catch before haybale ever
 // serves traffic, the same way a missing or malformed key file already
-// does. This matters most ahead of M6, the first milestone where a real
-// GitHub App private key is used against a live GitHub App.
+// does.
 //
 // A file that doesn't exist or can't be stat'd is not reported here —
 // that error is left to the caller's own subsequent read/parse of the
@@ -912,11 +891,7 @@ func buildCredentialSource(i int, u *Upstream) error {
 		if u.Credential.PrivateKeyPath == "" {
 			return fmt.Errorf("%s: privateKeyPath is required for type %q", prefix, credentialTypeGitHubApp)
 		}
-		// Checked before the key is ever read, for the same CWE-732
-		// reason the TLS key path is checked in Validate() — see
-		// checkKeyFileMode's doc comment. Worth having in place before
-		// M6, the first milestone that mints real GitHub tokens from
-		// this file.
+		// Apply the same private-key permission check used for listener TLS.
 		if err := checkKeyFileMode(u.Credential.PrivateKeyPath); err != nil {
 			return fmt.Errorf("%s: privateKeyPath: %w", prefix, err)
 		}

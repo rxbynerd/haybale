@@ -28,8 +28,8 @@ var policyCheckCmd = &cobra.Command{
 	Short: "Dry-run a policy decision, without serving traffic",
 	Long: "Loads --config's policy.yaml (via the exact same policy.Engine haybale serve uses) and " +
 		"prints whether --id would be ALLOWed or DENYed to --verb --repo, and which rule (if any) " +
-		"matched. No network call is made and no upstream credential is minted or checked — this " +
-		"only evaluates policy, the same way it would apply against a real request.",
+		"matched. The full config is validated, but no network call is made and no upstream " +
+		"credential is minted — this only evaluates policy.",
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		return runPolicyCheck(cmd, policyCheckConfigPath, policyCheckID, policyCheckRepo, policyCheckVerb)

@@ -10,8 +10,8 @@ implementing issuance — it does not require reading haybale's source.
 The shape follows [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068)
 (JWT access tokens) and the hardening rules of
 [RFC 8725](https://www.rfc-editor.org/rfc/rfc8725) (JWT BCP). GitHub
-Actions OIDC is a conformant issuer out of the box; see
-`docs/github-actions.md`.
+Actions OIDC is a conformant issuer out of the box; see the [GitHub Actions
+integration](github-actions.md).
 
 ## Transport
 
@@ -25,7 +25,7 @@ upstream's own credential in its place.
 
 | Field | Requirement |
 |-------|-------------|
-| `alg` | An **asymmetric** signature algorithm the issuer is configured for in haybale — `ES256` (recommended) or `RS256`. HMAC algorithms and `none` are **rejected unconditionally**; haybale never accepts a symmetric or unsigned token. |
+| `alg` | An **asymmetric** signature algorithm configured for the issuer. Supported values are `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `ES512`, `PS256`, `PS384`, `PS512`, and `EdDSA`; the default allowlist is `RS256` and `ES256`. HMAC algorithms and `none` are rejected. |
 | `kid` | **Strongly recommended.** Names the key in the JWKS that signed this token, so haybale can select exactly that key and so key rotation works cleanly. If `kid` is absent, haybale falls back to trying every key in *that issuer's* key set (never another issuer's) — correct but slower, and ambiguous during rotation. Always send a `kid`. |
 | `typ` | `at+jwt` is **recommended** (RFC 9068 explicit typing). haybale only enforces `typ` for an issuer configured with a required value; GitHub's own `JWT` is accepted where no specific `typ` is required. |
 
@@ -34,7 +34,7 @@ upstream's own credential in its place.
 | Claim | Requirement |
 |-------|-------------|
 | `iss`  | **Required.** Must equal, exactly, the `issuer` string the operator configured for you in haybale. It selects your trust material; a token is only ever verified against the keys of the issuer its `iss` names. |
-| `sub`  | **Required.** A stable identifier for the workload, e.g. `run-<RunID>`. Available to haybale's `identityTemplate` as `{sub}`. |
+| `sub`  | Required when the configured `identityTemplate` references `{sub}`. Use a stable workload identifier such as `run-<RunID>`. |
 | `aud`  | **Required.** Must contain (at least) the audience the operator configured for you (e.g. `https://haybale.internal`). A token with no `aud`, or an `aud` that does not intersect the configured set, is rejected. |
 | `exp`  | **Required.** Unix expiry. haybale imposes no maximum, but a short lifetime (≤ 15 minutes recommended) bounds the damage of a leaked token. Tokens without `exp` are rejected. |
 | `iat`  | Recommended. Rejected if in the future beyond leeway. |
@@ -56,8 +56,9 @@ string-typed, or authentication fails.
 
 An operator may pin your issuer to specific claim values (e.g.
 `repository_owner: rxbynerd`). Any claim they bind must be present on your
-token with a matching value. This is mandatory for open issuers (see
-`docs/security.md`); for a dedicated control plane it is optional.
+token with a matching value. This is mandatory for open issuers (see [Claim
+bindings](security.md#claim-bindings)); for a dedicated control plane it is
+optional.
 
 ### Optional: `repoScopeClaim` (per-token narrowing)
 
@@ -100,9 +101,10 @@ still uses it. Each key needs a distinct `kid`.
 
 A note on trust: your JWKS endpoint is, by construction, able to mint any
 identity for your issuer — a spoofed or compromised JWKS is equivalent to
-a signing-key compromise. haybale requires `https` (except loopback) and
-keeps each issuer's trust material separate; the operator's `claimBindings`
-bound the blast radius. See `docs/security.md`.
+a signing-key compromise. haybale requires `https` (except loopback) and keeps
+each issuer's trust material separate; the operator's `claimBindings` bound the
+blast radius. See
+[JWKS handling](security.md#jwks-handling).
 
 ## Worked example (control-plane token)
 
@@ -126,6 +128,6 @@ Payload:
 }
 ```
 
-With the matching issuer config from `docs/configuration.md`, haybale
+With the matching [issuer configuration](configuration.md#identity), haybale
 authenticates this as identity `run-9f2c1a`, scoped to
 `github.com/rxbynerd/haybale`.

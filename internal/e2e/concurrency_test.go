@@ -14,8 +14,7 @@ import (
 	"github.com/rxbynerd/haybale/internal/policy"
 )
 
-// TestParallelClonesThroughProxy is haybale's concurrency-hardening
-// acceptance test for M5: 4 real `git clone` subprocesses run
+// TestParallelClonesThroughProxy runs four real `git clone` subprocesses
 // concurrently against the same in-process haybale proxy (itself
 // forwarding to the same real `git http-backend` CGI upstream this
 // package's other tests use), asserting every clone succeeds with the

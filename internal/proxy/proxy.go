@@ -159,11 +159,9 @@ func New(upstreams map[string]*url.URL, credentialSources map[string]upstream.Cr
 		// upstream, preserving the byte-for-byte passthrough invariant
 		// (the upstream leg carries only the headers the client sent plus
 		// the Authorization rewrite injects — see rewrite). Inbound trace
-		// continuation still works: the SERVER handler in serve.go uses the
-		// global W3C propagator to extract a traceparent a caller (a
-		// Stirrup sandbox) supplied, so haybale's spans still nest under
-		// the caller's trace. When telemetry is disabled the global tracer
-		// is a no-op and this wrapper adds negligible overhead.
+		// continuation still works: the server handler uses the global W3C
+		// propagator to extract a caller-supplied traceparent. When telemetry
+		// is disabled the global tracer is a no-op.
 		Transport: otelhttp.NewTransport(
 			&http.Transport{
 				// Never let the transport request/decode its own gzip
@@ -323,9 +321,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	cred, err := source.Credentials(r.Context(), repo, verb)
 	if err != nil {
-		// A credential-source failure (M4's mint failure; a misconfigured
-		// static token) must never surface as a 401: the client has no
-		// upstream credential of its own to supply, so a 401 would just
+		// A credential-source failure must never surface as a 401: the client
+		// has no upstream credential of its own to supply, so a 401 would just
 		// make git hang on (or fail) a credential prompt it can't answer.
 		// The error itself is never logged — only that it happened —
 		// since an implementation's error could in principle wrap
@@ -366,16 +363,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 	p.metrics.RecordProxied(r.Context(), repo.Host, verb.String(), rec.status, duration, bytesIn.Load(), bytesOut.Load())
 
-	// Logged after ServeHTTP returns (rather than before, as a prior
-	// version of this line did at Debug level) so the log carries the
-	// actual response status, byte counts, and duration — outcome
-	// information a caller can't know in advance. Info rather than Debug
-	// so a default-configured deployment (LogLevel: "info") gets baseline
-	// per-request observability instead of logging nothing. bytesIn and
-	// bytesOut are counted by wrapping the request body reader and
-	// response writer, never by buffering: pack data can run to
-	// gigabytes, so nothing here reads the body itself, only how many
-	// bytes passed through it.
+	// Log after proxying so the record includes response status, byte counts,
+	// and duration. The counters wrap the request body and response writer;
+	// they never buffer pack data.
 	//
 	// InfoContext (not Info) so the record carries r.Context(): when
 	// telemetry is on, the SpanContextHandler stamps this line with the
@@ -490,9 +480,9 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 	}
 }
 
-// modifyResponse implements httputil.ReverseProxy.ModifyResponse. Its
-// only job is the second half of M3's core security invariant: the
-// upstream credential rewrite injected must never reach the client. A
+// modifyResponse implements httputil.ReverseProxy.ModifyResponse. It prevents
+// upstream authentication responses from exposing credential challenges or
+// other upstream-controlled error data to the client. A
 // 401 or 403 arriving here happened strictly after rewrite already set
 // Authorization to that injected credential — httputil.ReverseProxy
 // calls Rewrite before every RoundTrip, with no path that sends a

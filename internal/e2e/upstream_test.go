@@ -10,11 +10,8 @@ import (
 
 // upstreamBasicAuthUsername and upstreamBasicAuthToken are the Basic-auth
 // credential newUpstream's middleware requires on every request — the
-// "real" upstream credential haybale must inject (never the client's own
-// haybale token) for a proxied request to succeed at all. M3 e2e
-// requirement: the upstream now genuinely enforces auth, so a successful
-// clone/push through haybale is proof injection works, not a passthrough
-// that happened to work because the upstream never checked anything.
+// upstream credential haybale must inject, rather than the client JWT, for a
+// proxied request to succeed.
 const (
 	upstreamBasicAuthUsername = "x-access-token"
 	upstreamBasicAuthToken    = "e2e-upstream-token" //nolint:gosec // G101: a fixed, fake test-only credential this package's own fake upstream requires — never a real secret
@@ -51,9 +48,7 @@ func (r *headerRecorder) GitProtocol() string {
 }
 
 // Authorization returns the Authorization header value from the first
-// request the upstream received, or "" if none arrived yet — used by
-// the M3 leak assertions to confirm the upstream sees haybale's injected
-// credential rather than anything derived from the client's own token.
+// request the upstream received, or "" if none arrived yet.
 func (r *headerRecorder) Authorization() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()

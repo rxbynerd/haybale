@@ -1,13 +1,12 @@
 # Authenticating from GitHub Actions (no PAT)
 
 A GitHub Actions workflow can authenticate to haybale using its **ambient
-OIDC token** — the same short-lived JWT `actions/*` uses for cloud
-federation — so cross-repo `git` access inside a workflow no longer
-depends on a Personal Access Token. GitHub is the issuer; haybale is the
-verifier; no long-lived secret is stored anywhere.
+OIDC token** — the same short-lived JWT used for cloud federation. Cross-repo
+Git access therefore does not require a personal access token. GitHub is the
+issuer and haybale is the verifier; no long-lived client secret is needed.
 
-This recipe assumes haybale is reachable from the runner and configured
-with a GitHub Actions issuer (see `docs/configuration.md`).
+This recipe assumes haybale is reachable from the runner and configured with a
+GitHub Actions issuer. See the [configuration reference](configuration.md).
 
 ## 1. haybale side
 
@@ -96,6 +95,5 @@ which may have expired by the time a later step runs.
 
 ## 3. Verify
 
-`docs/runbook-github-actions-acceptance.md` walks through a live
-acceptance: a scratch-repo workflow performing a credential-less cross-repo
-clone/push through a reachable haybale, with evidence capture.
+The [GitHub Actions acceptance runbook](runbook-github-actions-acceptance.md)
+walks through a live clone/push test and the evidence to capture.

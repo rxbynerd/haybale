@@ -272,10 +272,8 @@ func TestParseRequestEmptyHostSegment(t *testing.T) {
 	}
 }
 
-// TestInvalidSingleLine pins the R2 fix: invalid()'s .Error() must never
-// contain a newline, or every rejection log line that includes it would
-// break in half. errors.Join (the prior implementation) violated this;
-// fmt.Errorf("%w: %s", ...) does not.
+// TestInvalidSingleLine confirms invalid errors contain no newline, preserving
+// one-record-per-line logging while retaining errors.Is support.
 func TestInvalidSingleLine(t *testing.T) {
 	err := invalid("some reason")
 	if strings.Contains(err.Error(), "\n") {

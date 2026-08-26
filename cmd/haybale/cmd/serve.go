@@ -73,9 +73,7 @@ func runServe(cmd *cobra.Command, path string) error {
 
 	// Telemetry is set up before the logger so the OTLP log handler (when
 	// enabled) can be composed into it below. A disabled telemetry block
-	// (no endpoint) yields a no-op Providers: noop-backed metrics, a nil
-	// LogHandler, and a Shutdown that does nothing — so the wiring below is
-	// unconditional and haybale behaves exactly as it did pre-telemetry.
+	// yields no-op metrics, no log handler, and a no-op shutdown.
 	providers, err := observability.Setup(cmd.Context(), telemetryConfig(cfg))
 	if err != nil {
 		return fmt.Errorf("setup telemetry: %w", err)
@@ -202,10 +200,8 @@ func runServe(cmd *cobra.Command, path string) error {
 // cfg.TLS is disabled, listenAndServe is exactly srv.ListenAndServe and
 // srv.TLSConfig is left nil; when enabled, srv.TLSConfig carries the
 // certificate config.Validate() already loaded and parsed once (the same
-// fail-fast-at-startup, reuse-not-reparse pattern
-// upstream.CredentialSource/identity.Authenticator/policy.Engine already
-// establish — Certificates, not GetCertificate, since there is nothing
-// left for ListenAndServeTLS's own certFile/keyFile arguments to do), and
+// certificate loaded during config validation. Certificates is used rather
+// than GetCertificate because the key pair is fixed at startup), and
 // listenAndServe calls srv.ListenAndServeTLS("", "") to use it.
 // MinVersion is set explicitly (rather than left at Go's default, itself
 // already TLS 1.2) so that floor is visible here as a deliberate choice.
@@ -223,9 +219,6 @@ func runServe(cmd *cobra.Command, path string) error {
 // already guard against for their own inputs; newServer's TLS branch
 // should fail the same clean way rather than nil-pointer-panicking on
 // *cfg.TLS.Certificate().
-//
-// Extracted from runServe so TLS wiring is testable without a real
-// listener — see TestNewServerTLSEnabled/TestNewServerPlainHTTP.
 func newServer(cfg *config.Config, handler http.Handler) (srv *http.Server, listenAndServe func() error, scheme string, err error) {
 	srv = &http.Server{
 		Addr:              cfg.Listen,
@@ -295,11 +288,6 @@ var ErrDrainTimeoutExceeded = errors.New("drain timeout exceeded before all in-f
 // Shutdown error (not a reached deadline) is still surfaced as a
 // generic error, since that is not a condition this function has a
 // deliberate story for.
-//
-// Extracted from runServe specifically so this logic is testable without
-// a real OS signal or a real TLS listener — see
-// TestServeWithGracefulDrainWaitsForInFlightRequest/
-// TestServeWithGracefulDrainExceedsFiniteTimeout.
 func serveWithGracefulDrain(ctx context.Context, srv *http.Server, p *proxy.Proxy, drainTimeout time.Duration, listenAndServe func() error, logger *slog.Logger) error {
 	errCh := make(chan error, 1)
 	go func() { errCh <- listenAndServe() }()
@@ -320,12 +308,8 @@ func serveWithGracefulDrain(ctx context.Context, srv *http.Server, p *proxy.Prox
 			shutdownCtx, cancel = context.WithTimeout(shutdownCtx, drainTimeout)
 			defer cancel()
 		}
-		// Timed so drain duration is observable — one of the internal
-		// operations issue #1 calls out. How long a fleet takes to drain on
-		// deploy/rollout is a real operational signal (a rising drain time
-		// means longer-running transfers in flight), and previously the
-		// clean-drain path logged nothing at all, so an operator couldn't
-		// tell a fast drain from a slow one or confirm it completed.
+		// Record drain duration so operators can identify long-running
+		// transfers during deployment or shutdown.
 		drainStart := time.Now()
 		shutdownErr := srv.Shutdown(shutdownCtx)
 		drainDuration := time.Since(drainStart)
@@ -372,10 +356,7 @@ func buildUpstreams(cfg *config.Config) (map[string]*url.URL, error) {
 
 // buildCredentialSources converts config.Upstreams (already validated)
 // into the host->CredentialSource map internal/proxy.New expects,
-// reusing the exact upstream.CredentialSource Validate() already built
-// for each Upstream rather than rebuilding it a second time — the same
-// reuse-not-reparse pattern buildUpstreams already establishes for
-// BaseURL.
+// reusing the upstream.CredentialSource built during validation.
 func buildCredentialSources(cfg *config.Config) (map[string]upstream.CredentialSource, error) {
 	sources := make(map[string]upstream.CredentialSource, len(cfg.Upstreams))
 	for _, u := range cfg.Upstreams {
@@ -407,10 +388,8 @@ func wireCredentialSourceLoggers(sources map[string]upstream.CredentialSource, l
 }
 
 // wireCredentialSourceMetrics installs metrics into every
-// *upstream.GitHubAppSource in sources, via SetMetrics — the metrics
-// counterpart of wireCredentialSourceLoggers, run for the same reason: the
-// sources were built inside config.Validate(), before the telemetry
-// pipeline existed. metrics is always non-nil (a disabled Providers still
+// *upstream.GitHubAppSource in sources. Sources are built during config
+// validation, before the telemetry pipeline exists. metrics is always non-nil (a disabled Providers still
 // carries noop-backed instruments), so a source that gets it simply records
 // into no-ops when telemetry is off. StaticSource needs no wiring — it
 // never mints and never touches a cache. Must run once, at startup, before

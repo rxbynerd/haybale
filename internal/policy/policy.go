@@ -6,11 +6,6 @@
 // would produce, so a caller probing repos it lacks access to cannot
 // distinguish "exists but denied" from "does not exist" (no existence
 // oracle).
-//
-// This package is a v0.2 extraction seam: the Engine interface is
-// deliberately narrow (identity + repo + verb in, Decision out) so a
-// future Cedar-backed implementation can replace GlobEngine without
-// touching internal/proxy.
 package policy
 
 import (

@@ -8,10 +8,7 @@ import (
 )
 
 // StaticSource is a CredentialSource that always returns the same fixed
-// Basic-auth credential, regardless of repo or verb. It is the simplest
-// possible CredentialSource — a single shared upstream token (e.g. a
-// deploy token for git.internal.example) rather than a per-repo GitHub
-// App installation token (GitHubAppSource, M4).
+// Basic-auth credential, regardless of repo or verb.
 type StaticSource struct {
 	credential BasicAuth
 }
