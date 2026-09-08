@@ -5,11 +5,12 @@
 # credential-handling network proxy) makes a minimal runtime image worth
 # the extra build stage.
 #
-# Native build only (no cross-compilation ARGs): `go build` targets the
-# builder stage's own GOOS/GOARCH, which is what a plain `docker build`/
-# `podman build` (no buildx) needs for a single-platform image.
+# The build stage always runs on the builder's native architecture and
+# cross-compiles to TARGETOS/TARGETARCH, so multi-platform builds need no
+# emulation. Both are unset for a plain `docker build`/`podman build`, in
+# which case `go build` targets the builder's own platform.
 
-FROM golang:1.26-alpine AS build
+FROM --platform=${BUILDPLATFORM:-} golang:1.26-alpine AS build
 
 WORKDIR /src
 
@@ -26,7 +27,11 @@ COPY internal/ internal/
 # -trimpath removes local filesystem paths from the binary; -s -w strip
 # the symbol table and DWARF debug info, shrinking the binary since
 # nothing in the final image can attach a debugger anyway.
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/haybale ./cmd/haybale
+ARG TARGETOS
+ARG TARGETARCH
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w" -o /out/haybale ./cmd/haybale
 
 # gcr.io/distroless/static-debian12 has no shell, no package manager, and
 # no libc — just enough (a minimal /etc/passwd, ca-certificates, tzdata)

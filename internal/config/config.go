@@ -832,7 +832,7 @@ const keyFileModeMask = 0o077
 // exists but is too permissive.
 //
 // This is a POSIX permission-bits check; haybale targets Linux/container
-// deployments (see Dockerfile), so no Windows-specific fallback is
+// deployments (see Containerfile), so no Windows-specific fallback is
 // implemented.
 func checkKeyFileMode(path string) error {
 	info, err := os.Stat(path)
