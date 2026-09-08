@@ -57,6 +57,28 @@ Mount any configured certificates, JWKS files, or GitHub App keys as read-only
 files as well. Private key files must have owner-only permissions (`0600` or
 stricter) and must be readable by the image's `nonroot` user (UID/GID 65532).
 
+## Published image
+
+Every push to `main` publishes a `linux/amd64` and `linux/arm64` image to
+GitHub Packages, tagged `latest` and `sha-<commit>`:
+
+```sh
+podman pull ghcr.io/rxbynerd/haybale:latest
+```
+
+Pin a deployment to a commit rather than `latest`:
+
+```sh
+podman pull ghcr.io/rxbynerd/haybale:sha-<full-commit-sha>
+```
+
+Each published digest carries a signed build provenance attestation,
+verifiable with the GitHub CLI:
+
+```sh
+gh attestation verify oci://ghcr.io/rxbynerd/haybale:latest --repo rxbynerd/haybale
+```
+
 ## Request flow
 
 Clients address a repository with haybale's host-in-path URL form:
