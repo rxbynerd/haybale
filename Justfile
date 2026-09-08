@@ -12,12 +12,13 @@ default: build test
 build:
     go build -o haybale ./cmd/haybale
 
-# Builds the distroless haybale image described in Dockerfile. Uses
+# Builds the distroless haybale image described in Containerfile. Uses
 # {{container}} (docker or podman) rather than hardcoding one, since a
 # Justfile recipe should work the same way regardless of which the
-# operator has installed.
+# operator has installed. -f is explicit because docker only looks for
+# Dockerfile by default.
 image-build:
-    {{container}} build -t {{image}} .
+    {{container}} build -f Containerfile -t {{image}} .
 
 test:
     go test ./...
