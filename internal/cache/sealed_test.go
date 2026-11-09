@@ -568,9 +568,28 @@ func TestSealedReaderOnGrowingSource(t *testing.T) {
 
 func FuzzSealedReader(f *testing.F) {
 	kr := testKeyring(f)
-	for _, n := range []int{0, 1, 8, 100, SegmentSize, SegmentSize + 3} {
+	// Seeds stay small so that the fuzzer can mutate and minimise them;
+	// Flush gives multi-segment shapes without 64 KiB inputs.
+	for _, n := range []int{0, 1, 8, 100} {
 		f.Add(sealBytes(f, kr, testHeader(), make([]byte, n)))
 	}
+	var buf bytes.Buffer
+	w, err := NewSealedWriter(&buf, kr, testHeader())
+	if err != nil {
+		f.Fatal(err)
+	}
+	for _, chunk := range []string{"0005\x02", "abc", "0000"} {
+		if _, err := w.Write([]byte(chunk)); err != nil {
+			f.Fatal(err)
+		}
+		if err := w.Flush(); err != nil {
+			f.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		f.Fatal(err)
+	}
+	f.Add(buf.Bytes())
 	f.Add([]byte(magic))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		r, err := NewSealedReader(bytes.NewReader(data), kr)
