@@ -24,6 +24,7 @@ type Request struct {
 	ContentType string
 	// Accept is the request Accept value to send upstream.
 	Accept string
-	// KeyHash is SHA-256 over Class, Protocol and Body.
+	// KeyHash is SHA-256 over Class, Protocol and Body. Entry names use it
+	// keyed by Keyring.pathHash, never as it is.
 	KeyHash [32]byte
 }

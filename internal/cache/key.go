@@ -14,7 +14,9 @@ import (
 type entryKey struct {
 	Group    Group
 	RepoHash [32]byte
-	KeyHash  [32]byte
+	// KeyHash is the request's canonical digest keyed under the cache key
+	// by Keyring.pathHash; the zero value marks a purge marker.
+	KeyHash [32]byte
 }
 
 // Path returns "v1/<group>/<repoHash hex>/<keyHash hex>". Group must be

@@ -297,7 +297,7 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo
 		return c.declined(w, host, observability.ClassBypass, reason), false
 	}
 	class := string(req.Class)
-	key := entryKey{Group: req.Class.Group(), RepoHash: c.keyring.RepoHash(baseURL, repo), KeyHash: req.KeyHash}
+	key := entryKey{Group: req.Class.Group(), RepoHash: c.keyring.RepoHash(baseURL, repo), KeyHash: c.keyring.pathHash(req.KeyHash)}
 	if c.marks.marked(key, c.now()) {
 		return c.declined(w, host, class, "uncacheable"), false
 	}

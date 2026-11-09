@@ -111,3 +111,45 @@ func TestDecode32(t *testing.T) {
 		}
 	}
 }
+
+func TestPathHashKnownAnswer(t *testing.T) {
+	kr, err := NewKeyring(testKey(0x2a))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var digest [32]byte
+	for i := range digest {
+		digest[i] = 1
+	}
+	// HMAC-SHA256(HKDF-SHA256(key, no salt, pathKeyInfo), digest), computed
+	// independently of this package.
+	const want = "f9c1b46d951e0c6251eb76a31f8f5172cfaff30c0b72d3f2772fd8d7ff76a18d"
+	if got := kr.pathHash(digest); hex.EncodeToString(got[:]) != want {
+		t.Errorf("pathHash = %x, want %s", got, want)
+	}
+}
+
+func TestPathHashIsKeyedAndStable(t *testing.T) {
+	a, err := NewKeyring(testKey(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NewKeyring(testKey(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte("fetch request"))
+	if a.pathHash(digest) != a.pathHash(digest) {
+		t.Error("pathHash is not stable under one key")
+	}
+	if a.pathHash(digest) == b.pathHash(digest) {
+		t.Error("pathHash is the same under two keys")
+	}
+	if a.pathHash(digest) == digest {
+		t.Error("pathHash returned the digest unchanged")
+	}
+	infos := map[string]bool{sealingKeyInfo: true, entryKeyInfo: true, pathKeyInfo: true}
+	if len(infos) != 3 {
+		t.Error("the path key info string repeats another derivation's")
+	}
+}

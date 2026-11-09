@@ -5,6 +5,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hkdf"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -26,10 +27,13 @@ const keyIDLen = 8
 // sealingKeyInfo separates the master sealing key from other uses of the
 // configured cache key, such as the RepoHash HMAC. entryKeyInfo derives
 // each entry's AES-256-GCM key from the master sealing key and the entry's
-// salt. Both strings are part of the on-disk format.
+// salt. pathKeyInfo derives the key that turns a request digest into the
+// KeyHash in entry names. All three strings are part of the storage
+// format.
 const (
 	sealingKeyInfo = "haybale response cache entry sealing v1"
 	entryKeyInfo   = "haybale response cache entry key v1"
+	pathKeyInfo    = "haybale response cache path key v1"
 )
 
 // Keyring holds the active cache key. Entries are sealed under it and
@@ -40,6 +44,8 @@ type Keyring struct {
 	active string
 	// key is the raw active cache key, the HMAC key for RepoHash.
 	key []byte
+	// path is the HMAC key for pathHash, derived from key.
+	path []byte
 	// sealing maps a key id to the master sealing key derived from that
 	// cache key; entry keys derive from it and a per-entry salt.
 	sealing map[string][KeySize]byte
@@ -52,7 +58,11 @@ func NewKeyring(active []byte) (Keyring, error) {
 	if err != nil {
 		return Keyring{}, err
 	}
-	return Keyring{active: id, key: bytes.Clone(active), sealing: map[string][KeySize]byte{id: sealing}}, nil
+	path, err := hkdf.Key(sha256.New, active, nil, pathKeyInfo, KeySize)
+	if err != nil {
+		return Keyring{}, fmt.Errorf("cache: derive path key: %w", err)
+	}
+	return Keyring{active: id, key: bytes.Clone(active), path: path, sealing: map[string][KeySize]byte{id: sealing}}, nil
 }
 
 // EphemeralKeyring returns a Keyring with a random active key. Entries
@@ -74,6 +84,17 @@ func (k Keyring) activeID() string { return k.active }
 // same configured key. baseURL must not be nil.
 func (k Keyring) RepoHash(baseURL *url.URL, repo gitproto.Repo) [32]byte {
 	return repoHash(k.key, baseURL, repo)
+}
+
+// pathHash returns the KeyHash that names the entry for a request whose
+// canonical digest is digest: HMAC-SHA256 under the path key, so a reader
+// of object names cannot confirm a guessed request without the cache key.
+func (k Keyring) pathHash(digest [32]byte) [32]byte {
+	mac := hmac.New(sha256.New, k.path)
+	mac.Write(digest[:])
+	var sum [32]byte
+	mac.Sum(sum[:0])
+	return sum
 }
 
 // holds reports whether the keyring has the key with id.

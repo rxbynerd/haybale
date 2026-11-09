@@ -474,6 +474,37 @@ func TestRemoteTierServesAPeersEntry(t *testing.T) {
 	}
 }
 
+func TestEntryNamesUseTheKeyedRequestHash(t *testing.T) {
+	store := newMemBlobStore()
+	c, _, _ := newRemoteTestCache(t, store, nil)
+	r := fetchRequest(t)
+	req, bypass, _, err := classify(r, testRepo, c.opts.MaxRequestBody)
+	if err != nil || bypass {
+		t.Fatalf("classify: bypass %v, %v", bypass, err)
+	}
+	if out, _, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), packFetcher(remotePack(t))); !out.Stored {
+		t.Fatalf("fetch = %+v, want a stored miss", out)
+	}
+	waitFor(t, "the pack upload", func() bool { return len(store.keys(packPrefix)) == 1 })
+	remote := store.keys(packPrefix)[0]
+	var local []string
+	for _, f := range entryFiles(t, c.opts.Dir) {
+		if strings.HasPrefix(f, packPrefix) {
+			local = append(local, f)
+		}
+	}
+	if len(local) != 1 || local[0] != remote {
+		t.Errorf("disk entries %v and remote object %s differ, want one shared name", local, remote)
+	}
+	if strings.Contains(remote, hex.EncodeToString(req.KeyHash[:])) {
+		t.Errorf("object name %s contains the plain request digest", remote)
+	}
+	want := entryKey{Group: GroupPack, RepoHash: c.keyring.RepoHash(testBaseURL, testRepo), KeyHash: c.keyring.pathHash(req.KeyHash)}.Path()
+	if remote != want {
+		t.Errorf("object name = %s, want %s", remote, want)
+	}
+}
+
 func TestRemoteFillCoalescesSubscribers(t *testing.T) {
 	store := newMemBlobStore()
 	pack := remotePack(t)
