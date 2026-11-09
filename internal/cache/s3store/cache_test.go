@@ -279,9 +279,15 @@ func TestCachePurgeRemoteWritesAMarkerAndDeletesObjects(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := newStore(t, testConfig(fake.URL()))
-	n, err := cache.PurgeRemote(context.Background(), store, kr, cacheTestRepo, cacheTestBaseURL, []cache.Group{cache.GroupRefs, cache.GroupPack}, time.Now())
-	if err != nil || n != 1 {
-		t.Fatalf("PurgeRemote = %d, %v; want the pack deleted", n, err)
+	res, err := cache.PurgeRepository(context.Background(), kr, cache.PurgeRequest{
+		Repo:    cacheTestRepo,
+		BaseURL: cacheTestBaseURL,
+		Groups:  []cache.Group{cache.GroupRefs, cache.GroupPack},
+		Now:     time.Now(),
+		Remote:  store,
+	})
+	if err != nil || res.Remote != 1 {
+		t.Fatalf("PurgeRepository = %+v, %v; want the pack deleted", res, err)
 	}
 	if got := objectsUnder(fake, "tenant/v1/purge/"); len(got) != 1 {
 		t.Errorf("purge markers = %v, want one", got)

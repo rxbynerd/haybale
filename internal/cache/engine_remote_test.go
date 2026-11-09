@@ -50,7 +50,7 @@ type memBlobStore struct {
 	statHook   func(ctx context.Context, key string) error
 	putHook    func(ctx context.Context, key string) error
 	deleteHook func(ctx context.Context, key string) error
-	listErr  error
+	listErr    error
 	// etags makes the store report an ETag for every object and honour
 	// GetIfMatch.
 	etags bool
@@ -402,6 +402,13 @@ func seedPeerWith(t *testing.T, store *memBlobStore, pack []byte, mutate func(*O
 	})
 	store.forgetCalls()
 	return peer
+}
+
+// purgeRemote purges testRepo's groups from the remote tier alone and
+// returns how many remote entries it deleted.
+func purgeRemote(store BlobStore, kr Keyring, groups []Group, now time.Time) (int, error) {
+	res, err := PurgeRepository(context.Background(), kr, PurgeRequest{Repo: testRepo, BaseURL: testBaseURL, Groups: groups, Now: now, Remote: store})
+	return res.Remote, err
 }
 
 // withRefsMaxAge sets a positive refsMaxAge, so refs entries are shared
@@ -1226,11 +1233,11 @@ func TestPurgeRemoteKeepsTheOtherGroupsTime(t *testing.T) {
 	kr := testKeyring(t)
 	repoHash := kr.RepoHash(testBaseURL, testRepo)
 	t0 := newFakeClock().Now()
-	if _, err := PurgeRemote(context.Background(), store, kr, testRepo, testBaseURL, []Group{GroupPack}, t0); err != nil {
+	if _, err := purgeRemote(store, kr, []Group{GroupPack}, t0); err != nil {
 		t.Fatal(err)
 	}
 	t1 := t0.Add(time.Hour)
-	if _, err := PurgeRemote(context.Background(), store, kr, testRepo, testBaseURL, []Group{GroupRefs}, t1); err != nil {
+	if _, err := purgeRemote(store, kr, []Group{GroupRefs}, t1); err != nil {
 		t.Fatal(err)
 	}
 	times, found, err := readPurgeMarker(context.Background(), store, kr, repoHash, t1)
@@ -1253,7 +1260,7 @@ func TestPurgeRemoteDeletesOnlyEntryObjectsOfTheGroups(t *testing.T) {
 	for _, k := range []string{refs, pack, stray} {
 		store.store(k, []byte("x"))
 	}
-	n, err := PurgeRemote(context.Background(), store, kr, testRepo, testBaseURL, []Group{GroupPack}, newFakeClock().Now())
+	n, err := purgeRemote(store, kr, []Group{GroupPack}, newFakeClock().Now())
 	if err != nil || n != 1 {
 		t.Fatalf("PurgeRemote = %d, %v; want 1 deleted", n, err)
 	}

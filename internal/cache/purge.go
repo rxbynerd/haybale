@@ -176,38 +176,140 @@ func readPurgeMarker(ctx context.Context, store BlobStore, kr Keyring, repoHash 
 	return times, err == nil, err
 }
 
-// PurgeRemote purges repo's entries in groups from the remote tier. It
-// first records the purge at now in the repository's purge marker,
-// keeping the times of groups not purged now, so that every replica
-// sharing the tier treats local entries created before it as misses once
-// it next refreshes the repository's access record. It then deletes the
-// groups' remote objects and returns how many it deleted. A marker that
-// fails verification is replaced.
-func PurgeRemote(ctx context.Context, store BlobStore, kr Keyring, repo gitproto.Repo, baseURL *url.URL, groups []Group, now time.Time) (int, error) {
+// PurgeStep names one step of PurgeRepository.
+type PurgeStep uint8
+
+const (
+	// PurgeStepMarker writes the repository's purge marker.
+	PurgeStepMarker PurgeStep = iota + 1
+	// PurgeStepRemote deletes the repository's remote entries.
+	PurgeStepRemote
+	// PurgeStepLocal deletes the repository's local entries.
+	PurgeStepLocal
+)
+
+// PurgeRequest describes the purge of one repository's entries.
+type PurgeRequest struct {
+	Repo    gitproto.Repo
+	BaseURL *url.URL
+	// Groups are the groups purged; see ParseGroups.
+	Groups []Group
+	// Now is the purge time the marker records.
+	Now time.Time
+	// Remote is the remote tier, nil for a local-only purge.
+	Remote BlobStore
+	// DeleteLocal deletes the local entries under one repository prefix
+	// and returns how many it removed; nil skips the local tier.
+	DeleteLocal func(prefix string) (int, error)
+	// StepDone, when set, is called as each step succeeds, with the result
+	// so far.
+	StepDone func(PurgeStep, PurgeResult)
+}
+
+// PurgeResult counts what PurgeRepository did.
+type PurgeResult struct {
+	// MarkerReplaced reports that the repository's existing purge marker
+	// failed verification and was replaced.
+	MarkerReplaced bool
+	// Remote and Local count the entries deleted from each tier.
+	Remote, Local int
+}
+
+// PurgeError is a failed step of PurgeRepository. Group is the group
+// being deleted when a remote or local step failed.
+type PurgeError struct {
+	Step  PurgeStep
+	Group Group
+	Err   error
+}
+
+func (e *PurgeError) Error() string { return e.Err.Error() }
+
+func (e *PurgeError) Unwrap() error { return e.Err }
+
+// PurgeRepository purges a repository's entries in req.Groups, in this
+// order: with a remote tier it records the purge in the repository's purge
+// marker, so that every replica sharing the tier drops older local
+// entries at its next marker check, then deletes the remote entries; it
+// then deletes the local entries. A marker that cannot be written ends the
+// purge before anything is deleted. A remote deletion that fails still
+// lets the local step run, and both failures are returned as
+// *PurgeError values. Rerunning a purge is safe.
+func PurgeRepository(ctx context.Context, kr Keyring, req PurgeRequest) (PurgeResult, error) {
+	var res PurgeResult
+	done := func(step PurgeStep) {
+		if req.StepDone != nil {
+			req.StepDone(step, res)
+		}
+	}
+	repoHash := kr.RepoHash(req.BaseURL, req.Repo)
+	var remoteErr, localErr error
+	if req.Remote != nil {
+		replaced, err := writePurgeMarker(ctx, req.Remote, kr, req.Repo, req.BaseURL, req.Groups, req.Now)
+		if err != nil {
+			return res, &PurgeError{Step: PurgeStepMarker, Err: err}
+		}
+		res.MarkerReplaced = replaced
+		done(PurgeStepMarker)
+		for _, g := range req.Groups {
+			n, err := deleteRemotePrefix(ctx, req.Remote, RepoPrefix(g, repoHash))
+			res.Remote += n
+			if err != nil {
+				remoteErr = &PurgeError{Step: PurgeStepRemote, Group: g, Err: err}
+				break
+			}
+		}
+		if remoteErr == nil {
+			done(PurgeStepRemote)
+		}
+	}
+	if req.DeleteLocal != nil {
+		for _, g := range req.Groups {
+			n, err := req.DeleteLocal(RepoPrefix(g, repoHash))
+			res.Local += n
+			if err != nil {
+				localErr = &PurgeError{Step: PurgeStepLocal, Group: g, Err: err}
+				break
+			}
+		}
+		if localErr == nil {
+			done(PurgeStepLocal)
+		}
+	}
+	return res, errors.Join(remoteErr, localErr)
+}
+
+// writePurgeMarker records a purge of groups at now in the repository's
+// purge marker, keeping the times of groups not purged now. The marker's
+// creation time is the latest of now and every kept time, so a kept time
+// from a host whose clock ran ahead still verifies. A marker that fails
+// verification is replaced, and replaced reports it.
+func writePurgeMarker(ctx context.Context, store BlobStore, kr Keyring, repo gitproto.Repo, baseURL *url.URL, groups []Group, now time.Time) (replaced bool, err error) {
 	repoHash := kr.RepoHash(baseURL, repo)
 	times, _, err := readPurgeMarker(ctx, store, kr, repoHash, now)
-	if err != nil && !errors.Is(err, ErrIntegrity) {
-		return 0, fmt.Errorf("cache: read purge marker: %w", err)
+	switch {
+	case errors.Is(err, ErrIntegrity):
+		replaced = true
+	case err != nil:
+		return false, fmt.Errorf("cache: read purge marker: %w", err)
+	}
+	createdAt := now
+	for _, t := range []time.Time{times.refs, times.pack} {
+		if t.After(createdAt) {
+			createdAt = t
+		}
 	}
 	for _, g := range groups {
 		times.set(g, now)
 	}
-	marker, err := sealPurgeMarker(kr, repoHash, repo, baseURL, now, times)
+	marker, err := sealPurgeMarker(kr, repoHash, repo, baseURL, createdAt, times)
 	if err != nil {
-		return 0, err
+		return false, err
 	}
 	if err := store.Put(ctx, purgeMarkerPath(repoHash), bytes.NewReader(marker), int64(len(marker))); err != nil {
-		return 0, fmt.Errorf("cache: write purge marker: %w", err)
+		return false, fmt.Errorf("cache: write purge marker: %w", err)
 	}
-	deleted := 0
-	for _, g := range groups {
-		n, err := deleteRemotePrefix(ctx, store, RepoPrefix(g, repoHash))
-		deleted += n
-		if err != nil {
-			return deleted, err
-		}
-	}
-	return deleted, nil
+	return replaced, nil
 }
 
 // deleteRemotePrefix deletes every entry object under prefix and returns

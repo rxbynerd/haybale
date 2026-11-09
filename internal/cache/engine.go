@@ -736,35 +736,33 @@ func (c *Cache) Invalidate(ctx context.Context, repo gitproto.Repo, baseURL *url
 	}
 }
 
-// Purge deletes the stored entries of repo in group, or in both groups
-// when group is empty, and returns how many were removed. With a remote
-// tier it also purges the remote tier through PurgeRemote, counting the
-// remote objects deleted, so other replicas drop their older entries.
+// Purge deletes the entries of repo in group, or in both groups when
+// group is empty, through PurgeRepository, and returns how many were
+// removed from both tiers. With a remote tier the purge marker makes
+// other replicas drop their older entries, and this process treats
+// entries created before now as purged.
 func (c *Cache) Purge(ctx context.Context, repo gitproto.Repo, baseURL *url.URL, group Group) (int, error) {
 	groups, err := ParseGroups(string(group))
 	if err != nil {
 		return 0, err
 	}
-	repoHash := c.keyring.RepoHash(baseURL, repo)
-	total := 0
-	for _, g := range groups {
-		n, err := c.store.DeletePrefix(RepoPrefix(g, repoHash))
-		total += n
-		if err != nil {
-			return total, err
-		}
-	}
-	if c.remote == nil {
-		return total, nil
-	}
 	now := c.now()
-	var times purgeTimes
-	for _, g := range groups {
-		times.set(g, now)
+	if c.remote != nil {
+		var times purgeTimes
+		for _, g := range groups {
+			times.set(g, now)
+		}
+		c.purges.observe(c.keyring.RepoHash(baseURL, repo), times, now)
 	}
-	c.purges.observe(repoHash, times, now)
-	n, err := PurgeRemote(ctx, c.remote, c.keyring, repo, baseURL, groups, now)
-	return total + n, err
+	res, err := PurgeRepository(ctx, c.keyring, PurgeRequest{
+		Repo:        repo,
+		BaseURL:     baseURL,
+		Groups:      groups,
+		Now:         now,
+		Remote:      c.remote,
+		DeleteLocal: c.store.DeletePrefix,
+	})
+	return res.Remote + res.Local, err
 }
 
 // Close stops the janitor, cancels every fill and waits for them, then

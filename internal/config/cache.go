@@ -261,6 +261,9 @@ type RemoteCacheConfig struct {
 	parsedHeaderTimeout time.Duration
 }
 
+// HasRemote reports whether the block configures a remote tier.
+func (c CacheConfig) HasRemote() bool { return c.Remote.set() }
+
 // set reports whether any field of the block is set.
 func (r RemoteCacheConfig) set() bool {
 	r.parsedHeaderTimeout = 0
