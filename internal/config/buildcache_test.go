@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -63,8 +64,9 @@ func TestBuildCacheEphemeralKeyLogsThatEntriesDoNotSurviveRestart(t *testing.T) 
 	if got == nil {
 		t.Fatal("BuildCache returned a nil cache for an enabled block")
 	}
-	if log := buf.String(); !strings.Contains(log, "level=INFO") || !strings.Contains(log, "will not survive a restart") {
-		t.Errorf("log = %q, want an Info line saying the cache will not survive a restart", log)
+	line := logLine(t, buf.String(), "ephemeral key")
+	if !strings.Contains(line, "level=INFO") || !strings.Contains(line, "does not survive a restart") {
+		t.Errorf("line = %q, want an Info line saying the cache does not survive a restart", line)
 	}
 	if info, err := os.Stat(c.Dir); err != nil || !info.IsDir() {
 		t.Errorf("cache directory was not created: %v", err)
@@ -82,9 +84,129 @@ func TestBuildCacheReadsTheKeyFromTheEnvironment(t *testing.T) {
 		t.Fatalf("BuildCache: %v", err)
 	}
 	defer closeCache(t, got)
-	if strings.Contains(buf.String(), "ephemeral") {
+	if strings.Contains(buf.String(), "ephemeral key") {
 		t.Errorf("log = %q, want no ephemeral-key notice when keyEnv is set", buf.String())
 	}
+	line := logLine(t, buf.String(), "response cache enabled")
+	if !strings.Contains(line, "keyMode=configured") {
+		t.Errorf("line = %q, want keyMode=configured", line)
+	}
+	// Neither the variable's value nor its base64 form may reach the log.
+	for _, secret := range []string{base64.StdEncoding.EncodeToString(key), base64.RawStdEncoding.EncodeToString(key), string(key)} {
+		if strings.Contains(buf.String(), secret) {
+			t.Errorf("log contains the cache key value %q", secret)
+		}
+	}
+}
+
+// TestBuildCacheLogsTheEffectiveConfiguration confirms a built cache is
+// announced at Info with its location, key mode and limits, in both key
+// modes.
+func TestBuildCacheLogsTheEffectiveConfiguration(t *testing.T) {
+	cases := map[string]struct {
+		keyEnv  bool
+		keyMode string
+	}{
+		"ephemeral key":  {false, "keyMode=ephemeral"},
+		"configured key": {true, "keyMode=configured"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x3c}, cache.KeySize))
+			c := enabledCacheConfig(t)
+			if tc.keyEnv {
+				t.Setenv(testCacheKeyEnv, key)
+				c.KeyEnv = testCacheKeyEnv
+			}
+			var buf bytes.Buffer
+			got, err := c.BuildCache(slog.New(slog.NewTextHandler(&buf, nil)), observability.NewNoopMetrics())
+			if err != nil {
+				t.Fatalf("BuildCache: %v", err)
+			}
+			defer closeCache(t, got)
+
+			line := logLine(t, buf.String(), "response cache enabled")
+			for _, want := range []string{
+				"level=INFO",
+				"dir=" + c.Dir,
+				tc.keyMode,
+				"maxDiskSize=10GiB",
+				"maxEntrySize=1GiB",
+				"maxConcurrentFills=4",
+			} {
+				if !strings.Contains(line, want) {
+					t.Errorf("line = %q, want it to contain %q", line, want)
+				}
+			}
+			for _, secret := range []string{key, testCacheKeyEnv} {
+				if strings.Contains(buf.String(), secret) {
+					t.Errorf("log contains %q, which must never be logged", secret)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildCacheWarnsWhenFillsCanOutgrowTheDiskBudget confirms the
+// oversubscription warning appears when concurrent fills can reserve more
+// than the disk budget, and not for the defaults.
+func TestBuildCacheWarnsWhenFillsCanOutgrowTheDiskBudget(t *testing.T) {
+	const warning = "concurrent fills can reserve more than the disk budget"
+	cases := map[string]struct {
+		mutate   func(c *CacheConfig)
+		wantWarn bool
+	}{
+		"defaults":                        {func(c *CacheConfig) {}, false},
+		"fills exactly fill the budget":   {func(c *CacheConfig) { c.MaxDiskSize, c.MaxEntrySize, c.MaxConcurrentFills = 64*mib, 8*mib, 8 }, false},
+		"fills one entry over the budget": {func(c *CacheConfig) { c.MaxDiskSize, c.MaxEntrySize, c.MaxConcurrentFills = 64*mib, 8*mib, 9 }, true},
+		"many fills of the default entry": {func(c *CacheConfig) { c.MaxConcurrentFills = 16 }, true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := enabledCacheConfig(t)
+			tc.mutate(&c)
+			if err := c.validate(); err != nil {
+				t.Fatalf("validate: %v", err)
+			}
+			var buf bytes.Buffer
+			got, err := c.BuildCache(slog.New(slog.NewTextHandler(&buf, nil)), observability.NewNoopMetrics())
+			if err != nil {
+				t.Fatalf("BuildCache: %v", err)
+			}
+			defer closeCache(t, got)
+
+			if !tc.wantWarn {
+				if strings.Contains(buf.String(), warning) {
+					t.Errorf("log = %q, want no oversubscription warning", buf.String())
+				}
+				return
+			}
+			line := logLine(t, buf.String(), warning)
+			for _, want := range []string{
+				"level=WARN",
+				"maxConcurrentFills=" + strconv.Itoa(c.MaxConcurrentFills),
+				"maxEntrySize=" + c.MaxEntrySize.String(),
+				"maxDiskSize=" + c.MaxDiskSize.String(),
+			} {
+				if !strings.Contains(line, want) {
+					t.Errorf("line = %q, want it to contain %q", line, want)
+				}
+			}
+		})
+	}
+}
+
+// logLine returns the line of a text-handler log containing substr, and
+// fails the test when none does.
+func logLine(t *testing.T, log, substr string) string {
+	t.Helper()
+	for line := range strings.SplitSeq(log, "\n") {
+		if strings.Contains(line, substr) {
+			return line
+		}
+	}
+	t.Fatalf("log = %q, want a line containing %q", log, substr)
+	return ""
 }
 
 func TestBuildCacheRejectsBadKeys(t *testing.T) {

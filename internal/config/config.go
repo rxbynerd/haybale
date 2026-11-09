@@ -2,7 +2,8 @@
 // Validation resolves policy, upstream URLs and credentials, listener TLS,
 // identity settings, and telemetry settings before the server accepts traffic.
 // Network-backed JWKS sources are initialized separately by BuildAuthenticator
-// so policy checks remain offline.
+// so policy checks remain offline, and the response cache is opened
+// separately by CacheConfig.BuildCache for the same reason.
 package config
 
 import (
@@ -795,6 +796,9 @@ func (c *Config) Validate() error {
 		}
 		if parsed.Scheme == "" || parsed.Host == "" {
 			return fmt.Errorf("upstreams[%d] (host %q): baseURL %q must be an absolute URL with scheme and host", i, u.Host, u.BaseURL)
+		}
+		if parsed.User != nil {
+			return fmt.Errorf("upstreams[%d] (host %q): baseURL must not contain credentials", i, u.Host)
 		}
 		u.parsedBaseURL = parsed
 

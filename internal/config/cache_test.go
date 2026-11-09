@@ -1,8 +1,10 @@
 package config
 
 import (
+	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -278,7 +280,25 @@ func TestCacheConfigValidate(t *testing.T) {
 		{name: "empty durations accepted as zero", mutate: func(c *CacheConfig) {
 			c.Retention, c.RefsMaxAge, c.AccessRecheck, c.ResponseHeaderTimeout, c.IdleTimeout = "", "", "", "", ""
 		}},
-		{name: "entry size equal to disk size", mutate: func(c *CacheConfig) { c.MaxEntrySize = c.MaxDiskSize }},
+		{
+			name:    "entry size equal to disk size",
+			mutate:  func(c *CacheConfig) { c.MaxEntrySize = c.MaxDiskSize },
+			wantErr: "cache: maxEntrySize 10GiB must not exceed half of maxDiskSize 10GiB",
+		},
+		{
+			name:    "entry size just above half the disk size",
+			mutate:  func(c *CacheConfig) { c.MaxEntrySize = c.MaxDiskSize/2 + 1 },
+			wantErr: "cache: maxEntrySize 5368709121B must not exceed half of maxDiskSize 10GiB",
+		},
+		{name: "entry size exactly half the disk size", mutate: func(c *CacheConfig) { c.MaxEntrySize = c.MaxDiskSize / 2 }},
+		{name: "entry size just below half the disk size", mutate: func(c *CacheConfig) { c.MaxEntrySize = c.MaxDiskSize/2 - 1 }},
+		{name: "entry size well below half the disk size", mutate: func(c *CacheConfig) { c.MaxEntrySize = c.MaxDiskSize / 10 }},
+		{
+			name:    "odd disk size halves rounding down",
+			mutate:  func(c *CacheConfig) { c.MaxDiskSize, c.MaxEntrySize = 2*gib+1, gib+1 },
+			wantErr: "cache: maxEntrySize 1073741825B must not exceed half of maxDiskSize 2147483649B",
+		},
+		{name: "odd disk size accepts the rounded-down half", mutate: func(c *CacheConfig) { c.MaxDiskSize, c.MaxEntrySize = 2*gib+1, gib }},
 		{name: "dir required", mutate: func(c *CacheConfig) { c.Dir = "" }, wantErr: "cache: dir is required"},
 		{name: "retention unparseable", mutate: func(c *CacheConfig) { c.Retention = "a day" }, wantErr: "cache: retention"},
 		{name: "retention negative", mutate: func(c *CacheConfig) { c.Retention = "-1h" }, wantErr: "cache: retention"},
@@ -291,6 +311,11 @@ func TestCacheConfigValidate(t *testing.T) {
 		{
 			name:    "entry size above disk size",
 			mutate:  func(c *CacheConfig) { c.MaxEntrySize = c.MaxDiskSize + 1 },
+			wantErr: "cache: maxEntrySize",
+		},
+		{
+			name:    "disk size so large that doubling the entry size would overflow",
+			mutate:  func(c *CacheConfig) { c.MaxDiskSize, c.MaxEntrySize = math.MaxInt64, math.MaxInt64/2+1 },
 			wantErr: "cache: maxEntrySize",
 		},
 		{name: "no concurrent fills", mutate: func(c *CacheConfig) { c.MaxConcurrentFills = 0 }, wantErr: "cache: maxConcurrentFills"},
@@ -460,6 +485,27 @@ func TestLoadCacheAppliesDefaults(t *testing.T) {
 	}
 }
 
+// TestLoadCacheTreatsZeroSizesAndCountsAsUnset confirms an explicit zero
+// selects the default, the same as omitting the field.
+func TestLoadCacheTreatsZeroSizesAndCountsAsUnset(t *testing.T) {
+	cfg, err := loadWithCacheBlock(t, `
+cache:
+  enabled: true
+  dir: /var/cache/haybale
+  maxConcurrentFills: 0
+  maxRequestBody: 0MiB
+  maxDiskSize: 0GiB
+  maxEntrySize: 0GiB
+`)
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+	c := cfg.Cache
+	if c.MaxDiskSize != 10*gib || c.MaxEntrySize != gib || c.MaxConcurrentFills != 4 || c.MaxRequestBody != mib {
+		t.Errorf("defaults = %s/%s/%d/%s, want 10GiB/1GiB/4/1MiB", c.MaxDiskSize, c.MaxEntrySize, c.MaxConcurrentFills, c.MaxRequestBody)
+	}
+}
+
 // TestLoadCacheIsOffByDefault confirms a config with no cache block, and
 // one with enabled: false, load with an inert, undefaulted cache.
 func TestLoadCacheIsOffByDefault(t *testing.T) {
@@ -509,6 +555,7 @@ func TestLoadCacheRejections(t *testing.T) {
 		{"remote block", "cache:\n  enabled: true\n  dir: /c\n  remote:\n    type: s3\n    bucket: b\n", "cache: remote is not supported in this release"},
 		{"staleIfErrorFor", "cache:\n  enabled: true\n  dir: /c\n  staleIfErrorFor: 1h\n", "cache: staleIfErrorFor is not supported in this release"},
 		{"entry above disk", "cache:\n  enabled: true\n  dir: /c\n  maxDiskSize: 1GiB\n  maxEntrySize: 2GiB\n", "cache: maxEntrySize"},
+		{"entry above half of disk", "cache:\n  enabled: true\n  dir: /c\n  maxDiskSize: 2GiB\n  maxEntrySize: 1.5GiB\n", "cache: maxEntrySize 1536MiB must not exceed half of maxDiskSize 2GiB"},
 		{"negative retention", "cache:\n  enabled: true\n  dir: /c\n  retention: -1h\n", "cache: retention"},
 		{"refsMaxAge not below accessRecheck", "cache:\n  enabled: true\n  dir: /c\n  refsMaxAge: 5m\n", "cache: refsMaxAge"},
 		{"unknown key", "cache:\n  enabled: true\n  dir: /c\n  maxDiskSiez: 1GiB\n", `cache: unknown field "maxDiskSiez" (line`},
@@ -535,5 +582,179 @@ func TestCacheConfigRejectsZeroRetention(t *testing.T) {
 	err := cfg.validate()
 	if err == nil || !strings.Contains(err.Error(), "retention") {
 		t.Fatalf("validate() error = %v, want a retention error", err)
+	}
+}
+
+// TestLoadCacheKeyWalkFollowsAliases confirms the unknown-key check sees
+// through aliases, merge keys and aliased keys, so no spelling of the
+// cache block escapes it.
+func TestLoadCacheKeyWalkFollowsAliases(t *testing.T) {
+	tests := []struct {
+		name    string
+		block   string
+		wantErr string // substring expected in the error; "" means Load succeeds
+		enabled bool   // expected Cache.Enabled on success
+	}{
+		{
+			name: "alias to a mapping with a typo",
+			block: `
+x-cache: &c
+  enabled: true
+  dir: /c
+  maxDiskSiez: 1GiB
+cache: *c
+`,
+			wantErr: `cache: unknown field "maxDiskSiez" (line`,
+		},
+		{
+			name: "alias to a valid mapping",
+			block: `
+x-cache: &c
+  enabled: true
+  dir: /c
+cache: *c
+`,
+			enabled: true,
+		},
+		{
+			name: "anchor nested under another key and reused",
+			block: `
+shared:
+  block: &c
+    enabled: true
+    dir: /c
+    retentoin: 1h
+cache: *c
+`,
+			wantErr: `cache: unknown field "retentoin" (line`,
+		},
+		{
+			name: "anchor nested under another key and reused without a typo",
+			block: `
+shared:
+  block: &c
+    enabled: true
+    dir: /c
+    retention: 1h
+cache: *c
+`,
+			enabled: true,
+		},
+		{
+			name: "aliased remote with an unknown key",
+			block: `
+x-remote: &r
+  timeout: 10s
+cache:
+  enabled: false
+  remote: *r
+`,
+			wantErr: `cache.remote: unknown field "timeout" (line`,
+		},
+		{
+			name: "aliased remote with known keys in a disabled block",
+			block: `
+x-remote: &r
+  type: s3
+cache:
+  enabled: false
+  remote: *r
+`,
+		},
+		{
+			name: "aliased cache block holding an aliased remote with an unknown key",
+			block: `
+x-remote: &r
+  timeout: 10s
+x-cache: &c
+  enabled: false
+  remote: *r
+cache: *c
+`,
+			wantErr: `cache.remote: unknown field "timeout" (line`,
+		},
+		{
+			name: "merge key inside the block",
+			block: `
+x-base: &base
+  enabled: true
+  dir: /c
+cache:
+  <<: *base
+  retention: 1h
+`,
+			wantErr: `cache: unknown field "<<" (line`,
+		},
+		{
+			name: "aliased key naming an unknown field",
+			block: `
+x-key: &k maxDiskSiez
+cache:
+  enabled: true
+  dir: /c
+  *k : 1GiB
+`,
+			wantErr: `cache: unknown field "maxDiskSiez" (line`,
+		},
+		{
+			name:  "null cache block is disabled",
+			block: "cache:\n",
+		},
+		{
+			name:  "explicit null cache block is disabled",
+			block: "cache: ~\n",
+		},
+		{
+			name:    "scalar cache block",
+			block:   "cache: enabled\n",
+			wantErr: "cannot unmarshal",
+		},
+		{
+			name:    "alias to a scalar",
+			block:   "x-cache: &c enabled\ncache: *c\n",
+			wantErr: "cannot unmarshal",
+		},
+		{
+			name:    "sequence cache block",
+			block:   "cache: [enabled]\n",
+			wantErr: "cannot unmarshal",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := loadWithCacheBlock(t, tt.block)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Load() error = %v, want nil", err)
+				}
+				if cfg.Cache.Enabled != tt.enabled {
+					t.Errorf("Cache.Enabled = %v, want %v", cfg.Cache.Enabled, tt.enabled)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Load() error = nil, want one containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Load() error = %q, want it to contain %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestResolveAliasStopsAtACycle confirms an alias that refers back to
+// itself neither hangs the key walk nor counts as a mapping.
+func TestResolveAliasStopsAtACycle(t *testing.T) {
+	t.Parallel()
+	loop := &yaml.Node{Kind: yaml.AliasNode, Value: "loop"}
+	loop.Alias = loop
+	if got := resolveAlias(loop); got.Kind != yaml.AliasNode {
+		t.Errorf("resolveAlias(cycle).Kind = %v, want the alias node returned unresolved", got.Kind)
+	}
+	if err := checkKnownKeys(loop, reflect.TypeFor[CacheConfig](), "cache"); err != nil {
+		t.Errorf("checkKnownKeys(cycle) error = %v, want nil so the decoder reports it", err)
+	}
+	if got := mappingValue(loop, "cache"); got != nil {
+		t.Errorf("mappingValue(cycle) = %v, want nil", got)
 	}
 }

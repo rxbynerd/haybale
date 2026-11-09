@@ -136,8 +136,9 @@ type CacheConfig struct {
 	// 10GiB.
 	MaxDiskSize ByteSize `yaml:"maxDiskSize"`
 	// MaxEntrySize is the largest response stored; larger responses
-	// stream through unstored. It must not exceed MaxDiskSize. Defaults
-	// to 1GiB.
+	// stream through unstored. It must not exceed half of MaxDiskSize,
+	// which leaves room for a second fill and for stored entries.
+	// Defaults to 1GiB.
 	MaxEntrySize ByteSize `yaml:"maxEntrySize"`
 	// MaxConcurrentFills bounds simultaneous cache fills; a read that
 	// finds no free slot is proxied without the cache. Must be at least
@@ -245,8 +246,9 @@ func (c CacheConfig) ParsedResponseHeaderTimeout() time.Duration {
 // Validate has not run).
 func (c CacheConfig) ParsedIdleTimeout() time.Duration { return c.parsedIdleTimeout }
 
-// applyDefaults fills in every unset field of an enabled block. A
-// disabled block is left untouched so it stays inert.
+// applyDefaults selects the default for every field of an enabled block
+// that is unset: a size or count of zero and an empty duration string
+// both mean unset. A disabled block is left untouched so it stays inert.
 func (c *CacheConfig) applyDefaults() {
 	if !c.Enabled {
 		return
@@ -329,8 +331,8 @@ func (c *CacheConfig) validate() error {
 	if c.parsedRefsMaxAge > 0 && c.parsedAccessRecheck > 0 && c.parsedRefsMaxAge >= c.parsedAccessRecheck {
 		return fmt.Errorf("cache: refsMaxAge %q must be less than accessRecheck %q: a refs response served from the cache does not renew the upstream access check cached packs depend on", c.RefsMaxAge, c.AccessRecheck)
 	}
-	if c.MaxEntrySize > c.MaxDiskSize {
-		return fmt.Errorf("cache: maxEntrySize %s must not exceed maxDiskSize %s", c.MaxEntrySize, c.MaxDiskSize)
+	if c.MaxEntrySize > c.MaxDiskSize/2 {
+		return fmt.Errorf("cache: maxEntrySize %s must not exceed half of maxDiskSize %s", c.MaxEntrySize, c.MaxDiskSize)
 	}
 	if c.MaxConcurrentFills < 1 {
 		return fmt.Errorf("cache: maxConcurrentFills must be at least 1, got %d", c.MaxConcurrentFills)
@@ -367,11 +369,28 @@ func (c CacheConfig) LoadKeyring() (cache.Keyring, error) {
 	return cache.NewKeyring(key)
 }
 
+// maxAliasDepth bounds how many alias hops resolveAlias follows.
+const maxAliasDepth = 32
+
+// resolveAlias follows alias nodes to the node they refer to. A chain
+// longer than maxAliasDepth, which only a cycle can produce, is returned
+// still unresolved, so it is not a mapping and the decoder rejects it.
+func resolveAlias(node *yaml.Node) *yaml.Node {
+	for range maxAliasDepth {
+		if node == nil || node.Kind != yaml.AliasNode {
+			return node
+		}
+		node = node.Alias
+	}
+	return node
+}
+
 // validateCacheKeys rejects unknown keys in the cache block of a parsed
-// YAML document. The rest of the file tolerates unknown keys, but a
-// mistyped or renamed cache key would otherwise silently revert to its
-// default. doc is the document node Load parsed; a file without a cache
-// block is valid.
+// YAML document, whether the block is written inline or reached through
+// an alias. The rest of the file tolerates unknown keys, but a mistyped
+// or renamed cache key would otherwise silently revert to its default.
+// doc is the document node Load parsed; a file without a cache block is
+// valid.
 func validateCacheKeys(doc *yaml.Node) error {
 	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
 		doc = doc.Content[0]
@@ -390,23 +409,27 @@ func validateCacheKeys(doc *yaml.Node) error {
 }
 
 // mappingValue returns the value node for key in a mapping node, or nil
-// when node is not a mapping or has no such key.
+// when node is not a mapping or has no such key. Aliases are resolved on
+// the node, on each key and on the returned value.
 func mappingValue(node *yaml.Node, key string) *yaml.Node {
+	node = resolveAlias(node)
 	if node == nil || node.Kind != yaml.MappingNode {
 		return nil
 	}
 	for i := 0; i+1 < len(node.Content); i += 2 {
-		if node.Content[i].Value == key {
-			return node.Content[i+1]
+		if resolveAlias(node.Content[i]).Value == key {
+			return resolveAlias(node.Content[i+1])
 		}
 	}
 	return nil
 }
 
 // checkKnownKeys requires every key of the mapping node to name a yaml
-// field of typ. prefix is the block's name for the error.
+// field of typ. prefix is the block's name for the error. A node that is
+// not a mapping after alias resolution is left to the decoder.
 func checkKnownKeys(node *yaml.Node, typ reflect.Type, prefix string) error {
-	if node.Kind != yaml.MappingNode {
+	node = resolveAlias(node)
+	if node == nil || node.Kind != yaml.MappingNode {
 		return nil
 	}
 	known := make(map[string]bool, typ.NumField())
@@ -416,8 +439,8 @@ func checkKnownKeys(node *yaml.Node, typ reflect.Type, prefix string) error {
 		}
 	}
 	for i := 0; i+1 < len(node.Content); i += 2 {
-		if key := node.Content[i]; !known[key.Value] {
-			return fmt.Errorf("%s: unknown field %q (line %d)", prefix, key.Value, key.Line)
+		if key := node.Content[i]; !known[resolveAlias(key).Value] {
+			return fmt.Errorf("%s: unknown field %q (line %d)", prefix, resolveAlias(key).Value, key.Line)
 		}
 	}
 	return nil
@@ -436,6 +459,7 @@ func (c CacheConfig) BuildCache(logger *slog.Logger, metrics *observability.Metr
 		return nil, nil
 	}
 	var keyring cache.Keyring
+	keyMode := "configured"
 	if c.KeyEnv != "" {
 		var err error
 		if keyring, err = c.LoadKeyring(); err != nil {
@@ -447,9 +471,10 @@ func (c CacheConfig) BuildCache(logger *slog.Logger, metrics *observability.Metr
 		if err != nil {
 			return nil, err
 		}
-		logger.Info("keyEnv is not set; entries are sealed under an ephemeral key and the cache will not survive a restart")
+		logger.Info("keyEnv is not set; entries are sealed under an ephemeral key, the cache does not survive a restart, and its entries are removed at the next start")
+		keyMode = "ephemeral"
 	}
-	return cache.New(cache.Options{
+	built, err := cache.New(cache.Options{
 		Dir:                   c.Dir,
 		Keyring:               keyring,
 		MaxDiskSize:           int64(c.MaxDiskSize),
@@ -465,4 +490,20 @@ func (c CacheConfig) BuildCache(logger *slog.Logger, metrics *observability.Metr
 		Logger:                logger,
 		Metrics:               metrics,
 	})
+	if err != nil {
+		return nil, err
+	}
+	if int64(c.MaxConcurrentFills) > int64(c.MaxDiskSize)/int64(c.MaxEntrySize) {
+		logger.Warn("concurrent fills can reserve more than the disk budget",
+			"maxConcurrentFills", c.MaxConcurrentFills,
+			"maxEntrySize", c.MaxEntrySize.String(),
+			"maxDiskSize", c.MaxDiskSize.String())
+	}
+	logger.Info("response cache enabled",
+		"dir", c.Dir,
+		"keyMode", keyMode,
+		"maxDiskSize", c.MaxDiskSize.String(),
+		"maxEntrySize", c.MaxEntrySize.String(),
+		"maxConcurrentFills", c.MaxConcurrentFills)
+	return built, nil
 }

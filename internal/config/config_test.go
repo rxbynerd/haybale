@@ -468,6 +468,20 @@ func TestValidate(t *testing.T) {
 			wantErr: "not a valid URL",
 		},
 		{
+			name: "upstream baseURL carries credentials",
+			cfg: func(t *testing.T) Config {
+				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)
+				return Config{
+					Listen:    ":8466",
+					LogLevel:  "info",
+					Identity:  validJWTIdentity(identityPath),
+					Policy:    PolicyConfig{Path: policyPath},
+					Upstreams: []Upstream{{Host: "github.com", BaseURL: "https://user:pass@github.com"}}, //nolint:gosec // G101: placeholder userinfo the test expects Validate to reject
+				}
+			},
+			wantErr: "baseURL must not contain credentials",
+		},
+		{
 			name: "duplicate upstream host",
 			cfg: func(t *testing.T) Config {
 				identityPath, policyPath := writeValidIdentityAndPolicyFiles(t)

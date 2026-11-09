@@ -43,9 +43,9 @@ const readHeaderTimeout = 10 * time.Second
 const telemetryShutdownTimeout = 5 * time.Second
 
 // cacheCloseTimeout bounds how long process exit waits for the response
-// cache to cancel its fills and close its store. It runs after in-flight
-// requests have drained, so only fills with no remaining subscribers can
-// still be running.
+// cache to cancel its fills and close its store. The close runs after the
+// request drain, which can itself time out with requests still in flight,
+// so fills may still have subscribers when it starts.
 const cacheCloseTimeout = 30 * time.Second
 
 var (
@@ -187,7 +187,7 @@ func runServe(cmd *cobra.Command, path string) error {
 	if err != nil {
 		return fmt.Errorf("build cache: %w", err)
 	}
-	defer closeResponseCache(responseCache, logger)
+	defer closeResponseCache(responseCache, logger, cacheCloseTimeout)
 
 	// proxy.New rejects a nil authenticator/policyEngine at construction,
 	// so a caller bug (Validate() didn't run, leaving Engine() nil)
@@ -370,18 +370,19 @@ func newResponseCache(cfg *config.Config, logger *slog.Logger, metrics *observab
 	return c, []proxy.Option{proxy.WithCache(c)}, nil
 }
 
-// closeResponseCache closes c within cacheCloseTimeout, logging rather
-// than failing when fills are still running at the bound. A nil c is a
-// no-op.
-func closeResponseCache(c *cache.Cache, logger *slog.Logger) {
+// closeResponseCache closes c within timeout, logging rather than
+// failing when fills are still running at the bound. A nil c is a no-op.
+func closeResponseCache(c *cache.Cache, logger *slog.Logger, timeout time.Duration) {
 	if c == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), cacheCloseTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	if err := c.Close(ctx); err != nil {
 		logger.Warn("response cache did not close cleanly", "error", err)
+		return
 	}
+	logger.Info("response cache closed")
 }
 
 // buildUpstreams converts config.Upstreams (already validated) into the
