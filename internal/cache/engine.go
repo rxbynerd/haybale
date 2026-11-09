@@ -169,6 +169,9 @@ type fillHooks struct {
 	// markerCheckJoined runs when a refs fill joins another fill's purge
 	// marker read, before it waits for the result.
 	markerCheckJoined func()
+	// afterFetch runs in a fill once its Fetcher has returned a response,
+	// before the fill claims the response from its header timers.
+	afterFetch func(key entryKey)
 }
 
 // New opens the cache directory, indexes its entries, removes entries
@@ -656,6 +659,7 @@ func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, colla
 	}
 
 	st := cacheStatus{result: observability.ResultMiss, collapsed: collapsed}
+	servedAt := c.now()
 	if out.stale != nil {
 		st = cacheStatus{result: observability.ResultStale, collapsed: collapsed, fwdStatus: out.stale.fwdStatus}
 	}
@@ -680,7 +684,7 @@ func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, colla
 			return c.declined(w, host, class, "verification"), false
 		}
 		if out.stale != nil {
-			c.logStaleServed(identity, repo, class, out.tier, out.stale)
+			c.logStaleServed(identity, repo, class, out.tier, out.stale, servedAt)
 		}
 		<-f.done
 		res.Stored = f.stored
@@ -706,7 +710,7 @@ func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, colla
 	case errors.Is(err, errClientGone):
 		c.metrics.RecordResponseCacheLookup(ctx, host, class, st.result)
 		if out.stale != nil {
-			c.logStaleServed(identity, repo, class, out.tier, out.stale)
+			c.logStaleServed(identity, repo, class, out.tier, out.stale, servedAt)
 		}
 		return Outcome{Result: st.result, Collapsed: collapsed, Status: http.StatusOK, BytesOut: n}, true
 	case err != nil && !started:
@@ -718,7 +722,7 @@ func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, colla
 	c.metrics.RecordResponseCacheLookup(ctx, host, class, st.result)
 	c.metrics.RecordResponseCacheServedBytes(ctx, host, class, out.tier, n)
 	if out.stale != nil {
-		c.logStaleServed(identity, repo, class, out.tier, out.stale)
+		c.logStaleServed(identity, repo, class, out.tier, out.stale, servedAt)
 	}
 	// The spool reaches EOF only once the fill has committed or discarded
 	// it, so the fill is about to finish and its result is known.
@@ -775,9 +779,10 @@ func (c *Cache) serveStaleEntry(w http.ResponseWriter, key entryKey, repo gitpro
 func (c *Cache) serveStaleOpened(w http.ResponseWriter, e *openedEntry, repo gitproto.Repo, class string, collapsed bool, identity string, st *staleService) (Outcome, bool) {
 	served := *st
 	served.createdAt = e.sr.Header().CreatedAt
+	servedAt := c.now()
 	res, ok := c.serveOpened(w, e, repo, class, cacheStatus{result: observability.ResultStale, collapsed: collapsed, fwdStatus: st.fwdStatus}, observability.TierDisk)
 	if ok {
-		c.logStaleServed(identity, repo, class, observability.TierDisk, &served)
+		c.logStaleServed(identity, repo, class, observability.TierDisk, &served, servedAt)
 	}
 	return res, ok
 }

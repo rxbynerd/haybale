@@ -93,9 +93,11 @@ func (f *fill) remoteEligible() bool {
 // fillFromRemote serves the fill from the remote tier's sealed copy,
 // spooled as it is and verified as it passes. It returns false, having
 // spooled nothing, when there is no usable copy or the Get or header read
-// fails before the outcome is published; the fill then goes upstream.
-// Once it returns true the fill is settled. With st set the copy is stale
-// service: the stale rules decide whether it is usable instead of the hit
+// fails before the outcome is published; the fill then goes upstream, and
+// unless the copy was only refused as not fresh, remoteUnavailable is set
+// so the fill does not read it again. Once it returns true the fill is
+// settled. With st set the copy is stale service: the stale rules decide
+// whether it is usable instead of the hit
 // freshness rules, and subscribers serve it as stale.
 func (f *fill) fillFromRemote(st *staleService) bool {
 	c := f.c
@@ -112,17 +114,21 @@ func (f *fill) fillFromRemote(st *staleService) bool {
 	info, err := src.start()
 	switch {
 	case errors.Is(err, ErrNotFound):
+		f.remoteUnavailable = true
 		return false
 	case err != nil:
 		f.remoteReadFailed(err)
+		f.remoteUnavailable = true
 		return false
 	case info.Size < sealedSize(0) || info.Size > sealedSize(c.opts.MaxEntrySize)+remoteSizeSlack:
 		f.logger().Debug("remote entry size is out of range; fetching upstream", "size", info.Size)
+		f.remoteUnavailable = true
 		return false
 	}
 	// A failed read here has already been recorded by src.
 	prefix := make([]byte, headerFixedPrefix)
 	if _, err := io.ReadFull(src, prefix); err != nil {
+		f.remoteUnavailable = true
 		return false
 	}
 	src.endPrefix()
@@ -133,6 +139,7 @@ func (f *fill) fillFromRemote(st *staleService) bool {
 	}
 	if err != nil {
 		f.remoteIntegrityFailed(err)
+		f.remoteUnavailable = true
 		return false
 	}
 	h := sr.Header()
@@ -147,6 +154,13 @@ func (f *fill) fillFromRemote(st *staleService) bool {
 	f.source = observability.TierRemote
 	sp, err := c.store.Create(path, info.Size, true)
 	if err != nil {
+		if st != nil {
+			// Stale service's subscribers receive the upstream answer it
+			// replaced.
+			f.finish(observability.FillResultDiscarded, storeReason(err), transientCooldown)
+			f.setOutcome(st.fallback)
+			return true
+		}
 		f.release(storeReason(err), transientCooldown)
 		return true
 	}

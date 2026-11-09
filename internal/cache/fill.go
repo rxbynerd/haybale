@@ -66,6 +66,8 @@ const (
 	// headerCutProbe: the probe deadline of a gate probe holding a
 	// qualifying stale entry expired.
 	headerCutProbe
+	// headerCutArrived: response headers arrived before either timer.
+	headerCutArrived
 )
 
 // errOversizeGrowth reports that a response outgrew the entry size limit
@@ -128,9 +130,8 @@ type fill struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	abandoned atomic.Bool
-	// headerCut records which timer, if any, cancelled the upstream
-	// request before its response headers arrived: headerCutTimeout or
-	// headerCutProbe.
+	// headerCut records whether response headers arrived or which timer
+	// cancelled the upstream request first; whichever is set first stands.
 	headerCut atomic.Uint32
 
 	spool       *spool
@@ -174,8 +175,10 @@ type fill struct {
 	dropEntry bool
 
 	// purge is the purge marker check started beside the upstream
-	// request; it belongs to the fill goroutine.
-	purge *purgeCheck
+	// request, and remoteUnavailable records that the remote tier held no
+	// readable copy of the entry; both belong to the fill goroutine.
+	purge             *purgeCheck
+	remoteUnavailable bool
 }
 
 func (c *Cache) newFill(key entryKey, req Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher, shared bool) *fill {
@@ -262,15 +265,23 @@ func (f *fill) perform() {
 		f.releaseOrServeStale(res, observability.FillReasonFetchError)
 		return
 	}
-	defer done()
 	res := classifyStatus(upstreamStatus(resp))
 	f.reportHealth(res, started)
 	endProbe()
 	body := newIdleReader(resp.Body, f.c.opts.IdleTimeout, f.cancel)
-	defer func() { _ = body.Close() }()
+	// Closing the body stops its idle timer, which would otherwise cancel
+	// the fill while it serves a stale entry instead.
+	var closeOnce sync.Once
+	closeUpstream := func() {
+		closeOnce.Do(func() {
+			_ = body.Close()
+			done()
+		})
+	}
+	defer closeUpstream()
 
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != responseContentType(f.req.Class) {
-		f.share(resp, body, res)
+		f.share(resp, body, res, closeUpstream)
 		return
 	}
 	if !identityEncoded(resp.Header) {
@@ -317,6 +328,17 @@ func (f *fill) fetchHeaders(probeDeadline bool) (resp *http.Response, done conte
 	if err == nil && (resp == nil || resp.Body == nil) {
 		err = errors.New("cache: fetcher returned no response body")
 	}
+	if err == nil {
+		if h := f.c.hooks.afterFetch; h != nil {
+			h(f.key)
+		}
+		// A timer that fired after Fetch returned has cancelled the body's
+		// context, so the response is treated as cut by that timer.
+		if !f.headerCut.CompareAndSwap(headerCutNone, headerCutArrived) {
+			_ = resp.Body.Close()
+			err = context.Canceled
+		}
+	}
 	if err != nil {
 		cancel()
 		return nil, nil, err
@@ -328,9 +350,11 @@ func (f *fill) fetchHeaders(probeDeadline bool) (resp *http.Response, done conte
 // the body is buffered up to sharedBodyLimit and, with the response
 // headers and status, becomes the one response they all write. A status
 // eligible for stale service is answered from a stale entry instead when
-// one qualifies.
-func (f *fill) share(resp *http.Response, body io.Reader, res upstreamResult) {
+// one qualifies. closeUpstream ends the upstream request once the body
+// has been buffered.
+func (f *fill) share(resp *http.Response, body io.Reader, res upstreamResult, closeUpstream func()) {
 	buf, err := io.ReadAll(io.LimitReader(body, sharedBodyLimit+1))
+	closeUpstream()
 	switch {
 	case err != nil:
 		f.releaseOrServeStale(res, observability.FillReasonFetchError)
@@ -634,6 +658,7 @@ func (f *fill) abort(err error, reason string) {
 // finish records the fill's result once and marks the key uncacheable for
 // markFor when it is positive. A fill cancelled because its subscribers
 // left marks nothing: the next request for the key should start afresh.
+// Nor does a fetch error while stale service is enabled.
 func (f *fill) finish(result, reason string, markFor time.Duration) {
 	if f.finished {
 		return
@@ -643,6 +668,11 @@ func (f *fill) finish(result, reason string, markFor time.Duration) {
 	f.c.metrics.RecordResponseCacheFill(ctx, f.repo.Host, string(f.req.Class), f.source, result, reason)
 	if f.fetched > 0 {
 		f.c.metrics.RecordResponseCacheFillBytes(ctx, f.repo.Host, string(f.req.Class), f.source, f.fetched)
+	}
+	// With stale service enabled a fetch error leaves the key cacheable,
+	// so the next request for it can still be answered stale.
+	if reason == observability.FillReasonFetchError && f.c.staleEnabled() {
+		markFor = 0
 	}
 	if markFor > 0 && !f.abandoned.Load() {
 		now := f.c.now()

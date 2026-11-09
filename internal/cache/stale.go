@@ -145,6 +145,9 @@ type staleService struct {
 	fwdStatus int
 	// createdAt is the authenticated creation time of the entry served.
 	createdAt time.Time
+	// fallback is what subscribers receive when a remote copy cannot be
+	// spooled after all.
+	fallback fillOutcome
 }
 
 // staleEnabled reports whether stale-if-error is configured.
@@ -206,7 +209,7 @@ func (f *fill) serveStale(res upstreamResult, fallback fillOutcome, fillReason s
 	if !res.eligible || !c.staleEnabled() || !f.purgeCurrent() {
 		return false
 	}
-	st := &staleService{reason: res.reason, fwdStatus: res.status}
+	st := &staleService{reason: res.reason, fwdStatus: res.status, fallback: fallback}
 	class := string(f.req.Class)
 	if e := c.openStaleEntry(f.key, f.repo, class); e != nil {
 		st.createdAt = e.sr.Header().CreatedAt
@@ -217,7 +220,7 @@ func (f *fill) serveStale(res upstreamResult, fallback fillOutcome, fillReason s
 		f.setOutcome(fillOutcome{kind: fillStale, stale: st, fallback: &fallback})
 		return true
 	}
-	return c.remote != nil && f.fillFromRemote(st)
+	return c.remote != nil && !f.remoteUnavailable && f.fillFromRemote(st)
 }
 
 // purgeCurrent reports whether the repository's purge state is known
@@ -231,9 +234,10 @@ func (f *fill) purgeCurrent() bool {
 	return f.c.purgeCurrent(f.ctx, f.repo, f.key.RepoHash)
 }
 
-// logStaleServed records a stale response to one client.
-func (c *Cache) logStaleServed(identity string, repo gitproto.Repo, class, tier string, st *staleService) {
+// logStaleServed records a stale response to one client, whose serving
+// began at servedAt; the entry's age is taken at that instant.
+func (c *Cache) logStaleServed(identity string, repo gitproto.Repo, class, tier string, st *staleService, servedAt time.Time) {
 	security.Log(c.logger, security.EventCacheStaleServed,
 		"identity", identity, "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "class", class,
-		"tier", tier, "reason", st.reason, "entryAgeSeconds", int64(c.now().Sub(st.createdAt)/time.Second))
+		"tier", tier, "reason", st.reason, "entryAgeSeconds", int64(servedAt.Sub(st.createdAt)/time.Second))
 }
