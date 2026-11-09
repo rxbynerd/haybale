@@ -112,13 +112,14 @@ type Proxy struct {
 	transport     http.RoundTripper
 	rp            *httputil.ReverseProxy
 	cache         ResponseCache
-	// readHeaderTimeout bounds the passthrough's wait for the response
-	// headers of a read; zero leaves it unbounded.
-	readHeaderTimeout time.Duration
 	logger        *slog.Logger
 	metrics       *observability.Metrics
 	authenticator identity.Authenticator
 	policyEngine  policy.Engine
+
+	// readHeaderTimeout bounds the passthrough's wait for the response
+	// headers of a read; zero leaves it unbounded.
+	readHeaderTimeout time.Duration
 
 	// draining is set by BeginDrain, called from cmd/haybale/cmd/serve.go
 	// on SIGTERM/SIGINT before http.Server.Shutdown is invoked. Once true,
