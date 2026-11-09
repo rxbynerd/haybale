@@ -74,9 +74,9 @@ func TestCancelledFillsDoNotOpenTheGate(t *testing.T) {
 	}
 }
 
-// TestStaleServiceAgeBoundaries: an entry exactly staleIfErrorFor old is
-// served and one a tick older is not; with staleIfErrorFor equal to
-// retention, an entry past it is deleted on either tier.
+// TestStaleServiceAgeBoundaries: on either tier, an entry exactly
+// staleIfErrorFor old is served and one a tick older is not; with
+// staleIfErrorFor equal to retention, an entry past it is deleted.
 func TestStaleServiceAgeBoundaries(t *testing.T) {
 	t.Run("exactly staleIfErrorFor", func(t *testing.T) {
 		h := newStaleHarness(t, nil)
@@ -92,6 +92,28 @@ func TestStaleServiceAgeBoundaries(t *testing.T) {
 			t.Errorf("entry past the bound = %+v, want the shared 503", out)
 		}
 	})
+	for _, tc := range []struct {
+		name   string
+		age    time.Duration
+		served bool
+	}{
+		{"tier 2 exactly staleIfErrorFor", testStaleFor, true},
+		{"tier 2 a tick over staleIfErrorFor", testStaleFor + time.Nanosecond, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newMemBlobStore()
+			seedPeer(t, store, remotePack(t))
+			c, clock, _ := newRemoteTestCache(t, store, enableStale)
+			clock.Advance(tc.age)
+			out, _, _ := serve(c, newCollectWriter(), fetchRequest(t), &failing{status: 502})
+			switch {
+			case tc.served && out.Result != observability.ResultStale:
+				t.Errorf("remote entry at the bound = %+v, want stale", out)
+			case !tc.served && (out.Result != observability.ResultMiss || out.Status != 502):
+				t.Errorf("remote entry past the bound = %+v, want the shared 502", out)
+			}
+		})
+	}
 	t.Run("tier 1 past retention", func(t *testing.T) {
 		h := newStaleHarness(t, func(o *Options) { o.Retention = testStaleFor })
 		h.clock.Advance(testStaleFor)
@@ -217,6 +239,47 @@ func TestRemoteStaleReadFailures(t *testing.T) {
 			t.Errorf("stale events = %d, want none", len(ev))
 		}
 	})
+}
+
+// TestRemoteStaleSpoolFailurePublishesTheFallback: when a qualifying
+// remote copy cannot be spooled, subscribers receive the answer stale
+// service would have replaced: the shared 5xx, or a release to
+// passthrough after a refused connection.
+func TestRemoteStaleSpoolFailurePublishesTheFallback(t *testing.T) {
+	cases := map[string]struct {
+		fetch   *failing
+		handled bool
+		status  int
+	}{
+		"503":     {fetch: &failing{status: 503}, handled: true, status: 503},
+		"refused": {fetch: &failing{err: errDialRefused}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			store := newMemBlobStore()
+			seedPeer(t, store, remotePack(t))
+			logger, logs := newLogCapture()
+			c, clock, reader := newRemoteTestCache(t, store, func(o *Options) {
+				enableStale(o)
+				o.Logger = logger
+				// The remote copy is larger than the whole disk budget, so
+				// its spool cannot be created.
+				o.MaxDiskSize, o.MaxEntrySize = 64<<10, 32<<10
+			})
+			clock.Advance(time.Minute)
+			out, handled, _ := serve(c, newCollectWriter(), fetchRequest(t), tc.fetch)
+			if handled != tc.handled || out.Status != tc.status || out.Result == observability.ResultStale {
+				t.Errorf("got %+v handled %v, want handled %v status %d", out, handled, tc.handled, tc.status)
+			}
+			if n := fillsWithReason(t, reader, observability.FillResultDiscarded, observability.FillReasonDiskBudget); n != 1 {
+				t.Errorf("disk_budget fills = %d, want 1", n)
+			}
+			if ev := logs.securityEvents(t, security.EventCacheStaleServed); len(ev) != 0 {
+				t.Errorf("stale events = %d, want none", len(ev))
+			}
+			assertStoreIdle(t, c)
+		})
+	}
 }
 
 // TestStaleServiceRecordsTheFillAndLeavesTheKeyCacheable: a 5xx answered

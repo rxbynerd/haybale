@@ -341,6 +341,53 @@ func TestHeldStaleServiceWaitsAtMostTheMarkerTimeout(t *testing.T) {
 	}
 }
 
+// TestProbeWithoutACurrentMarkerCheckWaitsForUpstream: a probe whose
+// purge marker cannot be read is not answered stale at its deadline; it
+// waits for upstream and, once the header timeout cuts that, is released.
+func TestProbeWithoutACurrentMarkerCheckWaitsForUpstream(t *testing.T) {
+	const interval = 50 * time.Millisecond
+	store := newMemBlobStore()
+	c, clock, _ := newRemoteStaleReplica(t, store)
+	c.gates.interval = interval
+	c.opts.ResponseHeaderTimeout = 4 * interval
+	if out, handled, _ := serve(c, newCollectWriter(), otherFetchRequest(t), &failing{err: errDialRefused}); handled {
+		t.Fatalf("refused fetch without an entry = %+v, want a release", out)
+	}
+	store.set(func(m *memBlobStore) {
+		m.getHook = func(key string, _ int64) error {
+			if strings.HasPrefix(key, purgePrefix) {
+				return errors.New("memblob: 503 SlowDown")
+			}
+			return nil
+		}
+	})
+	clock.Advance(markerCheckInterval(c.opts.AccessRecheck))
+	deadlines := probeDeadlines(c)
+	hang := newHangingFetch()
+	done := make(chan served, 1)
+	r := fetchRequest(t)
+	start := time.Now()
+	go func() {
+		out, handled, _ := serve(c, newCollectWriter(), r, hang)
+		done <- served{out: out, handled: handled}
+	}()
+	if awaitDeadline(t, deadlines) {
+		t.Fatal("a probe without a current marker check was answered stale")
+	}
+	select {
+	case res := <-done:
+		t.Fatalf("probe finished at the deadline: %+v", res.out)
+	default:
+	}
+	res := receive(t, done, "the probe")
+	if res.handled || res.out.Result == observability.ResultStale {
+		t.Errorf("probe = %+v handled %v, want a release", res.out, res.handled)
+	}
+	if elapsed := time.Since(start); elapsed < c.opts.ResponseHeaderTimeout {
+		t.Errorf("probe finished after %v, want it to wait the %v header timeout", elapsed, c.opts.ResponseHeaderTimeout)
+	}
+}
+
 // TestSharedMarkerReadOutlivesALeaderThatLeaves: a held request that
 // leads the purge marker read and then disconnects neither cuts the read
 // short nor fails it for a refs fill waiting on the same read, which still

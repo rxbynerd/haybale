@@ -479,6 +479,38 @@ func TestEntriesOlderThanAKnownPurgeAreNotServedFromTheBucket(t *testing.T) {
 	})
 }
 
+// TestALocalEntryOlderThanAKnownPurgeIsNotServed: a tier-1 entry created
+// before a purge time this replica knows of but has not deleted is served
+// neither as a hit nor stale; the request goes upstream.
+func TestALocalEntryOlderThanAKnownPurgeIsNotServed(t *testing.T) {
+	for _, stale := range []bool{false, true} {
+		c, clock := newTestCache(t, func(o *Options) {
+			if stale {
+				enableStale(o)
+			}
+		})
+		lsRefs(t, c, refsFetcher(t))
+		pack := remotePack(t)
+		if out, _, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), packFetcher(pack)); !out.Stored {
+			t.Fatalf("stale %v: seeding fetch = %+v, want a stored miss", stale, out)
+		}
+		clock.Advance(time.Second)
+		repoHash := c.keyring.RepoHash(testBaseURL, testRepo)
+		c.purges.observe(repoHash, purgeTimes{pack: clock.Now()}, clock.Now())
+		lsRefs(t, c, refsFetcher(t))
+		if stale {
+			if out, _, _ := serve(c, newCollectWriter(), fetchRequest(t), &failing{status: 503}); out.Result != observability.ResultMiss || out.Status != 503 {
+				t.Errorf("purged entry with stale service = %+v, want the shared 503", out)
+			}
+			continue
+		}
+		upstream := packFetcher(pack)
+		if out, _, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), upstream); out.Result != observability.ResultMiss || upstream.calls.Load() != 1 {
+			t.Errorf("purged entry = %+v upstream %d, want an upstream miss", out, upstream.calls.Load())
+		}
+	}
+}
+
 func TestAPanickingMarkerReadDoesNotBlockLaterRefsFills(t *testing.T) {
 	store := newMemBlobStore()
 	store.set(func(m *memBlobStore) {
