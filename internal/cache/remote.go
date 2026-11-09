@@ -41,7 +41,9 @@ var (
 	// errRemoteChanged reports that a remote object was replaced while a
 	// fill was reading it, so its bytes cannot be resumed.
 	errRemoteChanged = errors.New("cache: remote object changed during the read")
-	// errRemoteRead reports a remote read that failed past its resumes.
+	// errRemoteRead reports a remote read that failed past its resumes. The
+	// error that wraps it never wraps the transport error too, so a short
+	// read is not mistaken for a truncated entry.
 	errRemoteRead = errors.New("cache: remote read failed")
 )
 
@@ -157,7 +159,9 @@ func (f *fill) remoteFresh(h entryHeader) bool {
 
 // streamRemote reads the remote entry through sr, which verifies every
 // segment while tee writes the sealed bytes into the spool, then commits
-// or discards the spool.
+// or discards the spool. Only a failure of sr's own verification is an
+// integrity failure; a read the remote tier could not complete ends the
+// fill as a fetch error and leaves the object alone.
 func (f *fill) streamRemote(sr *sealedReader, tee *spoolTee) {
 	defer func() {
 		if h := f.c.hooks.afterDecision; h != nil {
@@ -179,7 +183,7 @@ func (f *fill) streamRemote(sr *sealedReader, tee *spoolTee) {
 			f.remoteIntegrityFailed(err)
 			f.abort(err, observability.FillReasonStoreError)
 		default:
-			f.abort(err, observability.FillReasonStoreError)
+			f.abort(err, observability.FillReasonFetchError)
 		}
 		return
 	}
@@ -303,7 +307,7 @@ func (r *remoteReader) Read(p []byte) (int, error) {
 			r.failed(err)
 		}
 		if r.resumes >= maxRemoteResumes {
-			return 0, fmt.Errorf("%w after %d resumes: %w", errRemoteRead, r.resumes, r.lastErr)
+			return 0, fmt.Errorf("%w after %d resumes: %v", errRemoteRead, r.resumes, r.lastErr)
 		}
 		if err := r.resume(); err != nil {
 			return 0, err

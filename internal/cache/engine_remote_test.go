@@ -601,8 +601,11 @@ func TestRemoteFillAbortsAfterItsResumesAreSpent(t *testing.T) {
 	if got := len(store.getOffsets(store.keys(packPrefix)[0])); got != 1+maxRemoteResumes {
 		t.Errorf("remote Gets = %d, want the first and %d resumes", got, maxRemoteResumes)
 	}
-	if got := fillsWithReason(t, reader, observability.FillResultDiscarded, observability.FillReasonStoreError); got != 1 {
-		t.Errorf("fills discarded with store_error = %d, want 1", got)
+	if got := fillsWithReason(t, reader, observability.FillResultDiscarded, observability.FillReasonFetchError); got != 1 {
+		t.Errorf("fills discarded with fetch_error = %d, want 1", got)
+	}
+	if got := store.count("delete", packPrefix); got != 0 {
+		t.Errorf("remote deletes = %d, want none after a transport failure", got)
 	}
 	for _, f := range entryFiles(t, c.opts.Dir) {
 		if strings.HasPrefix(f, packPrefix) {
