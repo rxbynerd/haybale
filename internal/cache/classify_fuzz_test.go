@@ -29,7 +29,7 @@ func FuzzClassify(f *testing.F) {
 		if len(body) > testMaxBody {
 			return
 		}
-		req, bypass, reason, err := classify(withProtocol(post(body), protocol), testRepo, testMaxBody, nil)
+		req, bypass, reason, err := classify(withProtocol(post(body), protocol), testRepo, testMaxBody)
 		if err != nil {
 			t.Fatalf("classify returned an error for an in-bound body: %v", err)
 		}
@@ -45,14 +45,14 @@ func FuzzClassify(f *testing.F) {
 		if bytes.Contains(req.Body, []byte("agent=")) || bytes.Contains(req.Body, []byte("session-id=")) {
 			t.Fatalf("canonical body carries a client capability: %q", req.Body)
 		}
-		again, bypass, reason, err := classify(withProtocol(post(req.Body), protocol), testRepo, testMaxBody, nil)
+		again, bypass, reason, err := classify(withProtocol(post(req.Body), protocol), testRepo, testMaxBody)
 		if err != nil || bypass {
 			t.Fatalf("canonical body did not reclassify: bypass %v reason %q err %v", bypass, reason, err)
 		}
 		if again.KeyHash != req.KeyHash || !bytes.Equal(again.Body, req.Body) || again.Class != req.Class {
 			t.Fatalf("canonical body is not a fixed point: %+v vs %+v", again, req)
 		}
-		zipped, bypass, reason, err := classify(withProtocol(post(gzipped(t, body), "Content-Encoding", "gzip"), protocol), testRepo, testMaxBody, nil)
+		zipped, bypass, reason, err := classify(withProtocol(post(gzipped(t, body), "Content-Encoding", "gzip"), protocol), testRepo, testMaxBody)
 		if err != nil || bypass {
 			t.Fatalf("gzip twin bypassed: reason %q err %v", reason, err)
 		}

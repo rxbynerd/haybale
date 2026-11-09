@@ -23,9 +23,10 @@ const (
 	// maxCreatedAtSkew is how far in the future an entry's creation time
 	// may lie before the entry is treated as corrupt.
 	maxCreatedAtSkew = 5 * time.Minute
-	// maxClassifications bounds how many request bodies are held in
-	// memory for classification at once; a request that finds no slot
-	// passes through unclassified.
+	// maxClassifications bounds how many requests are in the pre-stream
+	// phase (reading and classifying the body, then looking up or
+	// joining a fill) at once; a request that finds no slot passes
+	// through unclassified.
 	maxClassifications = 128
 )
 
@@ -96,7 +97,7 @@ type Cache struct {
 	// flight against maxRefsFills and is guarded by mu.
 	slots     chan struct{}
 	refsFills int
-	// classifySlots bounds request bodies held for classification.
+	// classifySlots bounds the requests in Serve's pre-stream phase.
 	classifySlots chan struct{}
 
 	idleGrace     time.Duration
@@ -223,18 +224,11 @@ func (c *Cache) Serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo
 	if !ok {
 		return c.declined(w, repo.Host, observability.ClassBypass, "body_budget"), false
 	}
-	// On the passthrough path the replayed body releases the slot once it
-	// has been read or closed; every other exit, including a panic,
-	// releases it here.
-	passthrough := false
-	defer func() {
-		if !passthrough {
-			release()
-		}
-	}()
-	out, handled = c.serve(w, r, repo, baseURL, fetch, release)
-	passthrough = !handled
-	return out, handled
+	// The slot covers the pre-stream phase only. serve releases it early
+	// once the request starts streaming a response; this defer releases it
+	// on every other exit, including a panic.
+	defer release()
+	return c.serve(w, r, repo, baseURL, fetch, release)
 }
 
 // takeClassifySlot reserves a classification slot for a request with a
@@ -253,11 +247,14 @@ func (c *Cache) takeClassifySlot(r *http.Request) (release func(), ok bool) {
 	return func() { once.Do(func() { <-c.classifySlots }) }, true
 }
 
-func (c *Cache) serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher, released func()) (Outcome, bool) {
+// serve classifies the request and answers it from an entry or a fill.
+// release frees the request's classification slot; serve calls it before
+// it starts streaming a response, so a long transfer does not hold a slot.
+func (c *Cache) serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher, release func()) (Outcome, bool) {
 	host := repo.Host
-	req, bypass, reason, err := classify(r, repo, c.opts.MaxRequestBody, released)
+	req, bypass, reason, err := classify(r, repo, c.opts.MaxRequestBody)
 	if err != nil {
-		c.logger.WarnContext(r.Context(), "cache: request could not be classified", "host", host, "error", err)
+		c.logger.WarnContext(r.Context(), "request could not be classified", "host", host, "error", err)
 		return c.declined(w, host, observability.ClassBypass, "classify_error"), false
 	}
 	if bypass {
@@ -273,10 +270,12 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo
 		if !ok {
 			return c.declined(w, host, class, "no_slot"), false
 		}
+		release()
 		return c.subscribe(w, r, f, false, repo, class)
 	}
 
 	if e := c.openEntry(key, repo, class, true); e != nil {
+		release()
 		if out, ok := c.serveOpened(w, e, repo, class, observability.ResultHit, false, observability.TierDisk); ok {
 			return out, true
 		}
@@ -285,10 +284,11 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo
 	// has been deleted, so the request joins or starts a fill instead; a
 	// second failure of a freshly committed entry is declined.
 	for range 2 {
-		f, e, collapsed, ok := c.joinOrStart(key, req, repo, baseURL, fetch, class)
-		if !ok {
-			return c.declined(w, host, class, "no_slot"), false
+		f, e, collapsed, declined := c.joinOrStart(key, req, repo, baseURL, fetch, class)
+		if declined != "" {
+			return c.declined(w, host, class, declined), false
 		}
+		release()
 		if e != nil {
 			if out, ok := c.serveOpened(w, e, repo, class, observability.ResultHit, false, observability.TierDisk); ok {
 				return out, true
@@ -424,19 +424,25 @@ func (c *Cache) startSingle(key entryKey, req Request, repo gitproto.Repo, baseU
 // returns a stored entry committed since the caller's lookup, or starts a
 // new fill. The entry lookup runs without mu held; a fill is started only
 // if no commit landed meanwhile, so a request never duplicates a fill
-// that has just committed. ok is false when no fill slot is free or the
-// cache is closed.
-func (c *Cache) joinOrStart(key entryKey, req Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher, class string) (f *fill, e *openedEntry, collapsed, ok bool) {
+// that has just committed. A refs fill that began before the latest push
+// is not joined, since its response may carry the pre-push tips. declined
+// is the bypass reason when the request cannot use the cache: no fill
+// slot is free, the cache is closed, or the in-flight refs fill is stale.
+func (c *Cache) joinOrStart(key entryKey, req Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher, class string) (f *fill, e *openedEntry, collapsed bool, declined string) {
 	for {
 		c.mu.Lock()
 		if c.closed {
 			c.mu.Unlock()
-			return nil, nil, false, false
+			return nil, nil, false, "no_slot"
 		}
 		if f := c.fills[key]; f != nil && !f.ended {
+			if c.staleRefsFill(f) {
+				c.mu.Unlock()
+				return nil, nil, false, "stale_fill"
+			}
 			f.attachLocked()
 			c.mu.Unlock()
-			return f, nil, true, true
+			return f, nil, true, ""
 		}
 		commits := c.commits
 		c.mu.Unlock()
@@ -450,15 +456,19 @@ func (c *Cache) joinOrStart(key entryKey, req Request, repo gitproto.Repo, baseU
 			if e != nil {
 				e.close()
 			}
-			return nil, nil, false, false
+			return nil, nil, false, "no_slot"
 		case e != nil:
 			c.mu.Unlock()
-			return nil, e, false, true
+			return nil, e, false, ""
 		}
 		if f := c.fills[key]; f != nil && !f.ended {
+			if c.staleRefsFill(f) {
+				c.mu.Unlock()
+				return nil, nil, false, "stale_fill"
+			}
 			f.attachLocked()
 			c.mu.Unlock()
-			return f, nil, true, true
+			return f, nil, true, ""
 		}
 		if c.commits != commits {
 			c.mu.Unlock()
@@ -466,8 +476,18 @@ func (c *Cache) joinOrStart(key entryKey, req Request, repo gitproto.Repo, baseU
 		}
 		f = c.startFillLocked(key, req, repo, baseURL, fetch, true)
 		c.mu.Unlock()
-		return f, nil, false, f != nil
+		if f == nil {
+			return nil, nil, false, "no_slot"
+		}
+		return f, nil, false, ""
 	}
+}
+
+// staleRefsFill reports whether f is a refs fill that began before the
+// repository's latest push. Such a fill is discarded at commit, so a new
+// request must not take its response.
+func (c *Cache) staleRefsFill(f *fill) bool {
+	return f.key.Group == GroupRefs && c.gens.current(f.key.RepoHash) != f.gen
 }
 
 // noteCommit records that a fill committed an entry.
@@ -656,10 +676,10 @@ func (c *Cache) Invalidate(ctx context.Context, repo gitproto.Repo, baseURL *url
 	c.gens.bump(repoHash)
 	n, err := c.store.DeletePrefix(RepoPrefix(GroupRefs, repoHash))
 	if err != nil {
-		c.logger.WarnContext(ctx, "cache: invalidating refs entries after a push failed", "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "error", err)
+		c.logger.WarnContext(ctx, "invalidating refs entries after a push failed", "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "error", err)
 		return
 	}
-	c.logger.DebugContext(ctx, "cache: invalidated refs entries after a push", "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "entries", n)
+	c.logger.DebugContext(ctx, "invalidated refs entries after a push", "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "entries", n)
 }
 
 // Purge deletes the stored entries of repo in group, or in both groups

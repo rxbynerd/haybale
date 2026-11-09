@@ -135,7 +135,7 @@ func wantKeyHash(class Class, protocol string, body []byte) [32]byte {
 
 func classifyRequest(t *testing.T, r *http.Request) (Request, bool, string) {
 	t.Helper()
-	req, bypass, reason, err := classify(r, testRepo, testMaxBody, nil)
+	req, bypass, reason, err := classify(r, testRepo, testMaxBody)
 	if err != nil {
 		t.Fatalf("classify() error = %v", err)
 	}
@@ -593,7 +593,7 @@ func TestClassifyErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, bypass, reason, err := classify(tt.r, tt.repo, tt.maxBody, nil)
+			_, bypass, reason, err := classify(tt.r, tt.repo, tt.maxBody)
 			if err == nil {
 				t.Fatalf("classify() error = nil (bypass %v, reason %q), want an error", bypass, reason)
 			}

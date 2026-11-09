@@ -21,8 +21,8 @@ import (
 
 // assertStoreIdle waits for every fill to end and then checks the budget
 // invariant: no reservation or pinned bytes remain, the committed bytes
-// equal the entry files on disk, every slot is free and no temporary file
-// is left behind.
+// equal the entry files on disk, every fill and classification slot is
+// free and no temporary file is left behind.
 func assertStoreIdle(t *testing.T, c *Cache) {
 	t.Helper()
 	waitFor(t, "fills to end", func() bool {
@@ -30,6 +30,9 @@ func assertStoreIdle(t *testing.T, c *Cache) {
 		defer c.mu.Unlock()
 		return len(c.fills) == 0 && c.refsFills == 0 && len(c.slots) == 0
 	})
+	if n := len(c.classifySlots); n != 0 {
+		t.Errorf("classification slots still held = %d, want 0", n)
+	}
 	waitFor(t, "reservations and pinned bytes to drain", func() bool {
 		_, inflight, pinned := c.store.usage()
 		return inflight == 0 && pinned == 0
@@ -224,17 +227,21 @@ func readEntryFile(t *testing.T, path string) []byte {
 // subscribers.
 func waitForSubscribers(t *testing.T, c *Cache, n int) {
 	t.Helper()
-	waitFor(t, "subscribers to attach", func() bool {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if len(c.fills) != 1 {
-			return false
-		}
-		for _, f := range c.fills {
-			return f.subscribers == n
-		}
+	waitFor(t, "subscribers to attach", func() bool { return subscribersAre(c, n) })
+}
+
+// subscribersAre reports whether exactly one fill is in flight and it has
+// n subscribers.
+func subscribersAre(c *Cache, n int) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.fills) != 1 {
 		return false
-	})
+	}
+	for _, f := range c.fills {
+		return f.subscribers == n
+	}
+	return false
 }
 
 // shortly is a bound for events that should happen promptly.

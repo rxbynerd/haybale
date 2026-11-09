@@ -381,29 +381,127 @@ func TestClassificationSlotIsReleasedOnEveryExit(t *testing.T) {
 	assertStoreIdle(t, c)
 }
 
+// TestEarlyBypassesDoNotLeakClassificationSlots drives each bypass that
+// returns before the body is read, plus the classification errors, more
+// often than there are slots. The bodies are never read or closed, as
+// when a passthrough path gives up early. A request after them must
+// still classify.
+func TestEarlyBypassesDoNotLeakClassificationSlots(t *testing.T) {
+	c, _, reader := exitCache(t, nil)
+	fetch := &fixedFetcher{status: 200, contentType: contentTypeResult, body: fetchResultBody(t, 1, 10)}
+	body := cloneFetchBody(t)
+	paths := map[string]func() *http.Request{
+		"bad Git-Protocol": func() *http.Request { return post(body, "Git-Protocol", "version=3") },
+		"query string": func() *http.Request {
+			r := postV2(body)
+			r.URL.RawQuery = "x=1"
+			return r
+		},
+		"wrong Content-Type": func() *http.Request {
+			r := postV2(body)
+			r.Header.Set("Content-Type", "text/plain")
+			return r
+		},
+		"Content-Encoding": func() *http.Request { return postV2(body, "Content-Encoding", "br") },
+		"GET with a body": func() *http.Request {
+			r := get()
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			r.ContentLength = int64(len(body))
+			return r
+		},
+		"unparseable path": func() *http.Request {
+			r := postV2(body)
+			r.URL.Path = "/nowhere"
+			return r
+		},
+		"write request": func() *http.Request {
+			r := postV2(body)
+			r.URL.Path = "/github.com/acme/widgets.git/git-receive-pack"
+			return r
+		},
+	}
+	const attempts = 200
+	for name, build := range paths {
+		for range attempts {
+			if out, handled, _ := serve(c, httptest.NewRecorder(), build(), fetch); handled || out.Result != observability.ResultBypass {
+				t.Fatalf("%s = %+v handled %v, want a bypass", name, out, handled)
+			}
+		}
+		if n := len(c.classifySlots); n != 0 {
+			t.Fatalf("%s left %d classification slots held", name, n)
+		}
+	}
+	if got := sumWhere(t, reader, "haybale.response_cache.lookups.total", map[string]string{"haybale.result": observability.ResultBypass}); got != int64(len(paths)*attempts) {
+		t.Errorf("bypass lookups = %d, want %d", got, len(paths)*attempts)
+	}
+	if out, handled, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), fetch); !handled || out.Result != observability.ResultMiss {
+		t.Errorf("request after %d early bypasses = %+v handled %v, want a handled miss", len(paths)*attempts, out, handled)
+	}
+	assertStoreIdle(t, c)
+}
+
+// TestClassificationSlotIsNotHeldWhileStreaming starts more concurrent
+// clones than there are slots; every one is served from the one fill, so
+// none passes through for want of a slot.
+func TestClassificationSlotIsNotHeldWhileStreaming(t *testing.T) {
+	c, _, _ := exitCache(t, nil)
+	pr, pw := io.Pipe()
+	var fetches atomic.Int32
+	fetch := fetchFunc(func(context.Context, Request) (*http.Response, error) {
+		fetches.Add(1)
+		return streamingResponse(contentTypeResult, pr), nil
+	})
+	const clients = maxClassifications + 8
+	type result struct {
+		out     Outcome
+		handled bool
+	}
+	results := make(chan result, clients)
+	requests := make([]*http.Request, clients)
+	for i := range requests {
+		requests[i] = fetchRequest(t)
+	}
+	// Each client is started once the previous one has joined, so fewer
+	// than maxClassifications are ever in the pre-stream phase together.
+	for i, r := range requests {
+		go func() {
+			out, handled, _ := serve(c, httptest.NewRecorder(), r, fetch)
+			results <- result{out, handled}
+		}()
+		waitFor(t, "the client to join the one fill", func() bool { return subscribersAre(c, i+1) })
+	}
+	waitFor(t, "the classification slots to be released", func() bool { return len(c.classifySlots) == 0 })
+	_, _ = pw.Write(fetchResultBody(t, 1, 10))
+	_ = pw.Close()
+	for range clients {
+		if res := <-results; !res.handled || res.out.Result != observability.ResultMiss {
+			t.Errorf("client = %+v handled %v, want a miss served from the shared fill", res.out, res.handled)
+		}
+	}
+	if got := fetches.Load(); got != 1 {
+		t.Errorf("upstream fetches = %d, want 1", got)
+	}
+	assertStoreIdle(t, c)
+}
+
 func TestReplayBodyDropsItsBufferOnceReplayed(t *testing.T) {
 	r := postV2(cloneFetchBody(t))
-	var released atomic.Int32
-	if _, reason, err := readBody(r, false, 1<<20, func() { released.Add(1) }); err != nil || reason != "" {
+	if _, reason, err := readBody(r, false, 1<<20); err != nil || reason != "" {
 		t.Fatalf("readBody: %q, %v", reason, err)
 	}
 	rb, ok := r.Body.(*replayBody)
 	if !ok {
 		t.Fatalf("body is %T", r.Body)
 	}
-	if len(rb.captured) == 0 || released.Load() != 0 {
+	if len(rb.captured) == 0 {
 		t.Fatal("captured bytes were dropped before the replay")
 	}
 	data, err := io.ReadAll(r.Body)
 	if err != nil || !bytes.Equal(data, cloneFetchBody(t)) {
 		t.Fatalf("replay = %d bytes, %v", len(data), err)
 	}
-	if rb.captured != nil || released.Load() != 1 {
-		t.Errorf("after replay: captured %d bytes, released %d times", len(rb.captured), released.Load())
-	}
-	_ = r.Body.Close()
-	if released.Load() != 1 {
-		t.Errorf("Close released again (%d)", released.Load())
+	if rb.captured != nil {
+		t.Errorf("after replay: %d captured bytes remain", len(rb.captured))
 	}
 }
 
@@ -758,22 +856,29 @@ func TestFillMetricsPerExit(t *testing.T) {
 	// Lookups, collapsing and byte tiers across a miss, a follower and a hit.
 	stored := &fixedFetcher{status: 200, contentType: contentTypeResult, body: fetchResultBody(t, 1, 10)}
 	before := lookups(t, reader, observability.ResultMiss)
-	lf := newLateFollower(t, c, fetchRequestFor(t, 1), func() *http.Response {
+	lf := newLateFollower(t, c, fetchRequestFor(t, 20), func() *http.Response {
 		return response(200, contentTypeResult, fetchResultBody(t, 1, 10))
 	})
+	if out, handled, _ := serve(c, httptest.NewRecorder(), fetchRequestFor(t, 20), lf.fetch); !handled || out.Collapsed {
+		t.Fatalf("leader = %+v handled %v, want a handled, uncollapsed miss", out, handled)
+	}
+	if out, handled := lf.wait(); !handled || !out.Collapsed {
+		t.Fatalf("follower = %+v handled %v, want a handled, collapsed miss", out, handled)
+	}
 	c.hooks.afterDecision, c.hooks.beforeOpenReader = nil, nil
-	stored.calls.Store(0)
 	serve(c, httptest.NewRecorder(), fetchRequestFor(t, 1), stored) // hit
 	if got := lookups(t, reader, observability.ResultHit); got != 1 {
 		t.Errorf("hit lookups = %d, want 1", got)
 	}
-	if got := lookups(t, reader, observability.ResultMiss); got < before {
-		t.Errorf("miss lookups = %d, want at least %d", got, before)
+	if got := lookups(t, reader, observability.ResultMiss); got != before+2 {
+		t.Errorf("miss lookups = %d, want %d (the leader and the follower)", got, before+2)
 	}
 	if got := lookups(t, reader, observability.ResultBypass); got != 2 {
 		t.Errorf("bypass lookups = %d, want 2 (the fetch error and the encoded response)", got)
 	}
-	_ = lf
+	if got := sumWhere(t, reader, "haybale.response_cache.collapsed.total", nil); got != 1 {
+		t.Errorf("collapsed.total = %d, want 1", got)
+	}
 	if got := sumWhere(t, reader, "haybale.response_cache.served_bytes.total", map[string]string{"haybale.tier": observability.TierDisk}); got == 0 {
 		t.Error("no bytes served from the disk tier after a hit")
 	}

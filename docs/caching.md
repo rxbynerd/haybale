@@ -415,14 +415,18 @@ remote tier is not supported in this release.
   fetch, a `want-ref` request, a body over `maxRequestBody`, a filter or
   argument outside the allowlists, or a protocol v2 request without the
   `Git-Protocol` header that Git normally sends. In the logs and metrics such a
-  request has `class=bypass`, because it could not be classified. A request
-  that was classified but not served has its real class and one of these
-  reasons:
+  request has `class=bypass`, because it could not be classified. That includes
+  a request that found none of the 128 classification slots free
+  (`body_budget`). A request that was classified but not served has its real
+  class and one of these reasons:
   - `uncacheable`: the key was marked after a discarded fill and the mark has
     not expired. An upstream `401` that haybale turned into a `502` is one
     example;
   - `no_slot`: every fill slot was busy (`maxConcurrentFills` for packs, 64 for
-    refs); and
+    refs);
+  - `stale_fill`: with `refsMaxAge` above `0s`, a push finished after the refs
+    fill that is in flight began, so its response might carry the tips from
+    before the push and the request is proxied instead of joining it; and
   - `verification`: a freshly stored entry failed its integrity check, so the
     request was proxied instead.
 - Repeated `miss` results for the `fetch` class usually mean the clones ask for

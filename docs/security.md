@@ -191,8 +191,10 @@ request waiting on the same fetch can receive it.
 Request bodies are streamed as well, except that with the response cache
 enabled the body of a read request is read in full, up to `cache.maxRequestBody`,
 before the request is forwarded (see [Response cache](#response-cache)). At most
-128 request bodies are held for classification at once; beyond that, reads pass
-through without being inspected. Push bodies are never read.
+128 read requests are being read and classified at once; beyond that, reads pass
+through without being inspected. A request the cache declines keeps the bytes it
+read, at most `cache.maxRequestBody`, until they have been forwarded. Push
+bodies are never read.
 
 The server applies a 10-second request-header timeout but no read, write, or
 idle timeout, and upstream connections use 30-second dial and TLS handshake
@@ -417,8 +419,8 @@ request that finds no free slot is proxied directly.
 
 ### Resource use
 
-The cache bounds the memory and disk it uses. At most 128 request bodies are
-classified at once. Fills are bounded by `maxConcurrentFills` pack slots and 64
+The cache bounds the memory and disk it uses. At most 128 read requests are
+read and classified at once. Fills are bounded by `maxConcurrentFills` pack slots and 64
 ref slots, and each reserves its disk before it starts. A response of unknown
 length larger than both `maxEntrySize` and the free disk closes the connections
 of the clients sharing it, once per `retention` for that key. It does not evict

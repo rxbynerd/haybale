@@ -242,8 +242,8 @@ func (f *fill) share(resp *http.Response, body io.Reader) {
 		}
 	}
 	h.Set("Content-Length", strconv.Itoa(len(buf)))
-	f.setOutcome(fillOutcome{kind: fillShared, status: resp.StatusCode, header: h, body: buf})
 	f.finish(observability.FillResultDiscarded, observability.FillReasonUpstreamStatus, transientCooldown)
+	f.setOutcome(fillOutcome{kind: fillShared, status: resp.StatusCode, header: h, body: buf})
 }
 
 // openSpool reserves disk for the response and writes the sealed header.
@@ -447,9 +447,11 @@ func (f *fill) setOutcome(o fillOutcome) {
 
 // release settles a fill that cannot serve its subscribers from the spool:
 // those still waiting for the header outcome take the passthrough path.
+// The result and the mark are recorded first, so a released request that
+// passes through already sees both.
 func (f *fill) release(reason string, markFor time.Duration) {
-	f.setOutcome(fillOutcome{kind: fillReleased})
 	f.finish(observability.FillResultDiscarded, reason, markFor)
+	f.setOutcome(fillOutcome{kind: fillReleased})
 }
 
 // discard ends a spool that served its subscribers but is not storable:

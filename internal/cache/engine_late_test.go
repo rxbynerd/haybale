@@ -49,13 +49,22 @@ func newLateFollower(t *testing.T, c *Cache, r *http.Request, respond func() *ht
 	}
 	var once sync.Once
 	c.hooks.afterDecision = func(entryKey) { once.Do(func() { close(decided) }) }
+	// The goroutine never calls t.Fatal and the cleanup waits for it, so
+	// it cannot report a failure after the test has finished.
+	t.Cleanup(func() { <-lf.done })
 	go func() {
-		waitForSubscribers(t, c, 1)
+		if !pollFor(func() bool { return subscribersAre(c, 1) }) {
+			t.Error("the leader's fill never started")
+			close(lf.done)
+			return
+		}
 		go func() {
 			defer close(lf.done)
 			lf.out, lf.handled, _ = serve(c, lf.rec, r, lf.fetch)
 		}()
-		waitForSubscribers(t, c, 2)
+		if !pollFor(func() bool { return subscribersAre(c, 2) }) {
+			t.Error("the late follower never attached to the fill")
+		}
 		close(attached)
 	}()
 	return lf
@@ -188,6 +197,67 @@ func TestPushBetweenGenerationCheckAndCommitDeletesTheEntry(t *testing.T) {
 	c.hooks.beforeCommit = nil
 	if out, _, _ := serve(c, httptest.NewRecorder(), get(), refs); out.Result != observability.ResultMiss || refs.calls.Load() != 2 {
 		t.Errorf("next refs request = %+v with %d fetches, want a miss and 2", out, refs.calls.Load())
+	}
+	assertStoreIdle(t, c)
+}
+
+func TestRefsRequestAfterAPushDoesNotJoinAStaleFill(t *testing.T) {
+	c, logs, _ := exitCache(t, func(o *Options) { o.RefsMaxAge = time.Minute })
+	pr, pw := io.Pipe()
+	var fetches atomic.Int32
+	fetch := fetchFunc(func(context.Context, Request) (*http.Response, error) {
+		fetches.Add(1)
+		return streamingResponse(contentTypeAdvertisement, pr), nil
+	})
+	body := advertisementBody(t)
+	leaderOut := make(chan Outcome, 1)
+	go func() {
+		out, _, _ := serve(c, httptest.NewRecorder(), get(), fetch)
+		leaderOut <- out
+	}()
+	waitForSubscribers(t, c, 1)
+	c.Invalidate(context.Background(), testRepo, testBaseURL)
+
+	type result struct {
+		out     Outcome
+		handled bool
+	}
+	afterPush := make(chan result, 1)
+	go func() {
+		out, handled, _ := serve(c, httptest.NewRecorder(), get(), fetch)
+		afterPush <- result{out, handled}
+	}()
+	answered := false
+	select {
+	case res := <-afterPush:
+		answered = true
+		if res.handled || res.out.Result != observability.ResultBypass {
+			t.Errorf("request after the push = %+v handled %v, want a bypass", res.out, res.handled)
+		}
+	case <-time.After(shortly):
+		t.Error("request after the push joined the stale fill and waited on it")
+	}
+	if got := fetches.Load(); got != 1 {
+		t.Errorf("upstream fetches = %d, want 1: the request must not start a second fill", got)
+	}
+
+	_, _ = pw.Write(body)
+	_ = pw.Close()
+	if !answered {
+		<-afterPush
+	}
+	if recs := logs.records(t, "bypass"); len(recs) != 1 || recs[0]["reason"] != "stale_fill" {
+		t.Errorf("bypass log records = %v, want one with reason stale_fill", recs)
+	}
+	if out := <-leaderOut; out.Result != observability.ResultMiss || out.Stored {
+		t.Errorf("leader = %+v, want an unstored miss", out)
+	}
+	if files := entryFiles(t, c.opts.Dir); len(files) != 0 {
+		t.Errorf("entries after the stale fill = %v, want none", files)
+	}
+	fresh := &fixedFetcher{status: 200, contentType: contentTypeAdvertisement, body: body}
+	if out, handled, _ := serve(c, httptest.NewRecorder(), get(), fresh); !handled || !out.Stored {
+		t.Errorf("request once the stale fill ended = %+v handled %v, want a stored miss", out, handled)
 	}
 	assertStoreIdle(t, c)
 }

@@ -54,9 +54,11 @@ the implementation:
 - haybale scans the pkt-line *framing* of a read response to decide
   whether it is safe to store.
 
-> Implemented as: At most 128 request bodies are classified at once. Beyond
-> that limit, a read passes through unclassified. The slot is held while the
-> captured body is retained.
+> Implemented as: At most 128 requests are in the pre-stream phase at once:
+> reading and classifying the body, then looking up an entry or joining or
+> starting a fill. Beyond that limit, a read passes through unclassified. The
+> slot is released on every exit of that phase, and before a response starts
+> streaming, so a long transfer never holds one.
 
 It still never buffers a response body in memory, never interprets pack
 contents, and never reads a push body. Bypassed and write requests take
@@ -371,7 +373,9 @@ Lifecycle:
 > Implemented as: A subscriber that attaches after the fill committed is
 > served from the committed entry. A subscriber that attaches after a
 > discard decision is served from the spool, which stays readable until
-> every attached subscriber has opened a reader.
+> every attached subscriber has opened a reader. A refs request does not join
+> a fill that began before the repository's latest push, because that fill is
+> discarded at commit and may carry the pre-push tips; it passes through.
 
 > Implemented as: A response with a known `Content-Length` over
 > `maxEntrySize` is spooled and served to completion without committing when
