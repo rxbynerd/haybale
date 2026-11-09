@@ -643,8 +643,9 @@ func (c *Cache) invalidateRemote(repo gitproto.Repo, repoHash [32]byte) {
 }
 
 // remoteError counts and logs a failed remote-tier operation. The error is
-// logged as the BlobStore formats it, which for the s3 backend is the
-// operation, error code and status only.
+// logged as the BlobStore formats it: for the s3 backend a failed request
+// is the operation, error code and status only, but a body read that fails
+// mid-stream is the transport's error, which can name peer addresses.
 func (c *Cache) remoteError(operation string, err error) {
 	c.metrics.RecordResponseCacheStoreError(context.Background(), observability.TierRemote, operation)
 	c.logger.Warn("remote cache tier operation failed", "operation", operation, "error", err)

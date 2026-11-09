@@ -43,9 +43,11 @@ const readHeaderTimeout = 10 * time.Second
 const telemetryShutdownTimeout = 5 * time.Second
 
 // cacheCloseTimeout bounds how long process exit waits for the response
-// cache to cancel its fills and close its store. The close runs after the
-// request drain, which can itself time out with requests still in flight,
-// so fills may still have subscribers when it starts.
+// cache to cancel its fills, flush queued uploads to the remote tier and
+// close its store. The close runs after the request drain, which can
+// itself time out with requests still in flight, so fills may still have
+// subscribers when it starts. Uploads still queued at the deadline are
+// dropped.
 const cacheCloseTimeout = 30 * time.Second
 
 var (

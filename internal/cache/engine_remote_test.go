@@ -525,16 +525,22 @@ func TestRemoteFillCoalescesSubscribers(t *testing.T) {
 	leader, follower := newCollectWriter(), newCollectWriter()
 	var leaderOut, followerOut Outcome
 	var wg sync.WaitGroup
+	leaderReq, followerReq := fetchRequest(t), fetchRequest(t)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		leaderOut, _, _ = serve(c, leader, fetchRequest(t), upstream)
+		leaderOut, _, _ = serve(c, leader, leaderReq, upstream)
 	}()
-	<-leader.first
+	select {
+	case <-leader.first:
+	case <-time.After(shortly):
+		close(release)
+		t.Fatal("the leader received no bytes")
+	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		followerOut, _, _ = serve(c, follower, fetchRequest(t), upstream)
+		followerOut, _, _ = serve(c, follower, followerReq, upstream)
 	}()
 	waitForSubscribers(t, c, 2)
 	close(release)
