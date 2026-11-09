@@ -84,6 +84,15 @@ func WithCache(c ResponseCache) Option {
 	return func(p *Proxy) { p.cache = c }
 }
 
+// WithReadHeaderTimeout bounds how long a read on the passthrough path
+// waits for upstream response headers, as the response cache's fetcher
+// does; a read whose headers do not arrive in time is answered 502. Zero
+// leaves reads unbounded. Writes are never bounded, since an upstream may
+// run hooks before it answers a push.
+func WithReadHeaderTimeout(d time.Duration) Option {
+	return func(p *Proxy) { p.readHeaderTimeout = d }
+}
+
 // Proxy is an http.Handler that validates inbound smart-HTTP requests,
 // authenticates and authorizes the caller, and streams the request
 // through to the configured upstream.
@@ -103,6 +112,9 @@ type Proxy struct {
 	transport     http.RoundTripper
 	rp            *httputil.ReverseProxy
 	cache         ResponseCache
+	// readHeaderTimeout bounds the passthrough's wait for the response
+	// headers of a read; zero leaves it unbounded.
+	readHeaderTimeout time.Duration
 	logger        *slog.Logger
 	metrics       *observability.Metrics
 	authenticator identity.Authenticator
@@ -225,6 +237,10 @@ func New(upstreams map[string]*url.URL, credentialSources map[string]upstream.Cr
 		},
 		otelhttp.WithPropagators(propagation.NewCompositeTextMapPropagator()),
 	)
+	passthrough := p.transport
+	if p.readHeaderTimeout > 0 {
+		passthrough = readHeaderBound{next: p.transport, timeout: p.readHeaderTimeout}
+	}
 	p.rp = &httputil.ReverseProxy{
 		Rewrite: p.rewrite,
 		// -1 disables periodic batching and flushes on every write
@@ -232,7 +248,7 @@ func New(upstreams map[string]*url.URL, credentialSources map[string]upstream.Cr
 		// percentages) streams live through the proxy rather than
 		// arriving in bursts.
 		FlushInterval: -1,
-		Transport:     p.transport,
+		Transport:     passthrough,
 		ErrorLog:      slog.NewLogLogger(logger.Handler(), slog.LevelError),
 		// ModifyResponse maps a post-injection upstream 401/403 to a 502
 		// and resets the response headers to a minimal known-safe set
