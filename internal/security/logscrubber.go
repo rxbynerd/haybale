@@ -5,6 +5,11 @@ import "regexp"
 // redactedPlaceholder replaces every matched secret span in Scrub.
 const redactedPlaceholder = "[REDACTED]"
 
+// redactedTemplate is the replacement template Scrub applies to every
+// match. A pattern's capture group named "keep" (a non-secret prefix such
+// as a header name) survives; patterns without one expand it to nothing.
+const redactedTemplate = "${keep}" + redactedPlaceholder
+
 // namedPattern pairs a regexp with a stable name for tests and diagnostics.
 type namedPattern struct {
 	name string
@@ -28,6 +33,9 @@ type namedPattern struct {
 //     token, OAuth token, user-to-server token, GitHub App installation
 //     token (ghs_), or refresh token looks like.
 //   - a PEM private key block.
+//   - an AWS access key id (AKIA long-term, ASIA temporary) and the
+//     value of an x-amz-security-token header or query parameter, the
+//     shapes an S3 request or SDK error can carry.
 //
 // This list is intentionally small and specific rather than a permissive
 // high-entropy-string catch-all: haybale's own logging call sites are
@@ -53,6 +61,8 @@ var secretPatterns = []namedPattern{
 	// share the ghX_ prefix pattern at all.
 	{"github_token", regexp.MustCompile(`\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]+\b|github_pat_[A-Za-z0-9_]+`)},
 	{"pem_private_key", regexp.MustCompile(`-----BEGIN[\s\w]+KEY-----`)},
+	{"aws_access_key_id", regexp.MustCompile(`\b(AKIA|ASIA)[A-Z0-9]{16}\b`)},
+	{"aws_security_token", regexp.MustCompile(`(?i)(?P<keep>x-amz-security-token["']?\s*[:=]\s*["']?)[A-Za-z0-9+/=%_-]+`)},
 }
 
 // Scrub replaces every known secret pattern in value with "[REDACTED]".
@@ -60,7 +70,7 @@ var secretPatterns = []namedPattern{
 // (the common case) — it simply returns value unchanged.
 func Scrub(value string) string {
 	for _, p := range secretPatterns {
-		value = p.re.ReplaceAllString(value, redactedPlaceholder)
+		value = p.re.ReplaceAllString(value, redactedTemplate)
 	}
 	return value
 }

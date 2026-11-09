@@ -82,6 +82,35 @@ func TestScrub(t *testing.T) {
 			input:    "remote https://git:eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJydW4ifQ.YWJj@haybale.internal/github.com/o/r.git",
 			wantGone: []string{"eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJydW4ifQ.YWJj"},
 		},
+		{ //nolint:gosec // G101: fake access key id fixture exercising Scrub's aws_access_key_id pattern, not a real credential
+			name:     "aws long-term access key id",
+			input:    `credential=AKIAIOSFODNN7EXAMPLE/20261109/us-east-1/s3/aws4_request`,
+			wantGone: []string{"AKIAIOSFODNN7EXAMPLE"},
+			wantKept: []string{"credential=[REDACTED]/20261109/us-east-1/s3/aws4_request"},
+		},
+		{ //nolint:gosec // G101: fake access key id fixture exercising Scrub's aws_access_key_id pattern, not a real credential
+			name:     "aws temporary access key id",
+			input:    `using key ASIAY34FZKBOKMUTVV7A for upload`,
+			wantGone: []string{"ASIAY34FZKBOKMUTVV7A"},
+			wantKept: []string{"using key", "for upload"},
+		},
+		{ //nolint:gosec // G101: fake access key id fixture exercising the aws_access_key_id word boundary, not a real credential
+			name:     "aws access key id prefix inside a longer word",
+			input:    `XAKIAIOSFODNN7EXAMPLEX`,
+			wantKept: []string{"XAKIAIOSFODNN7EXAMPLEX"},
+		},
+		{ //nolint:gosec // G101: fake session token fixture exercising Scrub's aws_security_token pattern, not a real credential
+			name:     "aws security token header",
+			input:    `X-Amz-Security-Token: IQoJb3JpZ2luX2VjEH0aCXVzLWVhc3QtMSJHMEUCIQ+abc/def== sent`,
+			wantGone: []string{"IQoJb3JpZ2luX2VjEH0aCXVzLWVhc3QtMSJHMEUCIQ+abc/def=="},
+			wantKept: []string{"X-Amz-Security-Token: [REDACTED] sent"},
+		},
+		{ //nolint:gosec // G101: fake session token fixture exercising Scrub's aws_security_token pattern, not a real credential
+			name:     "aws security token query parameter",
+			input:    `GET /obj?X-Amz-Security-Token=IQoJb3JpZ2luX2VjEH0%2Babc%3D&X-Amz-Date=20261109T000000Z`,
+			wantGone: []string{"IQoJb3JpZ2luX2VjEH0%2Babc%3D"},
+			wantKept: []string{"X-Amz-Security-Token=[REDACTED]&X-Amz-Date=20261109T000000Z"},
+		},
 		{
 			name:     "no secret material",
 			input:    "proxied request identity=run-1 host=github.com owner=acme repo=widgets verb=read status=200",
