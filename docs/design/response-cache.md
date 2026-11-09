@@ -109,8 +109,11 @@ and of immutable objects: a pack satisfying `want X` is a complete
 closure of `X` and stays a correct answer to that exact request. Requests
 that name refs (`want-ref`, `deepen-not`), depend on negotiation state
 (`have`), or ask the server to emit URLs (`packfile-uris`) are not
-immutable and are never cached. Only the ref advertisement (which tips
-are current) has a freshness problem, and the design separates the two.
+immutable and are never cached. One allowed argument, `include-tag`,
+makes the response depend on the server's current tag set as well; the
+design accepts that drift for shallow clones (Decision 2). Otherwise only
+the ref advertisement (which tips are current) has a freshness problem,
+and the design separates the two.
 
 ## Decision 1: a request-keyed response cache, not a bare-repository mirror
 
@@ -168,7 +171,14 @@ The fetch allowlist is: `want <oid>`, `done`, `thin-pack`, `no-progress`,
 `deepen-since <ts>`, `shallow <oid>`, and `filter <spec>` where `<spec>`
 matches `blob:none`, `blob:limit=<n>[kmg]`, `tree:<depth>`,
 `object:type=<blob|tree|commit|tag>`, or `sparse:oid=<full hex oid>`.
-For v0 the capability list must include `side-band-64k` or `side-band`.
+For v0 the capability list on the first `want` line must include
+`side-band-64k` or `side-band`, and every capability must be from
+{`multi_ack`, `multi_ack_detailed`, `no-done`, `side-band`,
+`side-band-64k`, `thin-pack`, `no-progress`, `include-tag`, `ofs-delta`,
+`shallow`, `deepen-since`, `deepen-not`, `deepen-relative`, `filter`,
+`agent=`, `session-id=`, `object-format=`}; v0 request lines may be
+`want`, `shallow`, `deepen`, `deepen-since`, one allowlisted `filter`,
+then a flush and `done` (the v0 body ends with `done`, not a flush).
 Explicitly bypassed: `have`, `want-ref` (sent automatically by stock
 clients when a server advertises `ref-in-want`; it resolves a ref name at
 request time), `deepen-not`, `packfile-uris`, `sideband-all`,
@@ -230,9 +240,10 @@ no effect on cache behaviour.
 ## Decision 3: freshness policy
 
 - **`pack` entries are content-addressed.** They are retained for
-  `cache.retention` (default `24h`) or until evicted for space. No
-  retained pack is ever an incorrect answer to its request, but it may
-  be an answer upstream would no longer give: after a force-push that
+  `cache.retention` (default `24h`) or until evicted for space. A
+  retained pack is always a valid answer to its request (with the
+  `include-tag` drift accepted above), but it may be an answer upstream
+  would no longer give: after a force-push that
   removed a leaked secret, a deleted or transferred repository, or
   revocation of haybale's own upstream access. Two controls bound that
   window. A `pack` hit is served only if this instance saw a successful
@@ -297,20 +308,40 @@ Lifecycle:
   subscriber at once to the passthrough path (no serial re-election).
   Attach, detach and cancellation take one lock, so a request cannot
   attach to a fill that is being torn down.
-- If the fill fails after bytes were spooled (upstream transport error,
-  spool write error, disk budget exceeded, entry over `maxEntrySize`,
-  storability check failed), the spool is discarded and every subscriber
-  is aborted with `panic(http.ErrAbortHandler)`, which closes the
-  connection without a clean chunk terminator so no client can mistake a
-  truncated body for a complete one. The key is then marked uncacheable
-  in memory: for `retention` when the failure was an oversize response
-  (a deterministic key would otherwise fail every retry burst at the same
-  byte), and for a short cooldown for transient errors, so retries pass
-  straight through instead of refilling.
+- Whether an entry is stored never affects clients. Two outcomes are
+  distinct. **"Will not commit"** covers an oversize response (over
+  `maxEntrySize`), a storability-scan doubt, an in-band `ERR` or
+  sideband-3 message, a `Content-Length` mismatch, and a refs generation
+  change: the fill keeps spooling, every subscriber is served to
+  completion with upstream's own bytes (including upstream's error
+  text), and the spool is deleted afterwards instead of committed.
+  **"Cannot continue"** covers an upstream transport error mid-stream, a
+  spool write error, a sealed-segment verification failure, and a disk
+  budget that is still exhausted after evicting committed entries: the
+  spool is discarded and every subscriber is aborted with
+  `panic(http.ErrAbortHandler)`, which closes the connection without a
+  clean chunk terminator so no client can mistake a truncated body for a
+  complete one. After an oversize response the key is marked uncacheable
+  in memory for `retention`, so the next burst for that key passes
+  straight through instead of spooling to the limit again; after a
+  transient error the mark lasts a short cooldown.
+- Fills carry their own timeouts, independent of stale-if-error: no
+  response headers within `cache.responseHeaderTimeout` (default `60s`)
+  or no body bytes for `cache.idleTimeout` (default `2m`; upload-pack
+  sends a keepalive every 5 s while preparing a pack) is a transport
+  failure. Passthrough requests keep today's unbounded behaviour; one
+  wedged upstream connection then affects one client, whereas a wedged
+  fill would hold every subscriber.
+- Subscribers write every sealed segment to the client as soon as it is
+  verified and flush, so progress and keepalives reach clients with at
+  most the segment flush bound (below) of added latency.
 - `recover()` guards every fill goroutine; a panic in the scanner or
   sealing code aborts that fill and its subscribers, never the process.
 - Concurrent fills are bounded by `cache.maxConcurrentFills` (default
-  `32`); a request that cannot obtain a slot bypasses.
+  `8`); a request that cannot obtain a slot bypasses. A fill of unknown
+  length reserves `maxEntrySize` up front, so with the defaults eight
+  fills can be in flight against the 10 GiB budget; operators size the
+  three values together.
 
 A fill that completes the storability checks (Decision 5) commits the
 spool by rename and becomes a normal entry.
@@ -346,15 +377,22 @@ It is fuzzed.
 
 ## Decision 6: sealed entries, two storage tiers
 
-**Entry format.** Every stored object, on both tiers, is a header
-followed by sealed segments. The header is a small versioned record
-(format version, key id, `repoHash`, group, class, `keyHash`, plain
-repository name and upstream base URL for operators, creation time,
-`Content-Type`, body length, canonical-request digest) in clear text;
-the body is encrypted and authenticated in 64 KiB segments with
-AES-256-GCM in a STREAM-style construction (per-entry random nonce
-prefix, segment counter, final-segment flag) with the header's digest as
-associated data on every segment. A reader verifies the header and each
+**Entry format.** Every stored object, on both tiers, is a preamble, an
+authenticated header, and sealed segments. The preamble (magic, format
+version, key id, per-entry random nonce prefix) is clear text. The
+header records only fields known when the response starts: `repoHash`,
+group, class, `keyHash`, plain repository name and upstream base URL for
+operators, creation time, `Content-Type`, protocol, and the
+canonical-request digest. The body is encrypted and authenticated with
+AES-256-GCM in a STREAM-style construction (nonce = prefix || segment
+counter || final-segment flag) with the header's digest as associated
+data on every segment. **Segments are variable length**, each framed by
+an explicit ciphertext length, with 64 KiB as the maximum plaintext per
+segment: the fill seals a segment when 64 KiB has accumulated or when
+pending bytes are older than about 200 ms, so upload-pack's 5-byte
+keepalives and sideband progress reach subscribers promptly. The total
+body length is carried in an authenticated trailer in the final segment
+and cross-checked by the reader. A reader verifies the header and each
 segment before releasing bytes to the client; truncation, reordering,
 relocation under another key, and modification all fail verification.
 Verification failure is a miss plus a store-error metric; if bytes were
@@ -368,8 +406,11 @@ id, so a local-only cache does not survive a process restart. It is
 required when `cache.remote` is set, because replicas must read each
 other's entries. The key is distinct from any storage credential; whoever
 can write to the bucket still cannot forge or relocate an entry
-(the security review's highest-severity finding). A key id in the header
-allows rotation by running two keys for a retention period.
+(the security review's highest-severity finding). Rotating the key is a
+cold cache: `repoHash` is keyed, so entries under the previous key are
+unreachable and age out through the janitor and bucket lifecycle. The key
+id in the preamble exists so a reader can reject such entries cleanly,
+not to support dual-key operation.
 
 **Tier 1, local disk (`cache.dir`), required when the cache is enabled.**
 It is the spool for in-flight fills, the read path for every subscriber,
@@ -390,8 +431,9 @@ pattern. Operators deploy an `emptyDir` with `sizeLimit` above
 
 **Tier 2, remote object storage (`cache.remote`), optional.** After a
 tier-1 commit, the sealed file is uploaded by a bounded worker pool from
-its finalised length (a `Stat` first skips the upload when a peer already
-stored the key). On a tier-1 miss, tier 2 is consulted before upstream
+its finalised length (for `pack` entries a `Stat` first skips the upload
+when a peer already stored the key; `refs` entries are always uploaded so
+the shared copy is refreshed). On a tier-1 miss, tier 2 is consulted before upstream
 under `cache.remote.timeout`; a tier-2 hit is streamed into the tier-1
 spool as a fill source, so subscribers coalesce on it exactly as on an
 upstream fill. A tier-2 failure before the first byte falls through to
@@ -505,7 +547,9 @@ A read becomes eligible for stale service when, for that request:
   arrived within `cache.responseHeaderTimeout`; or
 - upstream returned 500, 502, 503 or 504.
 
-Not eligible: 401 and 403 (a credential problem, still mapped to 502),
+A subscriber to a fill whose header outcome is eligible is served stale
+when a qualifying entry exists, before the shared non-200 response is
+relayed. Not eligible: 401 and 403 (a credential problem, still mapped to 502),
 404 and other 4xx (passed through), 429 or rate-limit 403 (a policy
 signal, not an outage), and every write. An eligible request is answered
 from the newest entry for its key no older than `staleIfErrorFor`; the
@@ -550,11 +594,20 @@ The request log's `cache` field carries the same values for operators.
 ## Operator controls
 
 `haybale cache purge --config haybale.yaml --repo HOST/OWNER/REPO [--group refs|pack]`
-removes a repository's entries from tier 1 and, when configured, tier 2.
-It is the documented response to a history rewrite that removed a secret,
-a repository deletion or transfer, or a suspected poisoned entry. Like
-`policy check` it runs offline against the local directory; the remote
-step opens the bucket client only when `--remote` is passed.
+removes a repository's entries from the local tier-1 directory and, when
+`--remote` is passed, from tier 2. It is the documented response to a
+history rewrite that removed a secret, a repository deletion or transfer,
+or a suspected poisoned entry. It runs as a separate process against a
+directory a server may be using: the server treats a vanished file as a
+miss, and the purge only ever deletes names matching the entry pattern.
+
+Purge reaches one replica's tier 1. With a remote tier, purge also writes
+a per-repository marker object (`v1/purge/<repoHash>`, holding the purge
+time) that every replica reads when it refreshes the repository's
+`accessRecheck` record; a local entry created before the marker is a
+miss and is deleted. Without a remote tier, the procedure is to run the
+purge in every replica (or restart every replica when the key is
+ephemeral), and the documentation says so.
 
 ## Observability
 
@@ -579,7 +632,9 @@ nest under the request span; the fill span is linked from, not parented
 to, the first subscriber's span because the fill outlives it. The request
 log gains a `cache` field. Security events: `cache_stale_served`
 (warning). Hits keep `outcome=proxied` on the existing request metrics so
-current dashboards and SLOs include them.
+current dashboards and SLOs include them; the documented meaning of
+`proxied` widens to "answered on the client's behalf", and upstream-load
+panels should use the fill metrics instead.
 
 ## Configuration
 
@@ -590,12 +645,13 @@ cache:
   keyEnv: HAYBALE_CACHE_KEY        # 32-byte base64 key; optional for disk-only, required with remote
   maxDiskSize: 10GiB               # tier-1 budget: committed + in-flight + evicted-but-open
   maxEntrySize: 1GiB               # larger responses stream through unstored
-  maxConcurrentFills: 32
+  maxConcurrentFills: 8            # with maxEntrySize, bounds in-flight disk use
   maxRequestBody: 1MiB             # decoded size; larger read bodies bypass
   retention: 24h                   # all entries; also the post-rewrite exposure window
   refsMaxAge: 0s                   # 0s = always revalidate refs upstream
   accessRecheck: 5m                # pack hits need a recent upstream refs success
-  responseHeaderTimeout: 0s        # 0s = none; set (e.g. 60s) when staleIfErrorFor is on
+  responseHeaderTimeout: 60s       # fills only: time to upstream response headers
+  idleTimeout: 2m                  # fills only: max gap between upstream body bytes
   exposeStatus: false              # emit Cache-Status
   remote:                          # optional tier 2
     type: s3
@@ -604,13 +660,16 @@ cache:
     region: us-east-1
     endpoint: ""                   # https; set for R2, Ceph, GCS interop
     forcePathStyle: false
-    timeout: 10s                   # per remote operation on the miss path
+    headerTimeout: 10s             # time to first byte for remote Stat/Get on the miss path
     sse: ""                        # "AES256" or "aws:kms"
     kmsKeyID: ""
   staleIfErrorFor: 0s              # 0s = disabled; must not exceed retention
 ```
 
-Sizes use a `ByteSize` YAML type that accepts IEC units only (`KiB`,
+The `cache` block is decoded strictly (unknown keys are errors) even
+though the rest of the file is not, so a mistyped or renamed key fails
+startup instead of silently reverting to a default. Sizes use a
+`ByteSize` YAML type that accepts IEC units only (`KiB`,
 `MiB`, `GiB`, `TiB`) and rejects bare integers and SI units, so a value
 can never be misread by a factor of 1024. Durations use Go duration
 strings as elsewhere. `cache` follows the configuration package's
@@ -624,8 +683,10 @@ and starts the janitor and upload workers. The cache has `Close(ctx)`,
 called after graceful drain so fills and uploads survive the drain window
 and pending uploads are flushed within a bound; its goroutines are not
 bound to the SIGTERM context. `BuildCache` probes the bucket with a
-`Stat` of a sentinel key: `ErrNotFound` is healthy, an authorization
-error fails startup, matching the fail-fast JWKS behaviour.
+`Stat` of a sentinel key: `ErrNotFound` is healthy, an authorization or
+configuration error fails startup (matching the fail-fast JWKS
+behaviour), and a transient network or 5xx error logs a warning and
+continues, so a bucket outage cannot stop haybale from starting.
 
 ## Operational notes
 
@@ -641,6 +702,11 @@ error fails startup, matching the fail-fast JWKS behaviour.
   base URL, so they would not collide, but they should not share a key).
 - Cache entries are shared across every identity policy allows to read a
   repository. Policy, not the cache, decides who may read what.
+- `accessRecheck` and coalescing are per instance. Behind a load balancer
+  without client affinity, a clone's `ls-refs` and `fetch` may land on
+  different replicas; the cost is a lower hit rate (a tier-2 hit or an
+  upstream fill instead of a local hit), never a safety loss. Prefer
+  client affinity where the balancer offers it.
 - A hit does not contact upstream. haybale's own access being revoked
   becomes visible at the next `accessRecheck` boundary, and stale-if-error
   extends reads to `staleIfErrorFor`. After a history rewrite that
