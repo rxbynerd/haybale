@@ -18,8 +18,9 @@ client.
 - per-request, least-privilege GitHub App installation tokens, or static
   credentials for other Git hosts
 - streaming Git smart-HTTP proxying with no pack-size limit
-- an optional, encrypted on-disk response cache that serves repeated identical
-  clones and fetches without contacting the upstream again
+- an optional, encrypted on-disk response cache that serves the pack transfer
+  of repeated identical clones and fetches from disk instead of fetching it
+  from the upstream again
 - TLS, graceful draining, structured security logs, and optional OpenTelemetry
   traces, metrics, and logs
 
@@ -95,8 +96,10 @@ For each smart-HTTP request, haybale:
 2. verifies the caller's JWT and derives its policy identity;
 3. authorizes the identity against `policy.yaml` and any token repository scope;
 4. replaces the caller's authorization header with the configured upstream
-   credential; and
-5. streams the request and response between the client and upstream.
+   credential;
+5. with the optional response cache enabled, reads the request body, and serves
+   a stored response or joins a fetch already in progress; and
+6. otherwise streams the request and response between the client and upstream.
 
 See the [configuration reference](docs/configuration.md) for complete examples.
 
