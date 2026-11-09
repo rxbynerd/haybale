@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -110,5 +111,100 @@ func TestStaleServiceThroughTheProxy(t *testing.T) {
 	}
 	if n := strings.Count(buf.String(), `"event":"cache_stale_served"`); n != 1 {
 		t.Errorf("cache_stale_served events = %d, want only the one for the 503", n)
+	}
+}
+
+// TestUpstreamCopiesOfTheStatusHeaderAreIgnored: an upstream that sends
+// cache.UpstreamStatusHeader itself can neither trigger nor suppress
+// stale service, and the header never reaches the client, through the
+// cache or the passthrough path.
+func TestUpstreamCopiesOfTheStatusHeaderAreIgnored(t *testing.T) {
+	type answer struct {
+		status int
+		claim  string
+	}
+	var current atomic.Pointer[answer]
+	current.Store(&answer{status: http.StatusOK, claim: "503"})
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		a := current.Load()
+		w.Header().Set(cache.UpstreamStatusHeader, a.claim)
+		if a.status != http.StatusOK {
+			w.WriteHeader(a.status)
+			_, _ = io.WriteString(w, "upstream says no\n")
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+		_, _ = io.WriteString(w, "001e# service=git-upload-pack\n0000000eversion 2\n0000")
+	}))
+	defer upstreamSrv.Close()
+
+	dir := filepath.Join(t.TempDir(), "cache")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	kr, err := cache.EphemeralKeyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := cache.New(cache.Options{
+		Dir: dir, Keyring: kr, MaxDiskSize: 16 << 20, MaxEntrySize: 4 << 20, MaxConcurrentFills: 2,
+		MaxRequestBody: 1 << 20, Retention: time.Hour, StaleIfErrorFor: time.Hour, ExposeStatus: true,
+		ResponseHeaderTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = c.Close(ctx)
+	})
+	upstreams := newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL})
+	logger := slog.New(slog.DiscardHandler)
+	cached := httptest.NewServer(mustNew(t, upstreams, allowAllAuthenticator{}, allowAllPolicy{}, logger, WithCache(c)))
+	defer cached.Close()
+	passthrough := httptest.NewServer(mustNew(t, upstreams, allowAllAuthenticator{}, allowAllPolicy{}, logger))
+	defer passthrough.Close()
+
+	get := func(t *testing.T, base, repo string, a answer) *http.Response {
+		t.Helper()
+		current.Store(&a)
+		resp, err := http.Get(base + "/testhost/acme/" + repo + ".git/info/refs?service=git-upload-pack")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if v := resp.Header.Get(cache.UpstreamStatusHeader); v != "" {
+			t.Errorf("upstream %d: client saw %s = %q", a.status, cache.UpstreamStatusHeader, v)
+		}
+		return resp
+	}
+
+	// Each case has its own repository with a stored advertisement, since
+	// a relayed 4xx marks its key uncacheable.
+	seed := func(t *testing.T, repo string) {
+		t.Helper()
+		if resp := get(t, cached.URL, repo, answer{status: http.StatusOK, claim: "503"}); resp.StatusCode != http.StatusOK || resp.Header.Get("Cache-Status") != "haybale; fwd=miss" {
+			t.Fatalf("seeding %s = %d %q, want a 200 miss", repo, resp.StatusCode, resp.Header.Get("Cache-Status"))
+		}
+	}
+	for _, status := range []int{http.StatusNotFound, http.StatusTooManyRequests} {
+		repo := "widgets-" + strconv.Itoa(status)
+		seed(t, repo)
+		resp := get(t, cached.URL, repo, answer{status: status, claim: "503"})
+		if resp.StatusCode != status || resp.Header.Get("Cache-Status") != "haybale; fwd=miss" {
+			t.Errorf("upstream %d claiming 503 = %d %q, want the upstream's answer relayed", status, resp.StatusCode, resp.Header.Get("Cache-Status"))
+		}
+	}
+	seed(t, "widgets-503")
+	resp := get(t, cached.URL, "widgets-503", answer{status: http.StatusServiceUnavailable, claim: "200"})
+	if got := resp.Header.Get("Cache-Status"); resp.StatusCode != http.StatusOK || got != "haybale; hit; fwd=stale; fwd-status=503" {
+		t.Errorf("upstream 503 claiming 200 = %d %q, want it served stale", resp.StatusCode, got)
+	}
+	for _, a := range []answer{{status: http.StatusOK, claim: "503"}, {status: http.StatusServiceUnavailable, claim: "401"}} {
+		if resp := get(t, passthrough.URL, "widgets", a); resp.StatusCode != a.status {
+			t.Errorf("passthrough upstream %d = %d, want it relayed", a.status, resp.StatusCode)
+		}
 	}
 }

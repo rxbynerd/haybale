@@ -17,8 +17,9 @@ import (
 
 // UpstreamStatusHeader is set by a Fetcher on a response it rewrote, to
 // the status upstream actually sent: an upstream 401 or 403 arrives as a
-// 502 carrying "Haybale-Upstream-Status: 401". The cache classifies the
-// response by that status and never relays the header.
+// 502 carrying "Haybale-Upstream-Status: 401". A Fetcher removes any copy
+// upstream sent. The cache honours the header only in that form and never
+// relays it.
 const UpstreamStatusHeader = "Haybale-Upstream-Status"
 
 // Reasons a request was eligible for stale service, recorded on the
@@ -118,18 +119,24 @@ func connectFailure(err error) bool {
 	return errors.As(err, &timeout) && timeout.Timeout() && timeout.Error() == tlsHandshakeTimeoutText
 }
 
-// upstreamStatus returns the status upstream sent for resp, honouring
-// UpstreamStatusHeader, and removes that header so it is never relayed.
+// upstreamStatus returns the status upstream sent for resp and removes
+// UpstreamStatusHeader so it is never relayed. The header is honoured
+// only on a 502 and only for 401 or 403, the Fetcher's credential
+// rewrite; in any other combination the response status stands.
 func upstreamStatus(resp *http.Response) int {
 	raw := resp.Header.Get(UpstreamStatusHeader)
 	resp.Header.Del(UpstreamStatusHeader)
-	if raw == "" {
+	if resp.StatusCode != http.StatusBadGateway {
 		return resp.StatusCode
 	}
-	if n, err := strconv.Atoi(raw); err == nil {
-		return n
+	switch raw {
+	case strconv.Itoa(http.StatusUnauthorized):
+		return http.StatusUnauthorized
+	case strconv.Itoa(http.StatusForbidden):
+		return http.StatusForbidden
+	default:
+		return resp.StatusCode
 	}
-	return resp.StatusCode
 }
 
 // staleService describes a fill answered from a stale entry.

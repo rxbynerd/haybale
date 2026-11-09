@@ -636,9 +636,11 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 }
 
 // modifyResponse implements httputil.ReverseProxy.ModifyResponse by
-// applying sanitizeUpstreamResponse and logging the security event when
-// the upstream rejected the injected credential.
+// removing any upstream copy of cache.UpstreamStatusHeader, applying
+// sanitizeUpstreamResponse and logging the security event when the
+// upstream rejected the injected credential.
 func (p *Proxy) modifyResponse(resp *http.Response) error {
+	resp.Header.Del(cache.UpstreamStatusHeader)
 	upstreamStatus, sanitized := sanitizeUpstreamResponse(resp)
 	if !sanitized {
 		return nil
@@ -673,7 +675,8 @@ type cacheFetcher struct {
 // error; the cache then answers the request stale or releases it to the
 // passthrough path, which answers 502 and logs upstream_auth_failed. An
 // upstream 401 or 403 is returned as the sanitised 502 carrying
-// cache.UpstreamStatusHeader with the status upstream sent.
+// cache.UpstreamStatusHeader with the status upstream sent; an upstream
+// copy of that header is removed from every response.
 func (f *cacheFetcher) Fetch(ctx context.Context, req cache.Request) (*http.Response, error) {
 	source, ok := f.proxy.credentialSources[f.repo.Host]
 	if !ok || source == nil {
@@ -717,6 +720,7 @@ func (f *cacheFetcher) Fetch(ctx context.Context, req cache.Request) (*http.Resp
 	if err != nil {
 		return nil, err
 	}
+	resp.Header.Del(cache.UpstreamStatusHeader)
 	if upstreamStatus, sanitized := sanitizeUpstreamResponse(resp); sanitized {
 		f.proxy.logUpstreamRejected(f.repo, gitproto.Read, upstreamStatus)
 		resp.Header.Set(cache.UpstreamStatusHeader, strconv.Itoa(upstreamStatus))

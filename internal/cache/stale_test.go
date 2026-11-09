@@ -202,6 +202,44 @@ func TestUpstreamStatusHonoursTheSanitisedStatusAndStripsIt(t *testing.T) {
 	}
 }
 
+// TestUpstreamStatusHonoursOnlyTheCredentialRewrite: the header counts
+// only on a 502 and only for 401 or 403; in any other combination the
+// response's own status stands, and a 5xx claiming 200 is not a gate
+// success.
+func TestUpstreamStatusHonoursOnlyTheCredentialRewrite(t *testing.T) {
+	cases := []struct {
+		status int
+		header string
+		want   int
+	}{
+		{502, "401", 401},
+		{502, "403", 403},
+		{502, "503", 502},
+		{502, "200", 502},
+		{502, "404", 502},
+		{503, "200", 503},
+		{503, "401", 503},
+		{429, "503", 429},
+		{404, "503", 404},
+		{200, "503", 200},
+	}
+	for _, tc := range cases {
+		resp := response(tc.status, "text/plain", nil)
+		resp.Header.Set(UpstreamStatusHeader, tc.header)
+		if got := upstreamStatus(resp); got != tc.want {
+			t.Errorf("upstreamStatus(%d with %s) = %d, want %d", tc.status, tc.header, got, tc.want)
+		}
+		if v := resp.Header.Get(UpstreamStatusHeader); v != "" {
+			t.Errorf("upstreamStatus(%d with %s) left the header %q", tc.status, tc.header, v)
+		}
+	}
+	resp := response(http.StatusServiceUnavailable, "text/plain", nil)
+	resp.Header.Set(UpstreamStatusHeader, "200")
+	if res := classifyStatus(upstreamStatus(resp)); !res.eligible || res.signal != gateNeutral {
+		t.Errorf("503 claiming 200 = %+v, want eligible and neutral for the gate", res)
+	}
+}
+
 // staleHarness is a cache with stale-if-error enabled, metrics and a log
 // capture, whose clone fetch entry is already stored.
 type staleHarness struct {
@@ -292,6 +330,11 @@ func TestStaleServiceByFailure(t *testing.T) {
 		{name: "429", fetch: &failing{status: 429}, wantCode: 429},
 		{name: "422", fetch: &failing{status: 422}, wantCode: 422},
 		{name: "opaque error", fetch: &failing{err: errors.New("proxy: credential source: unexpected status 403")}},
+		{name: "429 claiming 503", fetch: &failing{status: 429, header: http.Header{UpstreamStatusHeader: {"503"}}}, wantCode: 429},
+		{name: "404 claiming 503", fetch: &failing{status: 404, header: http.Header{UpstreamStatusHeader: {"503"}}}, wantCode: 404},
+		{name: "502 claiming 503", fetch: &failing{status: 502, header: http.Header{UpstreamStatusHeader: {"503"}}}, wantStale: true, wantStatus: "haybale; hit; fwd=stale; fwd-status=502", wantReason: staleReasonUpstreamStatus},
+		{name: "502 claiming 200", fetch: &failing{status: 502, header: http.Header{UpstreamStatusHeader: {"200"}}}, wantStale: true, wantStatus: "haybale; hit; fwd=stale; fwd-status=502", wantReason: staleReasonUpstreamStatus},
+		{name: "503 claiming 200", fetch: &failing{status: 503, header: http.Header{UpstreamStatusHeader: {"200"}}}, wantStale: true, wantStatus: "haybale; hit; fwd=stale; fwd-status=503", wantReason: staleReasonUpstreamStatus},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -344,6 +387,9 @@ func TestStaleServiceByFailure(t *testing.T) {
 				}
 				if v := rec.Header().Get(UpstreamStatusHeader); v != "" {
 					t.Errorf("relayed %s = %q, want it stripped", UpstreamStatusHeader, v)
+				}
+				if got := rec.Header().Get("Cache-Status"); got != "haybale; fwd=miss" {
+					t.Errorf("Cache-Status = %q, want the shared response form", got)
 				}
 				if len(events) != 0 {
 					t.Errorf("cache_stale_served events = %d, want none", len(events))
