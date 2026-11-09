@@ -32,7 +32,7 @@ func TestEntryKeyKnownAnswer(t *testing.T) {
 	if hex.EncodeToString(want) != known {
 		t.Fatalf("reference derivation = %x, want the pinned value %s", want, known)
 	}
-	got := deriveEntryKey(kr.sealing[kr.ActiveID()], salt)
+	got := deriveEntryKey(kr.sealing[kr.activeID()], salt)
 	if hex.EncodeToString(got[:]) != known {
 		t.Fatalf("deriveEntryKey = %x, want %s", got, known)
 	}
@@ -53,7 +53,7 @@ func TestEntryKeysDifferPerSalt(t *testing.T) {
 	if bytes.Equal(a[headerFixedPrefix:], b[headerFixedPrefix:]) {
 		t.Fatal("two entries with the same body share ciphertext")
 	}
-	master := kr.sealing[kr.ActiveID()]
+	master := kr.sealing[kr.activeID()]
 	k1 := deriveEntryKey(master, a[saltAt:saltAt+saltLen])
 	k2 := deriveEntryKey(master, b[saltAt:saltAt+saltLen])
 	if k1 == k2 {
@@ -80,7 +80,7 @@ func TestSealedSaltIsAuthenticated(t *testing.T) {
 	}
 }
 
-// TestSealedSizeMatchesBytesWritten confirms SealedSize is exact for
+// TestSealedSizeMatchesBytesWritten confirms sealedSize is exact for
 // bodies written without Flush across segment boundaries, with the
 // 37-byte preamble.
 func TestSealedSizeMatchesBytesWritten(t *testing.T) {
@@ -88,10 +88,10 @@ func TestSealedSizeMatchesBytesWritten(t *testing.T) {
 		t.Fatalf("preambleLen = %d, want 37 (magic 4, version 2, key id 8, salt 16, nonce prefix 7)", preambleLen)
 	}
 	kr := testKeyring(t)
-	for _, n := range []int{0, 1, 100, SegmentSize - 1, SegmentSize, SegmentSize + 1, 3*SegmentSize + 17} {
+	for _, n := range []int{0, 1, 100, segmentSize - 1, segmentSize, segmentSize + 1, 3*segmentSize + 17} {
 		entry := sealBytes(t, kr, testHeader(), randomBody(t, n))
-		if got, want := int64(len(entry)), SealedSize(int64(n)); got != want {
-			t.Errorf("body %d: wrote %d sealed bytes, SealedSize = %d", n, got, want)
+		if got, want := int64(len(entry)), sealedSize(int64(n)); got != want {
+			t.Errorf("body %d: wrote %d sealed bytes, sealedSize = %d", n, got, want)
 		}
 	}
 }

@@ -12,15 +12,15 @@ import (
 // for a short cooldown.
 type uncacheableMarks struct {
 	mu    sync.Mutex
-	until map[Key]time.Time
+	until map[entryKey]time.Time
 }
 
 // mark records key as uncacheable until the given time.
-func (m *uncacheableMarks) mark(key Key, until time.Time) {
+func (m *uncacheableMarks) mark(key entryKey, until time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.until == nil {
-		m.until = make(map[Key]time.Time)
+		m.until = make(map[entryKey]time.Time)
 	}
 	if len(m.until) >= pruneThreshold {
 		for k, t := range m.until {
@@ -34,7 +34,7 @@ func (m *uncacheableMarks) mark(key Key, until time.Time) {
 
 // marked reports whether key is marked uncacheable at now, dropping an
 // expired mark.
-func (m *uncacheableMarks) marked(key Key, now time.Time) bool {
+func (m *uncacheableMarks) marked(key entryKey, now time.Time) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	until, ok := m.until[key]

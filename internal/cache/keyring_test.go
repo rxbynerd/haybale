@@ -29,11 +29,11 @@ func TestKeyringActiveIDIsSHA256Prefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(key)
-	if want := hex.EncodeToString(sum[:])[:8]; kr.ActiveID() != want {
-		t.Fatalf("ActiveID() = %q, want %q", kr.ActiveID(), want)
+	if want := hex.EncodeToString(sum[:])[:8]; kr.activeID() != want {
+		t.Fatalf("activeID() = %q, want %q", kr.activeID(), want)
 	}
-	if (Keyring{}).ActiveID() != "" {
-		t.Fatal("zero Keyring ActiveID() is not empty")
+	if (Keyring{}).activeID() != "" {
+		t.Fatal("zero Keyring activeID() is not empty")
 	}
 }
 
@@ -44,7 +44,7 @@ func TestKeyringCopiesKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	w, err := NewSealedWriter(&buf, kr, Header{})
+	w, err := newSealedWriter(&buf, kr, entryHeader{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestKeyringCopiesKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	key[0] ^= 0xff
-	if _, err := NewSealedReader(bytes.NewReader(buf.Bytes()), kr); err != nil {
+	if _, err := newSealedReader(bytes.NewReader(buf.Bytes()), kr); err != nil {
 		t.Fatalf("entry no longer opens after mutating the caller's key slice: %v", err)
 	}
 }
@@ -66,8 +66,8 @@ func TestEphemeralKeyringsDiffer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.ActiveID() == b.ActiveID() {
-		t.Fatalf("two ephemeral keyrings share id %q", a.ActiveID())
+	if a.activeID() == b.activeID() {
+		t.Fatalf("two ephemeral keyrings share id %q", a.activeID())
 	}
 }
 

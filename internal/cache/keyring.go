@@ -65,15 +65,15 @@ func EphemeralKeyring() (Keyring, error) {
 	return NewKeyring(key)
 }
 
-// ActiveID returns the id of the active key, or "" for the zero Keyring. A
+// activeID returns the id of the active key, or "" for the zero Keyring. A
 // key id is the first 8 hex characters of the SHA-256 of the cache key.
-func (k Keyring) ActiveID() string { return k.active }
+func (k Keyring) activeID() string { return k.active }
 
 // RepoHash returns RepoHash under the active cache key, so that every
 // component addressing entries derives the same repository hash from the
 // same configured key. baseURL must not be nil.
 func (k Keyring) RepoHash(baseURL *url.URL, repo gitproto.Repo) [32]byte {
-	return RepoHash(k.key, baseURL, repo)
+	return repoHash(k.key, baseURL, repo)
 }
 
 // holds reports whether the keyring has the key with id.

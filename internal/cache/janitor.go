@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io/fs"
 	"time"
+
+	"github.com/rxbynerd/haybale/internal/observability"
 )
 
 // scannedEntry is a committed entry file found by scan.
@@ -25,7 +27,7 @@ type scanResult struct {
 
 // scan lists the cache directory without holding the store lock. It never
 // follows symlinks: only real directories matching the layout are entered.
-func (s *DiskStore) scan() (scanResult, error) {
+func (s *diskStore) scan() (scanResult, error) {
 	var res scanResult
 	fsys := s.root.FS()
 	top, err := fs.ReadDir(fsys, ".")
@@ -100,15 +102,15 @@ func readDirIfExists(fsys fs.FS, name string) ([]fs.DirEntry, error) {
 	return entries, err
 }
 
-// RunJanitor sweeps the store immediately and then every interval until
+// runJanitor sweeps the store immediately and then every interval until
 // ctx ends. A sweep deletes committed entries older than retention,
 // temporary files that belong to no live spool, and least-recently-used
 // entries while usage exceeds the budget; it never deletes a live spool
 // or an entry that is open. It also reconciles the index with files
 // removed or added by another process, such as `haybale cache purge`.
-func (s *DiskStore) RunJanitor(ctx context.Context, interval, retention time.Duration) {
+func (s *diskStore) runJanitor(ctx context.Context, interval, retention time.Duration) {
 	if interval <= 0 || retention <= 0 {
-		s.logger.Error("cache: janitor not started: interval and retention must be positive",
+		s.logger.Error("janitor not started: interval and retention must be positive",
 			"interval", interval, "retention", retention)
 		return
 	}
@@ -132,7 +134,7 @@ type sweepStats struct {
 // sweep runs one janitor pass. The directory is listed without the lock;
 // every decision is then re-checked under it, so files committed, opened
 // or deleted during the listing are handled correctly.
-func (s *DiskStore) sweep(retention time.Duration) sweepStats {
+func (s *diskStore) sweep(retention time.Duration) sweepStats {
 	var stats sweepStats
 	s.mu.Lock()
 	if s.closed {
@@ -144,7 +146,7 @@ func (s *DiskStore) sweep(retention time.Duration) sweepStats {
 
 	res, err := s.scan()
 	if err != nil {
-		s.storeError("sweep", err)
+		s.storeError(observability.OperationSweep, err)
 		return stats
 	}
 
@@ -156,7 +158,7 @@ func (s *DiskStore) sweep(retention time.Duration) sweepStats {
 	defer s.reportLocked()
 
 	for _, name := range res.temps {
-		if _, live := s.spools[name]; !live && s.removeLocked(name, "sweep") {
+		if _, live := s.spools[name]; !live && s.removeLocked(name, observability.OperationSweep) {
 			stats.temps++
 		}
 	}
@@ -167,7 +169,7 @@ func (s *DiskStore) sweep(retention time.Duration) sweepStats {
 	for e := s.lru.Back(); e != nil; {
 		es := e.Value.(*entryState)
 		e = e.Prev()
-		if es.readers == 0 && es.modTime.Before(cutoff) && s.removeLocked(es.path, "expire") {
+		if es.readers == 0 && es.modTime.Before(cutoff) && s.removeLocked(es.path, observability.OperationExpire) {
 			s.dropLocked(es)
 			expired++
 		}
@@ -180,7 +182,7 @@ func (s *DiskStore) sweep(retention time.Duration) sweepStats {
 	if over := s.committed + s.inflight + s.pinned - s.budget; over > 0 {
 		before := len(s.entries)
 		if err := s.evictLocked(over); err != nil {
-			s.logger.Warn("cache: disk usage exceeds the budget and open entries cannot be evicted", "error", err)
+			s.logger.Warn("disk usage exceeds the budget and open entries cannot be evicted", "error", err)
 		}
 		stats.evicted = before - len(s.entries)
 	}
@@ -198,7 +200,7 @@ func (s *DiskStore) sweep(retention time.Duration) sweepStats {
 // index entries whose files are gone. Each discrepancy is confirmed with
 // an Lstat under the lock, and entries indexed after the listing started
 // (seq above startSeq) are left alone.
-func (s *DiskStore) reconcileLocked(res scanResult, startSeq uint64) {
+func (s *diskStore) reconcileLocked(res scanResult, startSeq uint64) {
 	seen := make(map[string]struct{}, len(res.entries))
 	for _, e := range res.entries {
 		seen[e.path] = struct{}{}

@@ -9,6 +9,8 @@ import (
 	"path"
 	"sync"
 	"sync/atomic"
+
+	"github.com/rxbynerd/haybale/internal/observability"
 )
 
 var (
@@ -27,13 +29,13 @@ const (
 	spoolFailed
 )
 
-// Spool is an entry being written: a temporary file in the cache
+// spool is an entry being written: a temporary file in the cache
 // directory that readers can follow while it grows. It has a single
 // writer; Write, Reserve, Commit and Discard must not be called
 // concurrently with each other. Abort, Fail and NewReader may be called
 // from any goroutine.
-type Spool struct {
-	store *DiskStore
+type spool struct {
+	store *diskStore
 	path  string
 	temp  string
 	f     *os.File
@@ -54,8 +56,8 @@ type Spool struct {
 
 // Create starts a spool for the entry at path with reserve bytes reserved
 // against the budget, evicting unopened least-recently-used entries to make
-// room. It returns ErrBudget when the reservation cannot fit.
-func (s *DiskStore) Create(path string, reserve int64) (*Spool, error) {
+// room. It returns errBudget when the reservation cannot fit.
+func (s *diskStore) Create(path string, reserve int64) (*spool, error) {
 	if !validEntryPath(path) {
 		return nil, fmt.Errorf("%w %q", errInvalidPath, path)
 	}
@@ -76,10 +78,10 @@ func (s *DiskStore) Create(path string, reserve int64) (*Spool, error) {
 	if err != nil {
 		s.inflight -= reserve
 		s.reportLocked()
-		s.storeError("create", err)
+		s.storeError(observability.OperationCreate, err)
 		return nil, err
 	}
-	sp := &Spool{store: s, path: path, temp: temp, f: f}
+	sp := &spool{store: s, path: path, temp: temp, f: f}
 	sp.cond = sync.NewCond(&sp.mu)
 	sp.reserved.Store(reserve)
 	s.spools[temp] = sp
@@ -89,7 +91,7 @@ func (s *DiskStore) Create(path string, reserve int64) (*Spool, error) {
 
 // Write appends sealed bytes and wakes readers. Writing past the
 // reservation fails; call Reserve first.
-func (sp *Spool) Write(p []byte) (int, error) {
+func (sp *spool) Write(p []byte) (int, error) {
 	sp.mu.Lock()
 	state, written, err := sp.state, sp.written, sp.err
 	sp.mu.Unlock()
@@ -110,14 +112,14 @@ func (sp *Spool) Write(p []byte) (int, error) {
 	}
 	sp.mu.Unlock()
 	if err != nil {
-		sp.store.storeError("write", err)
+		sp.store.storeError(observability.OperationWrite, err)
 	}
 	return n, err
 }
 
 // Reserve grows the reservation by additional bytes, with the same
-// eviction and ErrBudget behaviour as Create.
-func (sp *Spool) Reserve(additional int64) error {
+// eviction and errBudget behaviour as Create.
+func (sp *spool) Reserve(additional int64) error {
 	if additional < 0 {
 		return fmt.Errorf("cache: reservation must not be negative, got %d", additional)
 	}
@@ -137,7 +139,7 @@ func (sp *Spool) Reserve(additional int64) error {
 
 // NewReader returns a reader over the bytes written so far that blocks for
 // more until the spool is committed, aborted or failed.
-func (sp *Spool) NewReader() (*SpoolReader, error) {
+func (sp *spool) NewReader() (*spoolReader, error) {
 	s := sp.store
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -146,18 +148,18 @@ func (sp *Spool) NewReader() (*SpoolReader, error) {
 	}
 	f, err := s.root.Open(sp.temp)
 	if err != nil {
-		s.storeError("open", err)
+		s.storeError(observability.OperationOpen, err)
 		return nil, err
 	}
 	sp.readers++
-	return &SpoolReader{sp: sp, f: f}, nil
+	return &spoolReader{sp: sp, f: f}, nil
 }
 
 // Commit syncs the spool and renames it to its entry path, replacing any
 // entry already there. The reservation becomes committed bytes and
 // existing readers keep reading to EOF. On failure the spool is failed
 // with the returned error.
-func (sp *Spool) Commit() error {
+func (sp *spool) Commit() error {
 	if err := sp.openErr(); err != nil {
 		return err
 	}
@@ -182,7 +184,7 @@ func (sp *Spool) Commit() error {
 	}
 	now := s.now()
 	if err := s.root.Chtimes(sp.path, now, now); err != nil {
-		s.logger.Warn("cache: set entry modification time", "error", err)
+		s.logger.Warn("set entry modification time", "error", err)
 	}
 
 	sp.mu.Lock()
@@ -205,14 +207,14 @@ func (sp *Spool) Commit() error {
 }
 
 // Abort discards the spool and releases its reservation. Readers receive
-// ErrSpoolAborted. Aborting a finished spool does nothing.
-func (sp *Spool) Abort() { sp.Fail(ErrSpoolAborted) }
+// errSpoolAborted. Aborting a finished spool does nothing.
+func (sp *spool) Abort() { sp.Fail(errSpoolAborted) }
 
 // Fail discards the spool like Abort, and readers receive err (or
-// ErrSpoolAborted when err is nil).
-func (sp *Spool) Fail(err error) {
+// errSpoolAborted when err is nil).
+func (sp *spool) Fail(err error) {
 	if err == nil {
-		err = ErrSpoolAborted
+		err = errSpoolAborted
 	}
 	s := sp.store
 	s.mu.Lock()
@@ -220,14 +222,14 @@ func (sp *Spool) Fail(err error) {
 	s.failLocked(sp, err)
 }
 
-func (sp *Spool) failCommit(err error) error {
+func (sp *spool) failCommit(err error) error {
 	sp.store.mu.Lock()
 	defer sp.store.mu.Unlock()
 	return sp.failCommitLocked(err)
 }
 
-func (sp *Spool) failCommitLocked(err error) error {
-	sp.store.storeError("commit", err)
+func (sp *spool) failCommitLocked(err error) error {
+	sp.store.storeError(observability.OperationCommit, err)
 	sp.store.failLocked(sp, err)
 	return err
 }
@@ -237,7 +239,7 @@ func (sp *Spool) failCommitLocked(err error) error {
 // reservation released. Call it after the last Write. The written bytes
 // stay pinned until its readers close. Discarding a finished spool does
 // nothing.
-func (sp *Spool) Discard() {
+func (sp *spool) Discard() {
 	s := sp.store
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -245,13 +247,13 @@ func (sp *Spool) Discard() {
 }
 
 // failLocked moves an open spool to the failed state; see endLocked.
-func (s *DiskStore) failLocked(sp *Spool, err error) { s.endLocked(sp, spoolFailed, err) }
+func (s *diskStore) failLocked(sp *spool, err error) { s.endLocked(sp, spoolFailed, err) }
 
 // endLocked moves an open spool to state, which is spoolDiscarded or
 // spoolFailed, removes its file and releases its reservation. err is what
 // later spool operations return. Bytes already written stay pinned until
 // its readers close.
-func (s *DiskStore) endLocked(sp *Spool, state spoolState, err error) {
+func (s *diskStore) endLocked(sp *spool, state spoolState, err error) {
 	sp.mu.Lock()
 	if sp.state != spoolOpen {
 		sp.mu.Unlock()
@@ -264,7 +266,7 @@ func (s *DiskStore) endLocked(sp *Spool, state spoolState, err error) {
 	sp.mu.Unlock()
 
 	_ = sp.f.Close()
-	s.removeLocked(sp.temp, "abort")
+	s.removeLocked(sp.temp, observability.OperationAbort)
 	s.inflight -= sp.reserved.Load()
 	delete(s.spools, sp.temp)
 	if sp.readers > 0 {
@@ -276,7 +278,7 @@ func (s *DiskStore) endLocked(sp *Spool, state spoolState, err error) {
 
 // openErr returns nil while the spool is open, and otherwise the error an
 // operation that needs an open spool reports.
-func (sp *Spool) openErr() error {
+func (sp *spool) openErr() error {
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
 	switch sp.state {
@@ -288,11 +290,11 @@ func (sp *Spool) openErr() error {
 	return nil
 }
 
-// SpoolReader reads a spool from the start through its own descriptor,
+// spoolReader reads a spool from the start through its own descriptor,
 // waiting for bytes that have not been written yet. It is not safe for
 // concurrent use, except that Close may be called to stop a blocked Read.
-type SpoolReader struct {
-	sp     *Spool
+type spoolReader struct {
+	sp     *spool
 	f      *os.File
 	off    int64
 	closed bool // guarded by sp.mu
@@ -301,7 +303,7 @@ type SpoolReader struct {
 // Read returns written bytes, blocking until more are written. After the
 // spool is committed or discarded it returns io.EOF once every byte has
 // been read; after Abort or Fail it returns the failure error immediately.
-func (r *SpoolReader) Read(p []byte) (int, error) {
+func (r *spoolReader) Read(p []byte) (int, error) {
 	sp := r.sp
 	sp.mu.Lock()
 	var avail int64
@@ -347,7 +349,7 @@ func (r *SpoolReader) Read(p []byte) (int, error) {
 
 // Close closes the reader and wakes a blocked Read. Calling Close again
 // returns nil.
-func (r *SpoolReader) Close() error {
+func (r *spoolReader) Close() error {
 	sp := r.sp
 	s := sp.store
 	s.mu.Lock()

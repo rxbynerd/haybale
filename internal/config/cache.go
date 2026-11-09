@@ -175,12 +175,12 @@ type CacheConfig struct {
 	// ExposeStatus makes haybale emit a Cache-Status response header.
 	// Defaults to false.
 	ExposeStatus bool `yaml:"exposeStatus"`
-	// Remote configures a shared remote tier. It is reserved for a later
-	// release: any non-zero value fails validate.
+	// Remote configures a shared remote tier. Any non-zero value fails
+	// validate.
 	Remote RemoteCacheConfig `yaml:"remote"`
 	// StaleIfErrorFor is a Go duration string: the maximum age of an
-	// entry served when upstream cannot answer. It is reserved for a
-	// later release: only empty or "0s" is accepted.
+	// entry served when upstream cannot answer. Only a zero duration is
+	// accepted.
 	StaleIfErrorFor string `yaml:"staleIfErrorFor"`
 
 	// The parsed* fields cache the durations validate parsed, for the
@@ -193,8 +193,8 @@ type CacheConfig struct {
 }
 
 // RemoteCacheConfig configures the optional shared remote cache tier,
-// an object-storage bucket. It is reserved for a later release and is
-// rejected by CacheConfig.validate when any field is set.
+// an object-storage bucket. CacheConfig.validate rejects it when any
+// field is set.
 type RemoteCacheConfig struct {
 	// Type selects the remote implementation, e.g. "s3".
 	Type string `yaml:"type"`
@@ -282,7 +282,7 @@ func (c *CacheConfig) applyDefaults() {
 
 // validate fail-fasts on an enabled block that is structurally unusable:
 // a missing dir, a duration that does not parse or is negative, sizes or
-// limits out of range, or a field reserved for a later release. It does
+// limits out of range, or a remote or stale-if-error setting. It does
 // no filesystem, network or environment access, so `haybale policy check`
 // stays offline; the directory and key are checked when the cache is
 // built. A disabled block is always valid. An empty duration is accepted
@@ -340,12 +340,31 @@ func (c *CacheConfig) validate() error {
 	}
 
 	if c.Remote != (RemoteCacheConfig{}) {
-		return fmt.Errorf("cache: cache.remote is not supported in this release; remove the remote block")
+		return fmt.Errorf("cache: remote is not supported in this release; remove the remote block")
 	}
-	if c.StaleIfErrorFor != "" && c.StaleIfErrorFor != "0s" {
-		return fmt.Errorf("cache: cache.staleIfErrorFor is not supported in this release (got %q); leave it empty or \"0s\"", c.StaleIfErrorFor)
+	if c.StaleIfErrorFor != "" {
+		d, err := time.ParseDuration(c.StaleIfErrorFor)
+		if err != nil || d != 0 {
+			return fmt.Errorf("cache: staleIfErrorFor is not supported in this release (got %q); leave it empty or \"0s\"", c.StaleIfErrorFor)
+		}
 	}
 	return nil
+}
+
+// LoadKeyring builds the Keyring from the environment variable named by
+// KeyEnv, which must hold a base64-encoded 32-byte key. Errors name the
+// variable and never include its value. KeyEnv must be set; BuildCache
+// generates an ephemeral key itself when it is not.
+func (c CacheConfig) LoadKeyring() (cache.Keyring, error) {
+	raw, ok := os.LookupEnv(c.KeyEnv)
+	if !ok || raw == "" {
+		return cache.Keyring{}, fmt.Errorf("cache: environment variable %q (keyEnv) is unset or empty", c.KeyEnv)
+	}
+	key, err := cache.Decode32(raw)
+	if err != nil {
+		return cache.Keyring{}, fmt.Errorf("cache: environment variable %q (keyEnv): %w", c.KeyEnv, err)
+	}
+	return cache.NewKeyring(key)
 }
 
 // validateCacheKeys rejects unknown keys in the cache block of a parsed
@@ -418,17 +437,8 @@ func (c CacheConfig) BuildCache(logger *slog.Logger, metrics *observability.Metr
 	}
 	var keyring cache.Keyring
 	if c.KeyEnv != "" {
-		raw, ok := os.LookupEnv(c.KeyEnv)
-		if !ok || raw == "" {
-			return nil, fmt.Errorf("cache: environment variable %q (keyEnv) is unset or empty", c.KeyEnv)
-		}
-		key, err := cache.Decode32(raw)
-		if err != nil {
-			// Decode32's errors never include the value.
-			return nil, fmt.Errorf("cache: environment variable %q (keyEnv): %w", c.KeyEnv, err)
-		}
-		keyring, err = cache.NewKeyring(key)
-		if err != nil {
+		var err error
+		if keyring, err = c.LoadKeyring(); err != nil {
 			return nil, err
 		}
 	} else {
@@ -437,7 +447,7 @@ func (c CacheConfig) BuildCache(logger *slog.Logger, metrics *observability.Metr
 		if err != nil {
 			return nil, err
 		}
-		logger.Info("cache: keyEnv is not set; entries are sealed under an ephemeral key and the cache will not survive a restart")
+		logger.Info("keyEnv is not set; entries are sealed under an ephemeral key and the cache will not survive a restart")
 	}
 	return cache.New(cache.Options{
 		Dir:                   c.Dir,

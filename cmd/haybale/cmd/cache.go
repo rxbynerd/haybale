@@ -1,11 +1,9 @@
 package cmd
 
 import (
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
 
 	"github.com/spf13/cobra"
 
@@ -57,9 +55,9 @@ func runCachePurge(cmd *cobra.Command, cfgPath, repoArg, groupArg string, remote
 	if remote {
 		return errors.New("--remote: purging the remote cache tier is not supported in this release")
 	}
-	groups, err := parseCachePurgeGroups(groupArg)
+	groups, err := cache.ParseGroups(groupArg)
 	if err != nil {
-		return err
+		return fmt.Errorf("--group: %w", err)
 	}
 	repo, err := parsePolicyCheckRepo(repoArg)
 	if err != nil {
@@ -80,13 +78,9 @@ func runCachePurge(cmd *cobra.Command, cfgPath, repoArg, groupArg string, remote
 		return errors.New("cache.keyEnv is not set: entries sealed under an ephemeral key cannot be addressed " +
 			"by the purge command, and a local-only cache without keyEnv is cleared when the server restarts instead")
 	}
-	raw := os.Getenv(cc.KeyEnv)
-	if raw == "" {
-		return fmt.Errorf("environment variable %s (cache.keyEnv) is not set", cc.KeyEnv)
-	}
-	key, err := cache.Decode32(raw)
+	keyring, err := cc.LoadKeyring()
 	if err != nil {
-		return fmt.Errorf("environment variable %s (cache.keyEnv): %w", cc.KeyEnv, err)
+		return err
 	}
 
 	baseURL := upstreamBaseURL(cfg, repo.Host)
@@ -94,21 +88,28 @@ func runCachePurge(cmd *cobra.Command, cfgPath, repoArg, groupArg string, remote
 		return fmt.Errorf("--repo %q: host %q is not a configured upstream", repoArg, repo.Host)
 	}
 
-	// The server hashes the same raw key bytes and the same parsed base URL.
-	sum := cache.RepoHash(key, baseURL, repo)
-	repoHash := hex.EncodeToString(sum[:])
+	// The server hashes the same key and the same parsed base URL.
+	repoHash := keyring.RepoHash(baseURL, repo)
 
 	purged := 0
 	for _, group := range groups {
-		n, err := cache.PurgeDiskPrefix(cc.Dir, "v1/"+string(group)+"/"+repoHash+"/")
+		n, err := cache.PurgeDiskPrefix(cc.Dir, cache.RepoPrefix(group, repoHash))
 		purged += n
 		if err != nil {
-			return fmt.Errorf("purge %s entries (%d purged so far): %w", group, purged, err)
+			return fmt.Errorf("purge %s entries (%s purged so far): %w", group, pluralEntries(purged), err)
 		}
 	}
 
-	_, err = fmt.Fprintf(cmd.OutOrStdout(), "purged %d entries\n", purged)
+	_, err = fmt.Fprintf(cmd.OutOrStdout(), "purged %s\n", pluralEntries(purged))
 	return err
+}
+
+// pluralEntries renders a count of cache entries with the right number.
+func pluralEntries(n int) string {
+	if n == 1 {
+		return "1 entry"
+	}
+	return fmt.Sprintf("%d entries", n)
 }
 
 // upstreamBaseURL returns the parsed base URL of the upstream configured
@@ -120,19 +121,4 @@ func upstreamBaseURL(cfg *config.Config, host string) *url.URL {
 		}
 	}
 	return nil
-}
-
-// parseCachePurgeGroups maps --group to the entry groups to purge; empty
-// selects both.
-func parseCachePurgeGroups(raw string) ([]cache.Group, error) {
-	switch raw {
-	case "":
-		return []cache.Group{cache.GroupRefs, cache.GroupPack}, nil
-	case string(cache.GroupRefs):
-		return []cache.Group{cache.GroupRefs}, nil
-	case string(cache.GroupPack):
-		return []cache.Group{cache.GroupPack}, nil
-	default:
-		return nil, fmt.Errorf(`--group %q must be "refs" or "pack"`, raw)
-	}
 }

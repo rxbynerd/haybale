@@ -15,28 +15,28 @@ import (
 	"github.com/rxbynerd/haybale/internal/gitproto"
 )
 
-// Bypass reasons. Classify reports exactly one of these when it bypasses
+// Bypass reasons. classify reports exactly one of these when it bypasses
 // a request.
 const (
-	BypassTooLarge            = "too_large"
-	BypassContentEncoding     = "content_encoding"
-	BypassDecodeError         = "decode_error"
-	BypassFraming             = "framing"
-	BypassTrailingBytes       = "trailing_bytes" //nolint:gosec // G101: a bypass reason, not a credential
-	BypassMultipleCommands    = "multiple_commands"
-	BypassDuplicateCapability = "duplicate_capability"
-	BypassUnknownCapability   = "unknown_capability"
-	BypassUnknownArgument     = "unknown_argument"
-	BypassHasHave             = "has_have"
-	BypassMissingDone         = "missing_done"
-	BypassNoWant              = "no_want"
-	BypassMissingProtocol     = "missing_protocol"
-	BypassDuplicateProtocol   = "duplicate_protocol"
-	BypassBadProtocol         = "bad_protocol"
-	BypassBadFilter           = "bad_filter"
-	BypassBadSideband         = "bad_sideband"
-	BypassUnknownCommand      = "unknown_command"
-	BypassNotAReadShape       = "not_a_read_shape"
+	bypassTooLarge            = "too_large"
+	bypassContentEncoding     = "content_encoding"
+	bypassDecodeError         = "decode_error"
+	bypassFraming             = "framing"
+	bypassTrailingBytes       = "trailing_bytes" //nolint:gosec // G101: a bypass reason, not a credential
+	bypassMultipleCommands    = "multiple_commands"
+	bypassDuplicateCapability = "duplicate_capability"
+	bypassUnknownCapability   = "unknown_capability"
+	bypassUnknownArgument     = "unknown_argument"
+	bypassHasHave             = "has_have"
+	bypassMissingDone         = "missing_done"
+	bypassNoWant              = "no_want"
+	bypassMissingProtocol     = "missing_protocol"
+	bypassDuplicateProtocol   = "duplicate_protocol"
+	bypassBadProtocol         = "bad_protocol"
+	bypassBadFilter           = "bad_filter"
+	bypassBadSideband         = "bad_sideband"
+	bypassUnknownCommand      = "unknown_command"
+	bypassNotAReadShape       = "not_a_read_shape"
 )
 
 const (
@@ -51,7 +51,7 @@ const (
 	maxProtocolLength = 256
 )
 
-// Classify decides whether r, a read of repo, is cacheable. It must only
+// classify decides whether r, a read of repo, is cacheable. It must only
 // be called after authentication and policy have allowed the request,
 // because it reads the request body.
 //
@@ -66,7 +66,7 @@ const (
 // caller can pass the request through as received. err is non-nil only
 // for a misuse (a write request, a repo that does not match r, a
 // non-positive maxBody) or a failure reading the body from the client.
-func Classify(r *http.Request, repo gitproto.Repo, maxBody int64) (req Request, bypass bool, reason string, err error) {
+func classify(r *http.Request, repo gitproto.Repo, maxBody int64) (req Request, bypass bool, reason string, err error) {
 	if maxBody <= 0 {
 		return Request{}, false, "", errors.New("cache: classify: maxBody must be positive")
 	}
@@ -97,11 +97,11 @@ func bypassed(reason string) (Request, bool, string, error) {
 
 func classifyAdvertisement(r *http.Request, repo gitproto.Repo, protocol string) (Request, bool, string, error) {
 	if r.URL.RawQuery != "service=git-upload-pack" || r.ContentLength != 0 {
-		return bypassed(BypassNotAReadShape)
+		return bypassed(bypassNotAReadShape)
 	}
 	req := Request{
 		Repo:     repo,
-		Class:    ClassAdvertisement,
+		Class:    classAdvertisement,
 		Protocol: protocol,
 		Method:   http.MethodGet,
 		Endpoint: endpointAdvertisement,
@@ -113,14 +113,14 @@ func classifyAdvertisement(r *http.Request, repo gitproto.Repo, protocol string)
 
 func classifyUploadPack(r *http.Request, repo gitproto.Repo, protocol string, version int, maxBody int64) (Request, bool, string, error) {
 	if r.URL.RawQuery != "" {
-		return bypassed(BypassNotAReadShape)
+		return bypassed(bypassNotAReadShape)
 	}
 	if ct := r.Header.Values("Content-Type"); len(ct) != 1 || ct[0] != contentTypeRequest {
-		return bypassed(BypassNotAReadShape)
+		return bypassed(bypassNotAReadShape)
 	}
 	gzipped, ok := gzipEncoded(r.Header)
 	if !ok {
-		return bypassed(BypassContentEncoding)
+		return bypassed(bypassContentEncoding)
 	}
 	decoded, reason, err := readBody(r, gzipped, maxBody)
 	if err != nil {
@@ -135,9 +135,9 @@ func classifyUploadPack(r *http.Request, repo gitproto.Repo, protocol string, ve
 	}
 	switch {
 	case v2 && protocol == "":
-		return bypassed(BypassMissingProtocol)
+		return bypassed(bypassMissingProtocol)
 	case v2 != (version == 2):
-		return bypassed(BypassBadProtocol)
+		return bypassed(bypassBadProtocol)
 	}
 	req := Request{
 		Repo:        repo,
@@ -175,11 +175,11 @@ func parseProtocol(h http.Header) (value string, version int, reason string) {
 		return "", -1, ""
 	case 1:
 	default:
-		return "", 0, BypassDuplicateProtocol
+		return "", 0, bypassDuplicateProtocol
 	}
 	value = values[0]
 	if len(value) > maxProtocolLength {
-		return "", 0, BypassBadProtocol
+		return "", 0, bypassBadProtocol
 	}
 	params := strings.Split(value, ":")
 	switch params[0] {
@@ -190,13 +190,13 @@ func parseProtocol(h http.Header) (value string, version int, reason string) {
 	case "version=2":
 		version = 2
 	default:
-		return "", 0, BypassBadProtocol
+		return "", 0, bypassBadProtocol
 	}
 	seen := map[string]bool{"version": true}
 	for _, param := range params[1:] {
 		k, v, ok := strings.Cut(param, "=")
 		if !ok || !isToken(k) || !isToken(v) || seen[k] {
-			return "", 0, BypassBadProtocol
+			return "", 0, bypassBadProtocol
 		}
 		seen[k] = true
 	}
@@ -283,9 +283,9 @@ func readBody(r *http.Request, gzipped bool, maxBody int64) (decoded []byte, rea
 	case capture.err != nil:
 		return nil, "", fmt.Errorf("cache: reading request body: %w", capture.err)
 	case int64(capture.buf.Len()) > maxBody, int64(len(decoded)) > maxBody:
-		return nil, BypassTooLarge, nil
+		return nil, bypassTooLarge, nil
 	case decodeFailed:
-		return nil, BypassDecodeError, nil
+		return nil, bypassDecodeError, nil
 	}
 	return decoded, "", nil
 }

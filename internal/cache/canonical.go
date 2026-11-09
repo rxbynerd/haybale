@@ -39,7 +39,7 @@ func canonicalize(body []byte) (canonical []byte, class Class, v2 bool, reason s
 	case reason != "":
 		return nil, "", false, reason
 	case eof || first.Kind != pktline.Data:
-		return nil, "", false, BypassNotAReadShape
+		return nil, "", false, bypassNotAReadShape
 	}
 	text := chomp(first.Data)
 	switch {
@@ -47,9 +47,9 @@ func canonicalize(body []byte) (canonical []byte, class Class, v2 bool, reason s
 		class, reason = p.v2(first, strings.TrimPrefix(text, "command="))
 		v2 = true
 	case strings.HasPrefix(text, "want "):
-		class, reason = ClassFetch, p.v0(first)
+		class, reason = classFetch, p.v0(first)
 	default:
-		return nil, "", false, BypassNotAReadShape
+		return nil, "", false, bypassNotAReadShape
 	}
 	if reason != "" {
 		return nil, "", false, reason
@@ -70,9 +70,9 @@ func (p *bodyParser) next() (pkt pktline.Packet, eof bool, reason string) {
 	case errors.Is(err, io.EOF):
 		return pkt, true, ""
 	case err != nil:
-		return pkt, false, BypassFraming
+		return pkt, false, bypassFraming
 	case pkt.Kind == pktline.ResponseEnd, pkt.Kind == pktline.Data && len(pkt.Data) == 0:
-		return pkt, false, BypassFraming
+		return pkt, false, bypassFraming
 	}
 	return pkt, false, ""
 }
@@ -80,7 +80,7 @@ func (p *bodyParser) next() (pkt pktline.Packet, eof bool, reason string) {
 func (p *bodyParser) emit(pkt pktline.Packet) string {
 	out, err := pktline.AppendPacket(p.out, pkt)
 	if err != nil {
-		return BypassFraming
+		return bypassFraming
 	}
 	p.out = out
 	return ""
@@ -89,7 +89,7 @@ func (p *bodyParser) emit(pkt pktline.Packet) string {
 // end requires the body to end exactly here.
 func (p *bodyParser) end() string {
 	if _, eof, _ := p.next(); !eof {
-		return BypassTrailingBytes
+		return bypassTrailingBytes
 	}
 	return ""
 }
@@ -100,11 +100,11 @@ func (p *bodyParser) v2(first pktline.Packet, command string) (Class, string) {
 	var class Class
 	switch command {
 	case "ls-refs":
-		class = ClassLsRefs
+		class = classLsRefs
 	case "fetch":
-		class = ClassFetch
+		class = classFetch
 	default:
-		return "", BypassUnknownCommand
+		return "", bypassUnknownCommand
 	}
 	if reason := p.emit(first); reason != "" {
 		return "", reason
@@ -119,7 +119,7 @@ capabilities:
 		case reason != "":
 			return "", reason
 		case eof:
-			return "", BypassFraming
+			return "", bypassFraming
 		case pkt.Kind == pktline.Delim:
 			hasArgs = true
 			if reason := p.emit(pkt); reason != "" {
@@ -135,11 +135,11 @@ capabilities:
 		name, value, hasValue := strings.Cut(chomp(pkt.Data), "=")
 		switch {
 		case !hasValue:
-			return "", BypassUnknownCapability
+			return "", bypassUnknownCapability
 		case name == "command":
-			return "", BypassMultipleCommands
+			return "", bypassMultipleCommands
 		case seen[name]:
-			return "", BypassDuplicateCapability
+			return "", bypassDuplicateCapability
 		}
 		seen[name] = true
 		switch {
@@ -149,7 +149,7 @@ capabilities:
 				return "", reason
 			}
 		default:
-			return "", BypassUnknownCapability
+			return "", bypassUnknownCapability
 		}
 	}
 
@@ -160,7 +160,7 @@ capabilities:
 		case reason != "":
 			return "", reason
 		case eof, pkt.Kind == pktline.Delim:
-			return "", BypassFraming
+			return "", bypassFraming
 		}
 		if reason := p.emit(pkt); reason != "" {
 			return "", reason
@@ -169,7 +169,7 @@ capabilities:
 			break
 		}
 		line := chomp(pkt.Data)
-		if class == ClassLsRefs {
+		if class == classLsRefs {
 			reason = lsRefsArg(line)
 		} else {
 			reason = args.v2(line)
@@ -182,7 +182,7 @@ capabilities:
 	if reason := p.end(); reason != "" {
 		return "", reason
 	}
-	if class == ClassFetch {
+	if class == classFetch {
 		return class, args.complete()
 	}
 	return class, ""
@@ -207,7 +207,7 @@ func (p *bodyParser) v0(first pktline.Packet) string {
 		case reason != "":
 			return reason
 		case eof, pkt.Kind == pktline.Delim:
-			return BypassFraming
+			return bypassFraming
 		}
 		if reason := p.emit(pkt); reason != "" {
 			return reason
@@ -225,17 +225,17 @@ func (p *bodyParser) v0(first pktline.Packet) string {
 	case reason != "":
 		return reason
 	case eof:
-		return BypassMissingDone
+		return bypassMissingDone
 	case pkt.Kind != pktline.Data:
-		return BypassFraming
+		return bypassFraming
 	}
 	line := chomp(pkt.Data)
 	switch {
 	case line == "done":
 	case strings.HasPrefix(line, "have "):
-		return BypassHasHave
+		return bypassHasHave
 	default:
-		return BypassUnknownArgument
+		return bypassUnknownArgument
 	}
 	if reason := p.emit(pkt); reason != "" {
 		return reason
@@ -256,9 +256,9 @@ func v0FirstWant(data []byte) ([]byte, string) {
 	oid, caps, hasCaps := strings.Cut(strings.TrimPrefix(text, "want "), " ")
 	switch {
 	case !isOID(oid):
-		return nil, BypassUnknownArgument
+		return nil, bypassUnknownArgument
 	case !hasCaps:
-		return nil, BypassBadSideband
+		return nil, bypassBadSideband
 	}
 
 	seen := map[string]bool{}
@@ -267,7 +267,7 @@ func v0FirstWant(data []byte) ([]byte, string) {
 	for c := range strings.SplitSeq(caps, " ") {
 		name, value, hasValue := strings.Cut(c, "=")
 		if seen[name] {
-			return nil, BypassDuplicateCapability
+			return nil, bypassDuplicateCapability
 		}
 		seen[name] = true
 		switch {
@@ -278,11 +278,11 @@ func v0FirstWant(data []byte) ([]byte, string) {
 		case hasValue && name == "object-format" && validObjectFormat(value):
 			kept = append(kept, c)
 		default:
-			return nil, BypassUnknownCapability
+			return nil, bypassUnknownCapability
 		}
 	}
 	if !sideband {
-		return nil, BypassBadSideband
+		return nil, bypassBadSideband
 	}
 	return []byte("want " + oid + " " + strings.Join(kept, " ") + newline), ""
 }
@@ -313,15 +313,15 @@ func (a *fetchArgs) common(line string) string {
 	keyword, value, hasValue := strings.Cut(line, " ")
 	switch {
 	case keyword == "have":
-		return BypassHasHave
+		return bypassHasHave
 	case keyword == "filter":
 		a.filters++
 		if a.filters > 1 || !hasValue || !validFilter(value) {
-			return BypassBadFilter
+			return bypassBadFilter
 		}
 		return ""
 	case !hasValue:
-		return BypassUnknownArgument
+		return bypassUnknownArgument
 	}
 	switch {
 	case keyword == "want" && isOID(value):
@@ -330,7 +330,7 @@ func (a *fetchArgs) common(line string) string {
 	case keyword == "deepen" && isDecimal(value) && value[0] != '0':
 	case keyword == "deepen-since" && isDecimal(value):
 	default:
-		return BypassUnknownArgument
+		return bypassUnknownArgument
 	}
 	return ""
 }
@@ -339,9 +339,9 @@ func (a *fetchArgs) common(line string) string {
 func (a *fetchArgs) complete() string {
 	switch {
 	case a.wants == 0:
-		return BypassNoWant
+		return bypassNoWant
 	case !a.done:
-		return BypassMissingDone
+		return bypassMissingDone
 	}
 	return ""
 }
@@ -352,7 +352,7 @@ func lsRefsArg(line string) string {
 	case line == "symrefs", line == "peel", line == "unborn":
 	case strings.HasPrefix(line, "ref-prefix ") && len(line) > len("ref-prefix "):
 	default:
-		return BypassUnknownArgument
+		return bypassUnknownArgument
 	}
 	return ""
 }

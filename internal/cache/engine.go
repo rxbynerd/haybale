@@ -2,7 +2,6 @@ package cache
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -23,9 +22,6 @@ const (
 	// maxCreatedAtSkew is how far in the future an entry's creation time
 	// may lie before the entry is treated as corrupt.
 	maxCreatedAtSkew = 5 * time.Minute
-	// storeOperationOpen labels an entry that failed verification when it
-	// was opened or read.
-	storeOperationOpen = "open"
 )
 
 // errClientGone reports that the client stopped accepting the response.
@@ -33,7 +29,7 @@ var errClientGone = errors.New("cache: client stopped reading")
 
 // Options configures a Cache.
 type Options struct {
-	// Dir is the cache directory; see OpenDiskStore for its requirements.
+	// Dir is the cache directory; see openDiskStore for its requirements.
 	Dir string
 	// Keyring holds the key entries are sealed under and addressed by.
 	Keyring Keyring
@@ -45,7 +41,7 @@ type Options struct {
 	// reserve maxEntrySize; a request that finds no free slot bypasses
 	// the cache. Refs fills are bounded separately by a fixed cap.
 	MaxConcurrentFills int
-	// MaxRequestBody bounds the decoded request body Classify inspects.
+	// MaxRequestBody bounds the decoded request body classify inspects.
 	MaxRequestBody int64
 	// Retention is the maximum age of any entry.
 	Retention time.Duration
@@ -63,7 +59,7 @@ type Options struct {
 	IdleTimeout time.Duration
 	// ExposeStatus emits the Cache-Status response header.
 	ExposeStatus bool
-	// Remote is the remote tier. It must be nil in this release.
+	// Remote is the remote tier; New rejects a non-nil value.
 	Remote BlobStore
 	// Logger receives operational logs; nil discards them.
 	Logger *slog.Logger
@@ -78,7 +74,7 @@ type Options struct {
 // is safe for concurrent use.
 type Cache struct {
 	opts    Options
-	store   *DiskStore
+	store   *diskStore
 	keyring Keyring
 	logger  *slog.Logger
 	metrics *observability.Metrics
@@ -104,7 +100,7 @@ type Cache struct {
 	// mu orders fill attach, detach, start and teardown, so a request
 	// never joins a fill that is ending.
 	mu     sync.Mutex
-	fills  map[Key]*fill
+	fills  map[entryKey]*fill
 	closed bool
 }
 
@@ -126,7 +122,7 @@ func New(opts Options) (*Cache, error) {
 	if now == nil {
 		now = time.Now
 	}
-	store, err := OpenDiskStore(opts.Dir, opts.MaxDiskSize, logger, metrics, now)
+	store, err := openDiskStore(opts.Dir, opts.MaxDiskSize, logger, metrics, now)
 	if err != nil {
 		return nil, err
 	}
@@ -144,12 +140,12 @@ func New(opts Options) (*Cache, error) {
 		idleGrace:     fillIdleGrace,
 		flushInterval: sealFlushInterval,
 		access:        accessRecords{window: opts.AccessRecheck},
-		fills:         make(map[Key]*fill),
+		fills:         make(map[entryKey]*fill),
 	}
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		store.RunJanitor(ctx, janitorInterval, opts.Retention)
+		store.runJanitor(ctx, janitorInterval, opts.Retention)
 	}()
 	return c, nil
 }
@@ -158,7 +154,7 @@ func validateOptions(opts Options) error {
 	switch {
 	case opts.Dir == "":
 		return errors.New("cache: dir is required")
-	case opts.Keyring.ActiveID() == "":
+	case opts.Keyring.activeID() == "":
 		return errors.New("cache: keyring has no active key")
 	case opts.MaxDiskSize <= 0:
 		return fmt.Errorf("cache: max disk size must be positive, got %d", opts.MaxDiskSize)
@@ -189,16 +185,16 @@ func validateOptions(opts Options) error {
 // panic(http.ErrAbortHandler).
 func (c *Cache) Serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher) (Outcome, bool) {
 	host := repo.Host
-	req, bypass, reason, err := Classify(r, repo, c.opts.MaxRequestBody)
+	req, bypass, reason, err := classify(r, repo, c.opts.MaxRequestBody)
 	if err != nil {
 		c.logger.WarnContext(r.Context(), "cache: request could not be classified", "host", host, "error", err)
-		return c.declined(w, host, observability.ResultBypass, "classify_error"), false
+		return c.declined(w, host, observability.ClassBypass, "classify_error"), false
 	}
 	if bypass {
-		return c.declined(w, host, observability.ResultBypass, reason), false
+		return c.declined(w, host, observability.ClassBypass, reason), false
 	}
 	class := string(req.Class)
-	key := Key{Group: req.Class.Group(), RepoHash: c.keyring.RepoHash(baseURL, repo), KeyHash: req.KeyHash}
+	key := entryKey{Group: req.Class.Group(), RepoHash: c.keyring.RepoHash(baseURL, repo), KeyHash: req.KeyHash}
 	if c.marks.marked(key, c.now()) {
 		return c.declined(w, host, class, "uncacheable"), false
 	}
@@ -236,14 +232,14 @@ func (c *Cache) Serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo
 func (c *Cache) declined(w http.ResponseWriter, host, class, reason string) Outcome {
 	c.metrics.RecordResponseCacheLookup(context.Background(), host, class, observability.ResultBypass)
 	c.setCacheStatus(w.Header(), observability.ResultBypass, false)
-	c.logger.Debug("cache: bypass", "host", host, "class", class, "reason", reason)
+	c.logger.Debug("bypass", "host", host, "class", class, "reason", reason)
 	return Outcome{Result: observability.ResultBypass}
 }
 
 // lookupEntry opens the stored entry for key if it may be served: it
 // exists, is within retention, and satisfies the freshness rule of its
 // group. An expired entry is deleted. The caller closes the entry.
-func (c *Cache) lookupEntry(key Key) *Entry {
+func (c *Cache) lookupEntry(key entryKey) *storedEntry {
 	if key.Group == GroupRefs && c.opts.RefsMaxAge <= 0 {
 		return nil
 	}
@@ -269,9 +265,9 @@ func (c *Cache) lookupEntry(key Key) *Entry {
 // serveEntry streams a stored entry to the client. ok is false when the
 // entry failed verification before any byte was written; it has then been
 // deleted and the caller treats the request as a miss.
-func (c *Cache) serveEntry(w http.ResponseWriter, entry *Entry, key Key, host, class string) (Outcome, bool) {
+func (c *Cache) serveEntry(w http.ResponseWriter, entry *storedEntry, key entryKey, host, class string) (Outcome, bool) {
 	defer func() { _ = entry.Close() }()
-	sr, err := NewSealedReader(entry, c.keyring)
+	sr, err := newSealedReader(entry, c.keyring)
 	if err == nil && !headerMatches(sr.Header(), key, c.now()) {
 		err = fmt.Errorf("%w: header does not match the entry path", ErrIntegrity)
 	}
@@ -286,8 +282,8 @@ func (c *Cache) serveEntry(w http.ResponseWriter, entry *Entry, key Key, host, c
 		c.dropCorrupt(key, err)
 		return Outcome{}, false
 	case err != nil:
-		c.logger.Warn("cache: entry failed mid-stream; aborting the response", "host", host, "class", class, "error", err)
-		c.metrics.RecordResponseCacheStoreError(context.Background(), observability.TierDisk, storeOperationOpen)
+		c.logger.Warn("entry failed mid-stream; aborting the response", "host", host, "class", class, "error", err)
+		c.metrics.RecordResponseCacheStoreError(context.Background(), observability.TierDisk, observability.OperationOpen)
 		panic(http.ErrAbortHandler)
 	}
 	ctx := context.Background()
@@ -298,21 +294,21 @@ func (c *Cache) serveEntry(w http.ResponseWriter, entry *Entry, key Key, host, c
 
 // headerMatches reports whether a verified header belongs at key and
 // carries a plausible creation time.
-func headerMatches(h Header, key Key, now time.Time) bool {
+func headerMatches(h entryHeader, key entryKey, now time.Time) bool {
 	return h.Group == key.Group && h.RepoHash == key.RepoHash && h.KeyHash == key.KeyHash &&
 		!h.CreatedAt.After(now.Add(maxCreatedAtSkew))
 }
 
 // dropCorrupt deletes an entry that failed verification.
-func (c *Cache) dropCorrupt(key Key, err error) {
-	c.metrics.RecordResponseCacheStoreError(context.Background(), observability.TierDisk, storeOperationOpen)
-	c.logger.Warn("cache: entry failed verification; deleting it", "group", key.Group, "error", err)
+func (c *Cache) dropCorrupt(key entryKey, err error) {
+	c.metrics.RecordResponseCacheStoreError(context.Background(), observability.TierDisk, observability.OperationOpen)
+	c.logger.Warn("entry failed verification; deleting it", "group", key.Group, "error", err)
 	_ = c.store.Delete(key.Path())
 }
 
 // startSingle starts a fill that no other request can join, for a refs
 // request while refsMaxAge is zero.
-func (c *Cache) startSingle(key Key, req Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher) (*fill, bool) {
+func (c *Cache) startSingle(key entryKey, req Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher) (*fill, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
@@ -325,7 +321,7 @@ func (c *Cache) startSingle(key Key, req Request, repo gitproto.Repo, baseURL *u
 // joinOrStart attaches the request to the in-flight fill for key, or
 // returns a stored entry committed since the caller's lookup, or starts a
 // new fill. ok is false when no fill slot is free or the cache is closed.
-func (c *Cache) joinOrStart(key Key, req Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher) (f *fill, entry *Entry, collapsed, ok bool) {
+func (c *Cache) joinOrStart(key entryKey, req Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher) (f *fill, entry *storedEntry, collapsed, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
@@ -345,7 +341,7 @@ func (c *Cache) joinOrStart(key Key, req Request, repo gitproto.Repo, baseURL *u
 // startFillLocked takes a fill slot for the key's group and starts the
 // fill goroutine with the caller as its first subscriber. It returns nil
 // when no slot is free. Cache.mu must be held.
-func (c *Cache) startFillLocked(key Key, req Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher, shared bool) *fill {
+func (c *Cache) startFillLocked(key entryKey, req Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher, shared bool) *fill {
 	if !c.acquireSlotLocked(key.Group) {
 		return nil
 	}
@@ -422,7 +418,7 @@ func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, colla
 		return c.declined(w, host, class, "fill_ended"), false
 	}
 	defer func() { _ = rd.Close() }()
-	sr, err := NewSealedReader(rd, c.keyring)
+	sr, err := newSealedReader(rd, c.keyring)
 	if err != nil {
 		return c.declined(w, host, class, "fill_ended"), false
 	}
@@ -434,7 +430,7 @@ func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, colla
 	case err != nil && !started:
 		return c.declined(w, host, class, "fill_failed"), false
 	case err != nil:
-		c.logger.Warn("cache: fill failed mid-stream; aborting the response", "host", host, "class", class, "error", err)
+		c.logger.Warn("fill failed mid-stream; aborting the response", "host", host, "class", class, "error", err)
 		panic(http.ErrAbortHandler)
 	}
 	c.metrics.RecordResponseCacheLookup(ctx, host, class, observability.ResultMiss)
@@ -451,7 +447,7 @@ func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, colla
 // failure after that returns the error with started true. errClientGone
 // reports that the client stopped accepting bytes.
 func (c *Cache) stream(w http.ResponseWriter, src io.Reader, contentType, result string, collapsed bool) (n int64, started bool, err error) {
-	buf := make([]byte, SegmentSize)
+	buf := make([]byte, segmentSize)
 	k, rerr := src.Read(buf)
 	if k == 0 && rerr != nil && !errors.Is(rerr, io.EOF) {
 		return 0, false, rerr
@@ -489,7 +485,7 @@ func (c *Cache) stream(w http.ResponseWriter, src io.Reader, contentType, result
 func (c *Cache) Invalidate(ctx context.Context, repo gitproto.Repo, baseURL *url.URL) {
 	repoHash := c.keyring.RepoHash(baseURL, repo)
 	c.gens.bump(repoHash)
-	n, err := c.store.DeletePrefix(repoPrefix(GroupRefs, repoHash))
+	n, err := c.store.DeletePrefix(RepoPrefix(GroupRefs, repoHash))
 	if err != nil {
 		c.logger.WarnContext(ctx, "cache: invalidating refs entries after a push failed", "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "error", err)
 		return
@@ -500,30 +496,20 @@ func (c *Cache) Invalidate(ctx context.Context, repo gitproto.Repo, baseURL *url
 // Purge deletes the stored entries of repo in group, or in both groups
 // when group is empty, and returns how many were removed.
 func (c *Cache) Purge(_ context.Context, repo gitproto.Repo, baseURL *url.URL, group Group) (int, error) {
-	var groups []Group
-	switch group {
-	case "":
-		groups = []Group{GroupRefs, GroupPack}
-	case GroupRefs, GroupPack:
-		groups = []Group{group}
-	default:
-		return 0, fmt.Errorf("cache: unknown group %q", group)
+	groups, err := ParseGroups(string(group))
+	if err != nil {
+		return 0, err
 	}
 	repoHash := c.keyring.RepoHash(baseURL, repo)
 	total := 0
 	for _, g := range groups {
-		n, err := c.store.DeletePrefix(repoPrefix(g, repoHash))
+		n, err := c.store.DeletePrefix(RepoPrefix(g, repoHash))
 		total += n
 		if err != nil {
 			return total, err
 		}
 	}
 	return total, nil
-}
-
-// repoPrefix is the storage prefix of one repository's entries in group.
-func repoPrefix(group Group, repoHash [32]byte) string {
-	return "v1/" + string(group) + "/" + hex.EncodeToString(repoHash[:]) + "/"
 }
 
 // Close stops the janitor, cancels every fill and waits for them until

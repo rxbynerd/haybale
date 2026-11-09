@@ -911,7 +911,7 @@ func TestRefsFillsDoNotTakePackSlots(t *testing.T) {
 	}
 	want := int64(n * refsInitialReservation)
 	waitFor(t, "ten refs reservations", func() bool {
-		_, inflight, _ := c.store.Usage()
+		_, inflight, _ := c.store.usage()
 		return inflight == want
 	})
 	// With every refs fill in flight, the single pack slot is still free.
@@ -1050,13 +1050,13 @@ func TestRecordsPruneExpiredEntries(t *testing.T) {
 	}
 	var m uncacheableMarks
 	for i := range pruneThreshold {
-		m.mark(Key{KeyHash: [32]byte{byte(i), byte(i >> 8)}}, now.Add(-time.Minute))
+		m.mark(entryKey{KeyHash: [32]byte{byte(i), byte(i >> 8)}}, now.Add(-time.Minute))
 	}
-	m.mark(Key{KeyHash: [32]byte{0xff, 0xff, 0xff}}, now.Add(time.Minute))
+	m.mark(entryKey{KeyHash: [32]byte{0xff, 0xff, 0xff}}, now.Add(time.Minute))
 	if len(m.until) != 1 {
 		t.Errorf("marks after prune = %d, want 1", len(m.until))
 	}
-	if m.marked(Key{KeyHash: [32]byte{0xff, 0xff, 0xff}}, now.Add(2*time.Minute)) {
+	if m.marked(entryKey{KeyHash: [32]byte{0xff, 0xff, 0xff}}, now.Add(2*time.Minute)) {
 		t.Error("expired mark reported as marked")
 	}
 }

@@ -80,7 +80,11 @@ func cachePurgeTestRepoHash(t *testing.T, key []byte, owner, name string) string
 	if err != nil {
 		t.Fatalf("url.Parse: %v", err)
 	}
-	sum := cache.RepoHash(key, base, gitproto.Repo{Host: "github.com", Owner: owner, Name: name})
+	kr, err := cache.NewKeyring(key)
+	if err != nil {
+		t.Fatalf("cache.NewKeyring: %v", err)
+	}
+	sum := kr.RepoHash(base, gitproto.Repo{Host: "github.com", Owner: owner, Name: name})
 	return hex.EncodeToString(sum[:])
 }
 
@@ -249,7 +253,7 @@ func TestRunCachePurgeErrors(t *testing.T) {
 			keyValue: validKey,
 			repo:     "github.com/acme/widgets",
 			group:    "objects",
-			wantErr:  `--group "objects" must be "refs" or "pack"`,
+			wantErr:  `--group: cache: unknown group "objects"`,
 		},
 		{
 			name:     "malformed repo",
@@ -281,13 +285,13 @@ func TestRunCachePurgeErrors(t *testing.T) {
 		{
 			name:    "keyEnv variable unset",
 			repo:    "github.com/acme/widgets",
-			wantErr: cachePurgeTestKeyEnv + " (cache.keyEnv) is not set",
+			wantErr: `"` + cachePurgeTestKeyEnv + `" (keyEnv) is unset or empty`,
 		},
 		{
 			name:     "keyEnv variable not a key",
 			keyValue: "not-a-valid-key!",
 			repo:     "github.com/acme/widgets",
-			wantErr:  "cache.keyEnv",
+			wantErr:  "(keyEnv): cache: key is not valid base64",
 		},
 		{
 			name:     "keyEnv variable wrong length",

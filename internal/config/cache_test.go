@@ -300,32 +300,34 @@ func TestCacheConfigValidate(t *testing.T) {
 		{
 			name:    "remote type set",
 			mutate:  func(c *CacheConfig) { c.Remote.Type = "s3" },
-			wantErr: "cache.remote is not supported in this release",
+			wantErr: "cache: remote is not supported in this release",
 		},
 		{
 			name:    "remote bucket set",
 			mutate:  func(c *CacheConfig) { c.Remote.Bucket = "haybale-cache" },
-			wantErr: "cache.remote is not supported in this release",
+			wantErr: "cache: remote is not supported in this release",
 		},
 		{
 			name:    "remote forcePathStyle set",
 			mutate:  func(c *CacheConfig) { c.Remote.ForcePathStyle = true },
-			wantErr: "cache.remote is not supported in this release",
+			wantErr: "cache: remote is not supported in this release",
 		},
 		{
 			name:    "remote kmsKeyID set",
 			mutate:  func(c *CacheConfig) { c.Remote.KMSKeyID = "alias/haybale" },
-			wantErr: "cache.remote is not supported in this release",
+			wantErr: "cache: remote is not supported in this release",
 		},
 		{
 			name:    "staleIfErrorFor enabled",
 			mutate:  func(c *CacheConfig) { c.StaleIfErrorFor = "1h" },
-			wantErr: "cache.staleIfErrorFor is not supported in this release",
+			wantErr: "cache: staleIfErrorFor is not supported in this release",
 		},
+		{name: "staleIfErrorFor zero spelled 0", mutate: func(c *CacheConfig) { c.StaleIfErrorFor = "0" }},
+		{name: "staleIfErrorFor zero spelled 0m", mutate: func(c *CacheConfig) { c.StaleIfErrorFor = "0m" }},
 		{
-			name:    "staleIfErrorFor other zero spelling",
-			mutate:  func(c *CacheConfig) { c.StaleIfErrorFor = "0" },
-			wantErr: "cache.staleIfErrorFor is not supported in this release",
+			name:    "staleIfErrorFor unparseable",
+			mutate:  func(c *CacheConfig) { c.StaleIfErrorFor = "soon" },
+			wantErr: "cache: staleIfErrorFor is not supported in this release",
 		},
 	}
 	for _, tt := range tests {
@@ -504,8 +506,8 @@ func TestLoadCacheRejections(t *testing.T) {
 		{"bare integer size", "cache:\n  enabled: true\n  dir: /c\n  maxDiskSize: 1073741824\n", `size "1073741824" is invalid`},
 		{"SI size", "cache:\n  enabled: true\n  dir: /c\n  maxEntrySize: 1GB\n", `size "1GB" is invalid`},
 		{"missing dir", "cache:\n  enabled: true\n", "cache: dir is required"},
-		{"remote block", "cache:\n  enabled: true\n  dir: /c\n  remote:\n    type: s3\n    bucket: b\n", "cache.remote is not supported in this release"},
-		{"staleIfErrorFor", "cache:\n  enabled: true\n  dir: /c\n  staleIfErrorFor: 1h\n", "cache.staleIfErrorFor is not supported in this release"},
+		{"remote block", "cache:\n  enabled: true\n  dir: /c\n  remote:\n    type: s3\n    bucket: b\n", "cache: remote is not supported in this release"},
+		{"staleIfErrorFor", "cache:\n  enabled: true\n  dir: /c\n  staleIfErrorFor: 1h\n", "cache: staleIfErrorFor is not supported in this release"},
 		{"entry above disk", "cache:\n  enabled: true\n  dir: /c\n  maxDiskSize: 1GiB\n  maxEntrySize: 2GiB\n", "cache: maxEntrySize"},
 		{"negative retention", "cache:\n  enabled: true\n  dir: /c\n  retention: -1h\n", "cache: retention"},
 		{"refsMaxAge not below accessRecheck", "cache:\n  enabled: true\n  dir: /c\n  refsMaxAge: 5m\n", "cache: refsMaxAge"},

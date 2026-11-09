@@ -11,14 +11,14 @@ package cache
 type Class string
 
 const (
-	// ClassAdvertisement is GET info/refs?service=git-upload-pack: a v0
+	// classAdvertisement is GET info/refs?service=git-upload-pack: a v0
 	// ref advertisement or a v2 capability advertisement.
-	ClassAdvertisement Class = "advertisement"
-	// ClassLsRefs is a protocol v2 command=ls-refs request.
-	ClassLsRefs Class = "ls-refs"
-	// ClassFetch is a protocol v2 command=fetch or protocol v0
+	classAdvertisement Class = "advertisement"
+	// classLsRefs is a protocol v2 command=ls-refs request.
+	classLsRefs Class = "ls-refs"
+	// classFetch is a protocol v2 command=fetch or protocol v0
 	// upload-pack request whose arguments are all content-addressed.
-	ClassFetch Class = "fetch"
+	classFetch Class = "fetch"
 )
 
 // Group is a freshness group; entries of one group share a storage
@@ -36,9 +36,9 @@ const (
 // Group returns the freshness group of c, or "" for an unknown class.
 func (c Class) Group() Group {
 	switch c {
-	case ClassAdvertisement, ClassLsRefs:
+	case classAdvertisement, classLsRefs:
 		return GroupRefs
-	case ClassFetch:
+	case classFetch:
 		return GroupPack
 	default:
 		return ""

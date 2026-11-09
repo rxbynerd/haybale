@@ -176,12 +176,12 @@ func TestRunJanitorLoop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		s.RunJanitor(ctx, 5*time.Millisecond, time.Hour)
+		s.runJanitor(ctx, 5*time.Millisecond, time.Hour)
 		close(done)
 	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if committed, _, _ := s.Usage(); committed == 0 {
+		if committed, _, _ := s.usage(); committed == 0 {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -193,17 +193,17 @@ func TestRunJanitorLoop(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("RunJanitor did not return after cancel")
+		t.Fatal("runJanitor did not return after cancel")
 	}
 
 	returned := make(chan struct{})
 	go func() {
-		s.RunJanitor(context.Background(), 0, time.Hour)
+		s.runJanitor(context.Background(), 0, time.Hour)
 		close(returned)
 	}()
 	select {
 	case <-returned:
 	case <-time.After(5 * time.Second):
-		t.Fatal("RunJanitor with a zero interval did not return")
+		t.Fatal("runJanitor with a zero interval did not return")
 	}
 }

@@ -105,6 +105,24 @@ const (
 	TierUpstream = "upstream"
 )
 
+// Response-cache store operation values for the attrOperation label on
+// haybale.response_cache.store_errors.total.
+const (
+	OperationOpen   = "open"
+	OperationCreate = "create"
+	OperationWrite  = "write"
+	OperationCommit = "commit"
+	OperationAbort  = "abort"
+	OperationDelete = "delete"
+	OperationEvict  = "evict"
+	OperationExpire = "expire"
+	OperationSweep  = "sweep"
+)
+
+// ClassBypass is the attrClass value for a response-cache lookup of a
+// request the cache did not classify.
+const ClassBypass = "bypass"
+
 // Metrics holds haybale's OTel metric instruments. When telemetry is
 // disabled (NewNoopMetrics), every instrument is backed by
 // noop.MeterProvider so call sites record unconditionally with zero

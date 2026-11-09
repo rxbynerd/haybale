@@ -68,15 +68,15 @@ func stressChoice(w, i int) []byte {
 	return h.Sum(nil)
 }
 
-func openStore(t *testing.T, dir string, budget int64, clock *fakeClock) *DiskStore {
+func openStore(t *testing.T, dir string, budget int64, clock *fakeClock) *diskStore {
 	t.Helper()
 	var now func() time.Time
 	if clock != nil {
 		now = clock.Now
 	}
-	s, err := OpenDiskStore(dir, budget, nil, nil, now)
+	s, err := openDiskStore(dir, budget, nil, nil, now)
 	if err != nil {
-		t.Fatalf("OpenDiskStore: %v", err)
+		t.Fatalf("openDiskStore: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	return s
@@ -88,7 +88,7 @@ func entryPath(group Group, repo, key byte) string {
 	return "v1/" + string(group) + "/" + hex64(repo) + "/" + hex64(key)
 }
 
-func commitEntry(t *testing.T, s *DiskStore, path string, data []byte) {
+func commitEntry(t *testing.T, s *diskStore, path string, data []byte) {
 	t.Helper()
 	sp, err := s.Create(path, int64(len(data)))
 	if err != nil {
@@ -102,7 +102,7 @@ func commitEntry(t *testing.T, s *DiskStore, path string, data []byte) {
 	}
 }
 
-func readStoreEntry(t *testing.T, s *DiskStore, path string) []byte {
+func readStoreEntry(t *testing.T, s *diskStore, path string) []byte {
 	t.Helper()
 	e, err := s.Open(path)
 	if err != nil {
@@ -116,9 +116,9 @@ func readStoreEntry(t *testing.T, s *DiskStore, path string) []byte {
 	return data
 }
 
-func assertUsage(t *testing.T, s *DiskStore, committed, inflight, pinned int64) {
+func assertUsage(t *testing.T, s *diskStore, committed, inflight, pinned int64) {
 	t.Helper()
-	c, i, p := s.Usage()
+	c, i, p := s.usage()
 	if c != committed || i != inflight || p != pinned {
 		t.Fatalf("Usage() = (%d, %d, %d), want (%d, %d, %d)", c, i, p, committed, inflight, pinned)
 	}
@@ -130,7 +130,7 @@ func TestOpenDiskStoreRejectsPermissiveModes(t *testing.T) {
 		if err := os.Chmod(dir, mode); err != nil {
 			t.Fatal(err)
 		}
-		_, err := OpenDiskStore(dir, 1<<20, nil, nil, nil)
+		_, err := openDiskStore(dir, 1<<20, nil, nil, nil)
 		if err == nil || !strings.Contains(err.Error(), "chmod 700") {
 			t.Errorf("mode %04o: err = %v, want a chmod 700 error", mode, err)
 		}
@@ -157,12 +157,12 @@ func TestOpenDiskStoreRejectsUnusableDirs(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, d := range map[string]string{"missing parent": filepath.Join(dir, "missing", "cache"), "file": file} {
-		if _, err := OpenDiskStore(d, 1<<20, nil, nil, nil); err == nil {
-			t.Errorf("%s: OpenDiskStore succeeded", name)
+		if _, err := openDiskStore(d, 1<<20, nil, nil, nil); err == nil {
+			t.Errorf("%s: openDiskStore succeeded", name)
 		}
 	}
-	if _, err := OpenDiskStore(dir, 0, nil, nil, nil); err == nil {
-		t.Error("zero budget: OpenDiskStore succeeded")
+	if _, err := openDiskStore(dir, 0, nil, nil, nil); err == nil {
+		t.Error("zero budget: openDiskStore succeeded")
 	}
 }
 
@@ -401,11 +401,11 @@ func TestDiskStoreReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertUsage(t, s, 0, 600, 0)
-	if _, err := s.Create(entryPath(GroupPack, 1, 2), 600); !errors.Is(err, ErrBudget) {
-		t.Fatalf("over-budget Create: err = %v, want ErrBudget", err)
+	if _, err := s.Create(entryPath(GroupPack, 1, 2), 600); !errors.Is(err, errBudget) {
+		t.Fatalf("over-budget Create: err = %v, want errBudget", err)
 	}
-	if _, err := s.Create(entryPath(GroupPack, 1, 2), 2000); !errors.Is(err, ErrBudget) {
-		t.Fatalf("Create larger than the budget: err = %v, want ErrBudget", err)
+	if _, err := s.Create(entryPath(GroupPack, 1, 2), 2000); !errors.Is(err, errBudget) {
+		t.Fatalf("Create larger than the budget: err = %v, want errBudget", err)
 	}
 	if _, err := s.Create(entryPath(GroupPack, 1, 2), -1); err == nil {
 		t.Fatal("negative reservation accepted")
@@ -416,8 +416,8 @@ func TestDiskStoreReservation(t *testing.T) {
 	if _, err := a.Write(make([]byte, 600)); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Reserve(500); !errors.Is(err, ErrBudget) {
-		t.Fatalf("Reserve past the budget: err = %v, want ErrBudget", err)
+	if err := a.Reserve(500); !errors.Is(err, errBudget) {
+		t.Fatalf("Reserve past the budget: err = %v, want errBudget", err)
 	}
 	if err := a.Reserve(400); err != nil {
 		t.Fatal(err)
@@ -448,7 +448,7 @@ func TestDiskStoreReservation(t *testing.T) {
 func TestDiskStoreLRUEviction(t *testing.T) {
 	m, reader := observability.NewTestMetrics()
 	clock := newFakeClock()
-	s, err := OpenDiskStore(cacheDir(t), 300, nil, m, clock.Now)
+	s, err := openDiskStore(cacheDir(t), 300, nil, m, clock.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -474,8 +474,8 @@ func TestDiskStoreLRUEviction(t *testing.T) {
 	if _, err := s.Open(a); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected a to be evicted: err = %v", err)
 	}
-	if _, err := s.Create(entryPath(GroupPack, 1, 6), 250); !errors.Is(err, ErrBudget) {
-		t.Fatalf("Create needing the open entry's space: err = %v, want ErrBudget", err)
+	if _, err := s.Create(entryPath(GroupPack, 1, 6), 250); !errors.Is(err, errBudget) {
+		t.Fatalf("Create needing the open entry's space: err = %v, want errBudget", err)
 	}
 	// A failed reservation evicts nothing.
 	assertUsage(t, s, 300, 0, 0)
@@ -629,12 +629,12 @@ func TestSpoolTwoReadersAtDifferentOffsets(t *testing.T) {
 func TestSpoolAbortAndFailReachReaders(t *testing.T) {
 	sentinel := errors.New("upstream reset")
 	cases := map[string]struct {
-		end  func(*Spool)
+		end  func(*spool)
 		want error
 	}{
-		"abort":    {func(sp *Spool) { sp.Abort() }, ErrSpoolAborted},
-		"fail":     {func(sp *Spool) { sp.Fail(sentinel) }, sentinel},
-		"fail nil": {func(sp *Spool) { sp.Fail(nil) }, ErrSpoolAborted},
+		"abort":    {func(sp *spool) { sp.Abort() }, errSpoolAborted},
+		"fail":     {func(sp *spool) { sp.Fail(sentinel) }, sentinel},
+		"fail nil": {func(sp *spool) { sp.Fail(nil) }, errSpoolAborted},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -734,7 +734,7 @@ func TestPinnedBytesReleasedOnLastClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertUsage(t, s, 0, 0, 400)
-	if _, err := s.Create(entryPath(GroupPack, 1, 2), 700); !errors.Is(err, ErrBudget) {
+	if _, err := s.Create(entryPath(GroupPack, 1, 2), 700); !errors.Is(err, errBudget) {
 		t.Fatalf("pinned bytes not counted against the budget: err = %v", err)
 	}
 	if data, err := io.ReadAll(e1); err != nil || len(data) != 400 {
@@ -777,7 +777,7 @@ func TestSpoolReadersPinCommittedEntry(t *testing.T) {
 	assertUsage(t, s, 300, 0, 0)
 	// The spool reader holds the committed entry open, so it is not
 	// evictable.
-	if _, err := s.Create(entryPath(GroupPack, 1, 2), 800); !errors.Is(err, ErrBudget) {
+	if _, err := s.Create(entryPath(GroupPack, 1, 2), 800); !errors.Is(err, errBudget) {
 		t.Fatalf("entry held by a spool reader was evicted: err = %v", err)
 	}
 	if err := s.Delete(p); err != nil {
@@ -933,7 +933,7 @@ func TestDiskStoreConcurrentStress(t *testing.T) {
 		t.Error(err)
 	}
 
-	committed, inflight, pinned := s.Usage()
+	committed, inflight, pinned := s.usage()
 	if inflight != 0 || pinned != 0 {
 		t.Fatalf("after all spools and readers closed: inflight %d, pinned %d", inflight, pinned)
 	}
@@ -963,9 +963,9 @@ func TestDiskStoreConcurrentStress(t *testing.T) {
 	}
 }
 
-func stressWrite(s *DiskStore, p string, value byte, n int, abort bool) (err error) {
+func stressWrite(s *diskStore, p string, value byte, n int, abort bool) (err error) {
 	sp, err := s.Create(p, int64(n))
-	if errors.Is(err, ErrBudget) {
+	if errors.Is(err, errBudget) {
 		return nil
 	}
 	if err != nil {
@@ -981,7 +981,7 @@ func stressWrite(s *DiskStore, p string, value byte, n int, abort bool) (err err
 	}
 	if abort {
 		sp.Abort()
-		if _, err := io.ReadAll(r); !errors.Is(err, ErrSpoolAborted) {
+		if _, err := io.ReadAll(r); !errors.Is(err, errSpoolAborted) {
 			return fmt.Errorf("reader after abort: %w", err)
 		}
 		return nil
@@ -999,7 +999,7 @@ func stressWrite(s *DiskStore, p string, value byte, n int, abort bool) (err err
 	return nil
 }
 
-func stressRead(s *DiskStore, p string) (err error) {
+func stressRead(s *diskStore, p string) (err error) {
 	e, err := s.Open(p)
 	if errors.Is(err, ErrNotFound) {
 		return nil
@@ -1075,17 +1075,17 @@ func TestSpoolDiscardDrainsReaders(t *testing.T) {
 }
 
 // TestSealedEntryThroughSpool writes a sealed entry into a spool while a
-// SealedReader follows it, for both ways a fill can end cleanly.
+// sealedReader follows it, for both ways a fill can end cleanly.
 func TestSealedEntryThroughSpool(t *testing.T) {
 	kr := testKeyring(t)
-	body := randomBody(t, 3*SegmentSize+99)
-	for name, end := range map[string]func(*Spool) error{
-		"commit":  (*Spool).Commit,
-		"discard": func(sp *Spool) error { sp.Discard(); return nil },
+	body := randomBody(t, 3*segmentSize+99)
+	for name, end := range map[string]func(*spool) error{
+		"commit":  (*spool).Commit,
+		"discard": func(sp *spool) error { sp.Discard(); return nil },
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := openStore(t, cacheDir(t), 1<<24, nil)
-			sp, err := s.Create(entryPath(GroupPack, 1, 1), SealedSize(int64(len(body)))+segmentOverhead)
+			sp, err := s.Create(entryPath(GroupPack, 1, 1), sealedSize(int64(len(body)))+segmentOverhead)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1097,7 +1097,7 @@ func TestSealedEntryThroughSpool(t *testing.T) {
 
 			read := make(chan readResult, 1)
 			go func() {
-				sr, err := NewSealedReader(r, kr)
+				sr, err := newSealedReader(r, kr)
 				if err != nil {
 					read <- readResult{nil, err}
 					return
@@ -1106,7 +1106,7 @@ func TestSealedEntryThroughSpool(t *testing.T) {
 				read <- readResult{data, err}
 			}()
 
-			w, err := NewSealedWriter(sp, kr, testHeader())
+			w, err := newSealedWriter(sp, kr, testHeader())
 			if err != nil {
 				t.Fatal(err)
 			}

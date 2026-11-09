@@ -19,10 +19,10 @@ func testKeyring(t testing.TB) Keyring {
 	return kr
 }
 
-func testHeader() Header {
-	h := Header{
+func testHeader() entryHeader {
+	h := entryHeader{
 		Group:       GroupPack,
-		Class:       ClassFetch,
+		Class:       classFetch,
 		Repo:        "github.com/rxbynerd/haybale",
 		BaseURL:     "https://github.com",
 		CreatedAt:   time.Date(2026, 11, 9, 12, 0, 0, 123456789, time.UTC),
@@ -36,10 +36,10 @@ func testHeader() Header {
 	return h
 }
 
-func sealBytes(t testing.TB, kr Keyring, h Header, body []byte) []byte {
+func sealBytes(t testing.TB, kr Keyring, h entryHeader, body []byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
-	w, err := NewSealedWriter(&buf, kr, h)
+	w, err := newSealedWriter(&buf, kr, h)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func openBytes(t testing.TB, kr Keyring, entry []byte) []byte {
 // readEntry opens and fully reads entry, returning the bytes released
 // before the first error.
 func readEntry(kr Keyring, entry []byte) ([]byte, error) {
-	r, err := NewSealedReader(bytes.NewReader(entry), kr)
+	r, err := newSealedReader(bytes.NewReader(entry), kr)
 	if err != nil {
 		return nil, err
 	}
@@ -94,22 +94,22 @@ func segmentStarts(t testing.TB, entry []byte) []int {
 
 func TestSealedRoundTrip(t *testing.T) {
 	kr := testKeyring(t)
-	sizes := []int{0, 1, SegmentSize - 1, SegmentSize, SegmentSize + 1, 2 * SegmentSize, 5<<20 + 12345}
+	sizes := []int{0, 1, segmentSize - 1, segmentSize, segmentSize + 1, 2 * segmentSize, 5<<20 + 12345}
 	for _, n := range sizes {
 		body := randomBody(t, n)
 		h := testHeader()
 		entry := sealBytes(t, kr, h, body)
-		if int64(len(entry)) != SealedSize(int64(n)) {
-			t.Errorf("size %d: sealed length %d, SealedSize %d", n, len(entry), SealedSize(int64(n)))
+		if int64(len(entry)) != sealedSize(int64(n)) {
+			t.Errorf("size %d: sealed length %d, sealedSize %d", n, len(entry), sealedSize(int64(n)))
 		}
-		r, err := NewSealedReader(bytes.NewReader(entry), kr)
+		r, err := newSealedReader(bytes.NewReader(entry), kr)
 		if err != nil {
-			t.Fatalf("size %d: NewSealedReader: %v", n, err)
+			t.Fatalf("size %d: newSealedReader: %v", n, err)
 		}
 		got := r.Header()
 		want := h
-		want.Version = FormatVersion
-		want.KeyID = kr.ActiveID()
+		want.Version = formatVersion
+		want.KeyID = kr.activeID()
 		if !got.CreatedAt.Equal(want.CreatedAt) {
 			t.Errorf("size %d: CreatedAt = %v, want %v", n, got.CreatedAt, want.CreatedAt)
 		}
@@ -117,7 +117,7 @@ func TestSealedRoundTrip(t *testing.T) {
 		if got != want {
 			t.Errorf("size %d: Header() = %+v, want %+v", n, got, want)
 		}
-		if _, ok := r.BodyLength(); ok {
+		if _, ok := r.bodyLength(); ok {
 			t.Errorf("size %d: BodyLength known before EOF", n)
 		}
 		plain, err := io.ReadAll(r)
@@ -127,17 +127,17 @@ func TestSealedRoundTrip(t *testing.T) {
 		if !bytes.Equal(plain, body) {
 			t.Fatalf("size %d: body mismatch", n)
 		}
-		if length, ok := r.BodyLength(); !ok || length != int64(n) {
-			t.Errorf("size %d: BodyLength() = %d, %v", n, length, ok)
+		if length, ok := r.bodyLength(); !ok || length != int64(n) {
+			t.Errorf("size %d: bodyLength() = %d, %v", n, length, ok)
 		}
 	}
 }
 
 func TestSealedWriterSmallWritesAndFlush(t *testing.T) {
 	kr := testKeyring(t)
-	body := randomBody(t, 3*SegmentSize+17)
+	body := randomBody(t, 3*segmentSize+17)
 	var buf bytes.Buffer
-	w, err := NewSealedWriter(&buf, kr, testHeader())
+	w, err := newSealedWriter(&buf, kr, testHeader())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,8 +158,8 @@ func TestSealedWriterSmallWritesAndFlush(t *testing.T) {
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if w.Written() != int64(len(body)) {
-		t.Fatalf("Written() = %d, want %d", w.Written(), len(body))
+	if w.written() != int64(len(body)) {
+		t.Fatalf("written() = %d, want %d", w.written(), len(body))
 	}
 	if flushes == 0 {
 		t.Fatal("test did not flush")
@@ -167,7 +167,7 @@ func TestSealedWriterSmallWritesAndFlush(t *testing.T) {
 	if got := openBytes(t, kr, buf.Bytes()); !bytes.Equal(got, body) {
 		t.Fatal("body mismatch")
 	}
-	if int64(buf.Len()) <= SealedSize(int64(len(body))) {
+	if int64(buf.Len()) <= sealedSize(int64(len(body))) {
 		t.Fatal("flushed entry is not larger than the unflushed size")
 	}
 }
@@ -175,7 +175,7 @@ func TestSealedWriterSmallWritesAndFlush(t *testing.T) {
 func TestSealedFlushOnEmptyBufferIsNoop(t *testing.T) {
 	kr := testKeyring(t)
 	var buf bytes.Buffer
-	w, err := NewSealedWriter(&buf, kr, testHeader())
+	w, err := newSealedWriter(&buf, kr, testHeader())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,20 +205,20 @@ func TestSealedFlushOnEmptyBufferIsNoop(t *testing.T) {
 func TestSealedFlushReleasesPendingBytes(t *testing.T) {
 	kr := testKeyring(t)
 	pr, pw := io.Pipe()
-	w, errc := make(chan *SealedWriter, 1), make(chan error, 1)
+	w, errc := make(chan *sealedWriter, 1), make(chan error, 1)
 	go func() {
-		sw, err := NewSealedWriter(pw, kr, testHeader())
+		sw, err := newSealedWriter(pw, kr, testHeader())
 		if err != nil {
 			errc <- err
 			return
 		}
 		w <- sw
 	}()
-	r, err := NewSealedReader(pr, kr)
+	r, err := newSealedReader(pr, kr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var sw *SealedWriter
+	var sw *sealedWriter
 	select {
 	case sw = <-w:
 	case err := <-errc:
@@ -259,36 +259,36 @@ func TestSealedFlushReleasesPendingBytes(t *testing.T) {
 }
 
 func TestSealedSize(t *testing.T) {
-	if SealedSize(-1) != -1 {
-		t.Fatal("SealedSize(-1) != -1")
+	if sealedSize(-1) != -1 {
+		t.Fatal("sealedSize(-1) != -1")
 	}
-	if got, want := SealedSize(0), int64(preambleLen+headerSealedLen+frameLen+trailerCTLen); got != want {
-		t.Fatalf("SealedSize(0) = %d, want %d", got, want)
+	if got, want := sealedSize(0), int64(preambleLen+headerSealedLen+frameLen+trailerCTLen); got != want {
+		t.Fatalf("sealedSize(0) = %d, want %d", got, want)
 	}
-	if SealedSize(SegmentSize+1)-SealedSize(SegmentSize) != 1+segmentOverhead {
+	if sealedSize(segmentSize+1)-sealedSize(segmentSize) != 1+segmentOverhead {
 		t.Fatal("starting a segment does not add one frame and tag")
 	}
 }
 
 func TestSealedWriterRejectsBadHeader(t *testing.T) {
 	kr := testKeyring(t)
-	cases := map[string]func(*Header){
-		"version":      func(h *Header) { h.Version = 2 },
-		"key id":       func(h *Header) { h.KeyID = "deadbeef" },
-		"repo":         func(h *Header) { h.Repo = string(make([]byte, maxRepoLen+1)) },
-		"base URL":     func(h *Header) { h.BaseURL = string(make([]byte, maxBaseURLLen+1)) },
-		"group":        func(h *Header) { h.Group = Group(make([]byte, maxLabelLen+1)) },
-		"content type": func(h *Header) { h.ContentType = string(make([]byte, maxContentTypeLen+1)) },
+	cases := map[string]func(*entryHeader){
+		"version":      func(h *entryHeader) { h.Version = 2 },
+		"key id":       func(h *entryHeader) { h.KeyID = "deadbeef" },
+		"repo":         func(h *entryHeader) { h.Repo = string(make([]byte, maxRepoLen+1)) },
+		"base URL":     func(h *entryHeader) { h.BaseURL = string(make([]byte, maxBaseURLLen+1)) },
+		"group":        func(h *entryHeader) { h.Group = Group(make([]byte, maxLabelLen+1)) },
+		"content type": func(h *entryHeader) { h.ContentType = string(make([]byte, maxContentTypeLen+1)) },
 	}
 	for name, mutate := range cases {
 		h := testHeader()
 		mutate(&h)
-		if _, err := NewSealedWriter(io.Discard, kr, h); err == nil {
-			t.Errorf("%s: NewSealedWriter error = nil", name)
+		if _, err := newSealedWriter(io.Discard, kr, h); err == nil {
+			t.Errorf("%s: newSealedWriter error = nil", name)
 		}
 	}
-	if _, err := NewSealedWriter(io.Discard, Keyring{}, testHeader()); err == nil {
-		t.Error("zero Keyring: NewSealedWriter error = nil")
+	if _, err := newSealedWriter(io.Discard, Keyring{}, testHeader()); err == nil {
+		t.Error("zero Keyring: newSealedWriter error = nil")
 	}
 }
 
@@ -302,7 +302,7 @@ func TestSealedHeaderLimitsFitRecord(t *testing.T) {
 	h.ContentType = string(bytes.Repeat([]byte("t"), maxContentTypeLen))
 	h.Protocol = string(bytes.Repeat([]byte("p"), maxProtocolLen))
 	entry := sealBytes(t, kr, h, []byte("x"))
-	r, err := NewSealedReader(bytes.NewReader(entry), kr)
+	r, err := newSealedReader(bytes.NewReader(entry), kr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +313,7 @@ func TestSealedHeaderLimitsFitRecord(t *testing.T) {
 
 func TestSealedTruncation(t *testing.T) {
 	kr := testKeyring(t)
-	body := randomBody(t, 3*SegmentSize+100)
+	body := randomBody(t, 3*segmentSize+100)
 	entry := sealBytes(t, kr, testHeader(), body)
 
 	cuts := []int{0, 1, preambleLen - 1, preambleLen, preambleLen + 100, headerFixedPrefix - 1}
@@ -344,7 +344,7 @@ func TestSealedTrailingBytesRejected(t *testing.T) {
 func TestSealedTrailerLengthMismatch(t *testing.T) {
 	kr := testKeyring(t)
 	var buf bytes.Buffer
-	w, err := NewSealedWriter(&buf, kr, testHeader())
+	w, err := newSealedWriter(&buf, kr, testHeader())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +366,7 @@ func TestSealedTrailerLengthMismatch(t *testing.T) {
 
 func TestSealedBitFlips(t *testing.T) {
 	kr := testKeyring(t)
-	body := randomBody(t, 2*SegmentSize+10)
+	body := randomBody(t, 2*segmentSize+10)
 	entry := sealBytes(t, kr, testHeader(), body)
 	starts := segmentStarts(t, entry) // three body segments, trailer, end
 
@@ -397,7 +397,7 @@ func TestSealedBitFlips(t *testing.T) {
 		}
 		// Only whole segments before the flipped one are released.
 		for i := range names {
-			if off >= starts[i] && off < starts[i+1] && len(got) > i*SegmentSize {
+			if off >= starts[i] && off < starts[i+1] && len(got) > i*segmentSize {
 				t.Errorf("%s: released %d bytes from a corrupt segment", name, len(got))
 			}
 		}
@@ -406,7 +406,7 @@ func TestSealedBitFlips(t *testing.T) {
 
 func TestSealedSegmentReorderAndDuplicate(t *testing.T) {
 	kr := testKeyring(t)
-	body := randomBody(t, 3*SegmentSize+10)
+	body := randomBody(t, 3*segmentSize+10)
 	entry := sealBytes(t, kr, testHeader(), body)
 	starts := segmentStarts(t, entry)
 	head := entry[:headerFixedPrefix]
@@ -443,7 +443,7 @@ func TestSealedRejectsInvalidFrameLength(t *testing.T) {
 
 func TestSealedRelocationFails(t *testing.T) {
 	kr := testKeyring(t)
-	body := randomBody(t, SegmentSize+10)
+	body := randomBody(t, segmentSize+10)
 	a := sealBytes(t, kr, testHeader(), body)
 	other := testHeader()
 	other.KeyHash[0] ^= 0xff
@@ -469,22 +469,22 @@ func TestSealedWrongKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewSealedReader(bytes.NewReader(entry), other); !errors.Is(err, ErrIntegrity) {
+	if _, err := newSealedReader(bytes.NewReader(entry), other); !errors.Is(err, ErrIntegrity) {
 		t.Fatalf("unknown key id: err = %v, want ErrIntegrity", err)
 	}
 
 	// A different key presented under the entry's key id fails the header
 	// tag.
-	forged := Keyring{active: kr.ActiveID(), sealing: map[string][KeySize]byte{kr.ActiveID(): other.sealing[other.ActiveID()]}}
-	if _, err := NewSealedReader(bytes.NewReader(entry), forged); !errors.Is(err, ErrIntegrity) {
+	forged := Keyring{active: kr.activeID(), sealing: map[string][KeySize]byte{kr.activeID(): other.sealing[other.activeID()]}}
+	if _, err := newSealedReader(bytes.NewReader(entry), forged); !errors.Is(err, ErrIntegrity) {
 		t.Fatalf("wrong key under the right id: err = %v, want ErrIntegrity", err)
 	}
 
 	// Relabelling the preamble with another key's id fails under that
 	// key too: the preamble is the header's associated data.
 	relabelled := bytes.Clone(entry)
-	copy(relabelled[len(magic)+2:], other.ActiveID())
-	if _, err := NewSealedReader(bytes.NewReader(relabelled), other); !errors.Is(err, ErrIntegrity) {
+	copy(relabelled[len(magic)+2:], other.activeID())
+	if _, err := newSealedReader(bytes.NewReader(relabelled), other); !errors.Is(err, ErrIntegrity) {
 		t.Fatalf("key id relabelled: err = %v, want ErrIntegrity", err)
 	}
 }
@@ -515,7 +515,7 @@ func (r *errReader) Read(p []byte) (int, error) {
 
 func TestSealedReaderPassesThroughSourceErrors(t *testing.T) {
 	kr := testKeyring(t)
-	entry := sealBytes(t, kr, testHeader(), randomBody(t, 2*SegmentSize))
+	entry := sealBytes(t, kr, testHeader(), randomBody(t, 2*segmentSize))
 	sentinel := errors.New("source failed")
 	starts := segmentStarts(t, entry)
 
@@ -526,7 +526,7 @@ func TestSealedReaderPassesThroughSourceErrors(t *testing.T) {
 		"after trailer": len(entry),
 	}
 	for name, cut := range cuts {
-		r, err := NewSealedReader(&errReader{data: entry[:cut], err: sentinel}, kr)
+		r, err := newSealedReader(&errReader{data: entry[:cut], err: sentinel}, kr)
 		if err == nil {
 			_, err = io.ReadAll(r)
 		}
@@ -538,7 +538,7 @@ func TestSealedReaderPassesThroughSourceErrors(t *testing.T) {
 
 func TestSealedReaderOnGrowingSource(t *testing.T) {
 	kr := testKeyring(t)
-	body := randomBody(t, 3*SegmentSize+7)
+	body := randomBody(t, 3*segmentSize+7)
 	entry := sealBytes(t, kr, testHeader(), body)
 	pr, pw := io.Pipe()
 	go func() {
@@ -551,7 +551,7 @@ func TestSealedReaderOnGrowingSource(t *testing.T) {
 		}
 		_ = pw.Close()
 	}()
-	r, err := NewSealedReader(pr, kr)
+	r, err := newSealedReader(pr, kr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -572,7 +572,7 @@ func FuzzSealedReader(f *testing.F) {
 		f.Add(sealBytes(f, kr, testHeader(), make([]byte, n)))
 	}
 	var buf bytes.Buffer
-	w, err := NewSealedWriter(&buf, kr, testHeader())
+	w, err := newSealedWriter(&buf, kr, testHeader())
 	if err != nil {
 		f.Fatal(err)
 	}
@@ -590,10 +590,10 @@ func FuzzSealedReader(f *testing.F) {
 	f.Add(buf.Bytes())
 	f.Add([]byte(magic))
 	f.Fuzz(func(t *testing.T, data []byte) {
-		r, err := NewSealedReader(bytes.NewReader(data), kr)
+		r, err := newSealedReader(bytes.NewReader(data), kr)
 		if err != nil {
 			if !errors.Is(err, ErrIntegrity) {
-				t.Fatalf("NewSealedReader error %v is not ErrIntegrity", err)
+				t.Fatalf("newSealedReader error %v is not ErrIntegrity", err)
 			}
 			return
 		}
@@ -604,10 +604,10 @@ func FuzzSealedReader(f *testing.F) {
 			}
 			return
 		}
-		if n, ok := r.BodyLength(); !ok || n != int64(len(got)) {
-			t.Fatalf("BodyLength() = %d, %v after reading %d bytes", n, ok, len(got))
+		if n, ok := r.bodyLength(); !ok || n != int64(len(got)) {
+			t.Fatalf("bodyLength() = %d, %v after reading %d bytes", n, ok, len(got))
 		}
-		if int64(len(data)) < SealedSize(int64(len(got))) {
+		if int64(len(data)) < sealedSize(int64(len(got))) {
 			t.Fatalf("accepted %d sealed bytes for a %d-byte body", len(data), len(got))
 		}
 	})

@@ -37,7 +37,7 @@ const (
 	transientCooldown = time.Minute
 	// reserveStep is the smallest amount by which a fill grows its spool
 	// reservation once the sealed output outruns it.
-	reserveStep = 4 * SegmentSize
+	reserveStep = 4 * segmentSize
 	// refsInitialReservation is the disk a refs fill reserves up front.
 	// Refs responses are kilobytes, so they neither reserve maxEntrySize
 	// like a pack of unknown length nor take a pack fill slot; see
@@ -83,7 +83,7 @@ type fillOutcome struct {
 // outlives the subscriber that started it.
 type fill struct {
 	c       *Cache
-	key     Key
+	key     entryKey
 	req     Request
 	repo    gitproto.Repo
 	baseURL *url.URL
@@ -98,7 +98,7 @@ type fill struct {
 	cancel    context.CancelFunc
 	abandoned atomic.Bool
 
-	spool       *Spool
+	spool       *spool
 	headerReady chan struct{}
 	outcomeOnce sync.Once
 	outcome     fillOutcome // valid once headerReady is closed
@@ -111,7 +111,7 @@ type fill struct {
 	// flush timer share.
 	seal struct {
 		mu     sync.Mutex
-		w      *SealedWriter
+		w      *sealedWriter
 		timer  *time.Timer
 		armed  bool
 		closed bool
@@ -124,7 +124,7 @@ type fill struct {
 	idle        *time.Timer
 }
 
-func (c *Cache) newFill(key Key, req Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher, shared bool) *fill {
+func (c *Cache) newFill(key entryKey, req Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher, shared bool) *fill {
 	ctx, cancel := context.WithCancel(c.ctx)
 	return &fill{
 		c:           c,
@@ -151,7 +151,7 @@ func (f *fill) run() {
 	defer f.end()
 	defer func() {
 		if r := recover(); r != nil {
-			f.c.logger.Error("cache: fill panicked", "class", f.req.Class, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+			f.c.logger.Error("fill panicked", "class", f.req.Class, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
 			f.abort(fmt.Errorf("cache: fill panicked: %v", r), observability.FillReasonStoreError)
 		}
 	}()
@@ -161,7 +161,7 @@ func (f *fill) run() {
 func (f *fill) perform() {
 	resp, err := f.fetchHeaders()
 	if err != nil {
-		f.logger().Debug("cache: upstream fetch failed", "error", err)
+		f.logger().Debug("upstream fetch failed", "error", err)
 		f.release(observability.FillReasonFetchError, transientCooldown)
 		return
 	}
@@ -241,7 +241,7 @@ func (f *fill) openSpool(contentLength int64, now time.Time) bool {
 		if contentLength >= 0 {
 			expected = contentLength
 		}
-		reserve = SealedSize(expected)
+		reserve = sealedSize(expected)
 	}
 	sp, err := f.c.store.Create(f.key.Path(), reserve)
 	if err != nil {
@@ -249,7 +249,7 @@ func (f *fill) openSpool(contentLength int64, now time.Time) bool {
 		return false
 	}
 	f.spool = sp
-	hdr := Header{
+	hdr := entryHeader{
 		Group:       f.key.Group,
 		Class:       f.req.Class,
 		RepoHash:    f.key.RepoHash,
@@ -260,7 +260,7 @@ func (f *fill) openSpool(contentLength int64, now time.Time) bool {
 		ContentType: responseContentType(f.req.Class),
 		Protocol:    f.req.Protocol,
 	}
-	sw, err := NewSealedWriter(&spoolWriter{sp: sp, reserved: reserve}, f.c.keyring, hdr)
+	sw, err := newSealedWriter(&spoolWriter{sp: sp, reserved: reserve}, f.c.keyring, hdr)
 	if err != nil {
 		sp.Abort()
 		f.release(storeReason(err), transientCooldown)
@@ -399,9 +399,9 @@ func (f *fill) discard(reason string, markFor time.Duration) {
 // started reading take the passthrough path.
 func (f *fill) abort(err error, reason string) {
 	if f.abandoned.Load() {
-		f.logger().Debug("cache: fill cancelled after its subscribers left")
+		f.logger().Debug("fill cancelled after its subscribers left")
 	} else {
-		f.logger().Warn("cache: fill aborted", "reason", reason, "error", err)
+		f.logger().Warn("fill aborted", "reason", reason, "error", err)
 	}
 	if f.spool != nil {
 		f.spool.Fail(err)
@@ -425,7 +425,11 @@ func (f *fill) finish(result, reason string, markFor time.Duration) {
 	if markFor > 0 && !f.abandoned.Load() {
 		f.c.marks.mark(f.key, f.c.now().Add(markFor))
 	}
-	f.logger().Debug("cache: fill finished", "result", result, "reason", reason, "bytes", f.fetched)
+	attrs := []any{"result", result, "bytes", f.fetched}
+	if reason != "" {
+		attrs = append(attrs, "reason", reason)
+	}
+	f.logger().Debug("fill finished", attrs...)
 }
 
 // end detaches the fill from the cache so no request can join it, and
@@ -484,7 +488,7 @@ func (f *fill) logger() *slog.Logger {
 // spoolWriter writes sealed bytes to a spool, growing the reservation
 // ahead of the bytes so that a write never exceeds it.
 type spoolWriter struct {
-	sp       *Spool
+	sp       *spool
 	written  int64
 	reserved int64
 }
@@ -536,7 +540,7 @@ func (r *idleReader) Close() error {
 // responseContentType is the Content-Type a storable response of class
 // must carry.
 func responseContentType(class Class) string {
-	if class == ClassAdvertisement {
+	if class == classAdvertisement {
 		return contentTypeAdvertisement
 	}
 	return contentTypeResult
@@ -545,11 +549,11 @@ func responseContentType(class Class) string {
 // scanMode selects the response grammar for a request.
 func scanMode(req Request) pktline.Mode {
 	switch req.Class {
-	case ClassAdvertisement:
+	case classAdvertisement:
 		return pktline.ModeAdvertisement
-	case ClassLsRefs:
+	case classLsRefs:
 		return pktline.ModeV2Result
-	case ClassFetch:
+	case classFetch:
 		if isProtocolV2(req.Protocol) {
 			return pktline.ModeV2Fetch
 		}
@@ -582,7 +586,7 @@ func verdictReason(reason string) string {
 // storeReason labels a spool error: a budget failure or any other store
 // error.
 func storeReason(err error) string {
-	if errors.Is(err, ErrBudget) {
+	if errors.Is(err, errBudget) {
 		return observability.FillReasonDiskBudget
 	}
 	return observability.FillReasonStoreError

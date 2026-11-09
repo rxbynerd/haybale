@@ -133,14 +133,14 @@ func wantKeyHash(class Class, protocol string, body []byte) [32]byte {
 	return sha256.Sum256(append([]byte(string(class)+"\n"+protocol+"\n"), body...))
 }
 
-func classify(t *testing.T, r *http.Request) (Request, bool, string) {
+func classifyRequest(t *testing.T, r *http.Request) (Request, bool, string) {
 	t.Helper()
-	req, bypass, reason, err := Classify(r, testRepo, testMaxBody)
+	req, bypass, reason, err := classify(r, testRepo, testMaxBody)
 	if err != nil {
-		t.Fatalf("Classify() error = %v", err)
+		t.Fatalf("classify() error = %v", err)
 	}
 	if bypass != (reason != "") {
-		t.Fatalf("Classify() bypass = %v with reason %q", bypass, reason)
+		t.Fatalf("classify() bypass = %v with reason %q", bypass, reason)
 	}
 	return req, bypass, reason
 }
@@ -156,7 +156,7 @@ func TestClassifyCapturedRequests(t *testing.T) {
 		{
 			name:     "v2 ls-refs",
 			r:        postV2(lsRefsBody(t, agent)),
-			class:    ClassLsRefs,
+			class:    classLsRefs,
 			protocol: "version=2",
 			canonical: pkts(t, "command=ls-refs\n", "object-format=sha1\n", pktline.Delim,
 				"peel\n", "symrefs\n", "unborn\n",
@@ -166,7 +166,7 @@ func TestClassifyCapturedRequests(t *testing.T) {
 		{
 			name:     "v2 fetch",
 			r:        postV2(cloneFetchBody(t)),
-			class:    ClassFetch,
+			class:    classFetch,
 			protocol: "version=2",
 			canonical: pkts(t, "command=fetch\n", "object-format=sha1\n", pktline.Delim,
 				"thin-pack\n", "no-progress\n", "ofs-delta\n", "want "+oidA+"\n", "want "+oidB+"\n", "done\n",
@@ -176,7 +176,7 @@ func TestClassifyCapturedRequests(t *testing.T) {
 			name: "v2 fetch with depth 1",
 			r: postV2(fetchBody(t, "thin-pack\n", "no-progress\n", "include-tag\n", "ofs-delta\n",
 				"deepen 1\n", "want "+oidA+"\n", "want "+oidB+"\n", "done\n")),
-			class:    ClassFetch,
+			class:    classFetch,
 			protocol: "version=2",
 			canonical: pkts(t, "command=fetch\n", "object-format=sha1\n", pktline.Delim,
 				"thin-pack\n", "no-progress\n", "include-tag\n", "ofs-delta\n",
@@ -186,31 +186,31 @@ func TestClassifyCapturedRequests(t *testing.T) {
 		{
 			name:      "v0 fetch",
 			r:         post(v0Body(t, v0Caps+" agent=git/2.54.0-Darwin")),
-			class:     ClassFetch,
+			class:     classFetch,
 			canonical: pkts(t, "want "+oidA+" "+v0Caps+"\n", pktline.Flush, "done\n"),
 		},
 		{
 			name:      "v0 fetch with explicit version 0",
 			r:         post(v0Body(t, v0Caps+" agent=git/2.54.0-Darwin"), "Git-Protocol", "version=0"),
-			class:     ClassFetch,
+			class:     classFetch,
 			protocol:  "version=0",
 			canonical: pkts(t, "want "+oidA+" "+v0Caps+"\n", pktline.Flush, "done\n"),
 		},
 		{
 			name:      "v0 fetch with depth",
 			r:         post(pkts(t, "want "+oidA+" side-band-64k agent=git/2.54.0\n", "want "+oidB+"\n", "shallow "+oidB+"\n", "deepen 1\n", pktline.Flush, "done\n")),
-			class:     ClassFetch,
+			class:     classFetch,
 			canonical: pkts(t, "want "+oidA+" side-band-64k\n", "want "+oidB+"\n", "shallow "+oidB+"\n", "deepen 1\n", pktline.Flush, "done\n"),
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req, bypass, reason := classify(t, tt.r)
+			req, bypass, reason := classifyRequest(t, tt.r)
 			if bypass {
-				t.Fatalf("Classify() bypassed with reason %q", reason)
+				t.Fatalf("classify() bypassed with reason %q", reason)
 			}
 			if req.Class != tt.class || req.Protocol != tt.protocol || req.Repo != testRepo {
-				t.Errorf("Classify() class, protocol, repo = %q, %q, %v; want %q, %q, %v",
+				t.Errorf("classify() class, protocol, repo = %q, %q, %v; want %q, %q, %v",
 					req.Class, req.Protocol, req.Repo, tt.class, tt.protocol, testRepo)
 			}
 			if !bytes.Equal(req.Body, tt.canonical) {
@@ -219,7 +219,7 @@ func TestClassifyCapturedRequests(t *testing.T) {
 			if req.Method != http.MethodPost || req.Endpoint != "git-upload-pack" ||
 				req.ContentType != "application/x-git-upload-pack-request" ||
 				req.Accept != "application/x-git-upload-pack-result" {
-				t.Errorf("Classify() upstream request shape = %q %q %q %q",
+				t.Errorf("classify() upstream request shape = %q %q %q %q",
 					req.Method, req.Endpoint, req.ContentType, req.Accept)
 			}
 			if want := wantKeyHash(tt.class, tt.protocol, tt.canonical); req.KeyHash != want {
@@ -230,21 +230,21 @@ func TestClassifyCapturedRequests(t *testing.T) {
 }
 
 func TestClassifyAdvertisement(t *testing.T) {
-	v0, bypass, reason := classify(t, get())
+	v0, bypass, reason := classifyRequest(t, get())
 	if bypass {
 		t.Fatalf("v0 advertisement bypassed with reason %q", reason)
 	}
-	v2, bypass, reason := classify(t, get("Git-Protocol", "version=2"))
+	v2, bypass, reason := classifyRequest(t, get("Git-Protocol", "version=2"))
 	if bypass {
 		t.Fatalf("v2 advertisement bypassed with reason %q", reason)
 	}
 	for _, req := range []Request{v0, v2} {
-		if req.Class != ClassAdvertisement || req.Method != http.MethodGet ||
+		if req.Class != classAdvertisement || req.Method != http.MethodGet ||
 			req.Endpoint != "info/refs?service=git-upload-pack" || req.Body != nil ||
 			req.ContentType != "" || req.Accept != "*/*" {
 			t.Errorf("advertisement request = %+v", req)
 		}
-		if want := wantKeyHash(ClassAdvertisement, req.Protocol, nil); req.KeyHash != want {
+		if want := wantKeyHash(classAdvertisement, req.Protocol, nil); req.KeyHash != want {
 			t.Errorf("KeyHash = %x, want %x", req.KeyHash, want)
 		}
 	}
@@ -276,24 +276,24 @@ func TestClassifyAcceptsAllowlistedFetchArguments(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			args := append([]any{"want " + oidA + "\n"}, tt.args...)
 			args = append(args, "done\n")
-			_, bypass, reason := classify(t, postV2(fetchBody(t, args...)))
+			_, bypass, reason := classifyRequest(t, postV2(fetchBody(t, args...)))
 			if bypass {
-				t.Fatalf("Classify() bypassed with reason %q", reason)
+				t.Fatalf("classify() bypassed with reason %q", reason)
 			}
 		})
 	}
 
 	t.Run("sha256 object format", func(t *testing.T) {
 		body := pkts(t, "command=fetch\n", "object-format=sha256\n", pktline.Delim, "want "+oid256+"\n", "done\n", pktline.Flush)
-		if _, bypass, reason := classify(t, postV2(body)); bypass {
-			t.Fatalf("Classify() bypassed with reason %q", reason)
+		if _, bypass, reason := classifyRequest(t, postV2(body)); bypass {
+			t.Fatalf("classify() bypassed with reason %q", reason)
 		}
 	})
 	t.Run("ls-refs without arguments", func(t *testing.T) {
 		body := pkts(t, "command=ls-refs\n", agent, pktline.Flush)
-		req, bypass, reason := classify(t, postV2(body))
+		req, bypass, reason := classifyRequest(t, postV2(body))
 		if bypass {
-			t.Fatalf("Classify() bypassed with reason %q", reason)
+			t.Fatalf("classify() bypassed with reason %q", reason)
 		}
 		if want := pkts(t, "command=ls-refs\n", pktline.Flush); !bytes.Equal(req.Body, want) {
 			t.Errorf("canonical body = %q, want %q", req.Body, want)
@@ -301,14 +301,14 @@ func TestClassifyAcceptsAllowlistedFetchArguments(t *testing.T) {
 	})
 }
 
-// allBypassReasons is the closed set Classify reports from.
+// allBypassReasons is the closed set classify reports from.
 var allBypassReasons = []string{
-	BypassTooLarge, BypassContentEncoding, BypassDecodeError, BypassFraming,
-	BypassTrailingBytes, BypassMultipleCommands, BypassDuplicateCapability,
-	BypassUnknownCapability, BypassUnknownArgument, BypassHasHave,
-	BypassMissingDone, BypassNoWant, BypassMissingProtocol,
-	BypassDuplicateProtocol, BypassBadProtocol, BypassBadFilter,
-	BypassBadSideband, BypassUnknownCommand, BypassNotAReadShape,
+	bypassTooLarge, bypassContentEncoding, bypassDecodeError, bypassFraming,
+	bypassTrailingBytes, bypassMultipleCommands, bypassDuplicateCapability,
+	bypassUnknownCapability, bypassUnknownArgument, bypassHasHave,
+	bypassMissingDone, bypassNoWant, bypassMissingProtocol,
+	bypassDuplicateProtocol, bypassBadProtocol, bypassBadFilter,
+	bypassBadSideband, bypassUnknownCommand, bypassNotAReadShape,
 }
 
 func TestClassifyBypassReasons(t *testing.T) {
@@ -331,96 +331,96 @@ func TestClassifyBypassReasons(t *testing.T) {
 		r      *http.Request
 		reason string
 	}{
-		{"body over the bound", postV2(largeFetchBody(t, testMaxBody)), BypassTooLarge},
-		{"decoded body over the bound", postV2(bomb, "Content-Encoding", "gzip"), BypassTooLarge},
-		{"brotli body", postV2(cloneFetchBody(t), "Content-Encoding", "br"), BypassContentEncoding},
-		{"two content encodings", postV2(cloneFetchBody(t), "Content-Encoding", "gzip", "Content-Encoding", "gzip"), BypassContentEncoding},
-		{"gzip header invalid", postV2(cloneFetchBody(t), "Content-Encoding", "gzip"), BypassDecodeError},
-		{"gzip member truncated", postV2(truncatedGzip, "Content-Encoding", "gzip"), BypassDecodeError},
-		{"bytes after gzip member", postV2(trailingMember, "Content-Encoding", "gzip"), BypassDecodeError},
-		{"invalid length", postV2([]byte("zzzz")), BypassFraming},
-		{"missing terminating flush", postV2(cloneFetchBody(t)[:len(cloneFetchBody(t))-4]), BypassFraming},
-		{"truncated packet", postV2(append(pkts(t, "command=fetch\n"), "0010want"...)), BypassFraming},
-		{"empty data packet", postV2(want(raw("0004"))), BypassFraming},
-		{"response-end packet", postV2(pkts(t, "command=fetch\n", pktline.ResponseEnd)), BypassFraming},
-		{"second delim", postV2(want(pktline.Delim)), BypassFraming},
-		{"v0 delim", post(pkts(t, "want "+oidA+" side-band-64k\n", pktline.Delim, pktline.Flush, "done\n")), BypassFraming},
-		{"v0 missing flush", post(pkts(t, "want "+oidA+" side-band-64k\n")), BypassFraming},
-		{"byte after flush", postV2(append(cloneFetchBody(t), '0')), BypassTrailingBytes},
-		{"second request after flush", postV2(append(cloneFetchBody(t), lsRefsBody(t)...)), BypassTrailingBytes},
-		{"v0 bytes after done", post(append(v0Body(t, "side-band-64k"), "0000"...)), BypassTrailingBytes},
-		{"two commands", postV2(pkts(t, "command=fetch\n", "command=ls-refs\n", pktline.Delim, "done\n", pktline.Flush)), BypassMultipleCommands},
-		{"two agents", postV2(pkts(t, "command=fetch\n", agent, agent, pktline.Delim, "want "+oidA+"\n", "done\n", pktline.Flush)), BypassDuplicateCapability},
-		{"two session ids", postV2(pkts(t, "command=ls-refs\n", "session-id=a\n", "session-id=b\n", pktline.Flush)), BypassDuplicateCapability},
-		{"v0 repeated capability", post(v0Body(t, "side-band-64k thin-pack side-band-64k")), BypassDuplicateCapability},
-		{"v0 two agents", post(v0Body(t, "side-band-64k agent=a agent=b")), BypassDuplicateCapability},
-		{"server-option capability", postV2(pkts(t, "command=fetch\n", "server-option=x\n", pktline.Delim, "want "+oidA+"\n", "done\n", pktline.Flush)), BypassUnknownCapability},
-		{"capability without value", postV2(pkts(t, "command=fetch\n", "thin-pack\n", pktline.Delim, "want "+oidA+"\n", "done\n", pktline.Flush)), BypassUnknownCapability},
-		{"unknown object format", postV2(pkts(t, "command=fetch\n", "object-format=md5\n", pktline.Delim, "want "+oidA+"\n", "done\n", pktline.Flush)), BypassUnknownCapability},
-		{"v0 unknown capability", post(v0Body(t, "side-band-64k report-status")), BypassUnknownCapability},
-		{"v0 empty capability", post(v0Body(t, "side-band-64k  thin-pack")), BypassUnknownCapability},
-		{"want-ref", postV2(want("want-ref refs/heads/main\n")), BypassUnknownArgument},
-		{"deepen-not", postV2(want("deepen-not refs/heads/main\n")), BypassUnknownArgument},
-		{"packfile-uris", postV2(want("packfile-uris https\n")), BypassUnknownArgument},
-		{"sideband-all", postV2(want("sideband-all\n")), BypassUnknownArgument},
-		{"wait-for-done", postV2(want("wait-for-done\n")), BypassUnknownArgument},
-		{"short want oid", postV2(want("want abc\n")), BypassUnknownArgument},
-		{"uppercase want oid", postV2(want("want " + strings.ToUpper(oidB) + "\n")), BypassUnknownArgument},
-		{"deepen 0", postV2(want("deepen 0\n")), BypassUnknownArgument},
-		{"unknown ls-refs argument", postV2(pkts(t, "command=ls-refs\n", pktline.Delim, "peel\n", "all-the-refs\n", pktline.Flush)), BypassUnknownArgument},
-		{"empty ref-prefix", postV2(pkts(t, "command=ls-refs\n", pktline.Delim, "ref-prefix \n", pktline.Flush)), BypassUnknownArgument},
-		{"v0 bad first oid", post(pkts(t, "want xyz side-band-64k\n", pktline.Flush, "done\n")), BypassUnknownArgument},
-		{"v0 capability on later want", post(pkts(t, "want "+oidA+" side-band-64k\n", "want "+oidB+" thin-pack\n", pktline.Flush, "done\n")), BypassUnknownArgument},
-		{"v0 done before flush", post(pkts(t, "want "+oidA+" side-band-64k\n", "done\n", pktline.Flush, "done\n")), BypassUnknownArgument},
-		{"v0 deepen-not", post(pkts(t, "want "+oidA+" side-band-64k\n", "deepen-not main\n", pktline.Flush, "done\n")), BypassUnknownArgument},
-		{"v0 unknown line after flush", post(pkts(t, "want "+oidA+" side-band-64k\n", pktline.Flush, "ready\n")), BypassUnknownArgument},
-		{"v2 have", postV2(want("have " + oidB + "\n")), BypassHasHave},
-		{"v0 have", post(pkts(t, "want "+oidA+" side-band-64k\n", pktline.Flush, "have "+oidB+"\n", "done\n")), BypassHasHave},
-		{"v2 without done", postV2(fetchBody(t, "want "+oidA+"\n")), BypassMissingDone},
-		{"v0 without done", post(pkts(t, "want "+oidA+" side-band-64k\n", "deepen 1\n", pktline.Flush)), BypassMissingDone},
-		{"v2 without want", postV2(fetchBody(t, "thin-pack\n", "done\n")), BypassNoWant},
-		{"v2 fetch without arguments", postV2(pkts(t, "command=fetch\n", pktline.Flush)), BypassNoWant},
-		{"v2 body without Git-Protocol", post(cloneFetchBody(t)), BypassMissingProtocol},
-		{"two Git-Protocol headers", postV2(cloneFetchBody(t), "Git-Protocol", "version=2"), BypassDuplicateProtocol},
-		{"two Git-Protocol headers on GET", get("Git-Protocol", "version=2", "Git-Protocol", "version=2"), BypassDuplicateProtocol},
-		{"unknown protocol version", post(cloneFetchBody(t), "Git-Protocol", "version=3"), BypassBadProtocol},
-		{"empty protocol value", get("Git-Protocol", ""), BypassBadProtocol},
-		{"protocol parameter without value", get("Git-Protocol", "version=2:object-format"), BypassBadProtocol},
-		{"protocol parameter with space", get("Git-Protocol", "version=2:a=b c"), BypassBadProtocol},
-		{"protocol version repeated", get("Git-Protocol", "version=2:version=0"), BypassBadProtocol},
-		{"protocol value too long", get("Git-Protocol", "version=2:k="+strings.Repeat("v", 300)), BypassBadProtocol},
-		{"v2 body declaring version 1", post(cloneFetchBody(t), "Git-Protocol", "version=1"), BypassBadProtocol},
-		{"v0 body declaring version 2", postV2(v0Body(t, "side-band-64k")), BypassBadProtocol},
-		{"combine filter", postV2(want("filter combine:blob:none+tree:0\n")), BypassBadFilter},
-		{"two filters", postV2(want("filter blob:none\n", "filter tree:0\n")), BypassBadFilter},
-		{"uppercase size unit", postV2(want("filter blob:limit=1K\n")), BypassBadFilter},
-		{"filter without spec", postV2(want("filter\n")), BypassBadFilter},
-		{"sparse path filter", postV2(want("filter sparse:path=/x\n")), BypassBadFilter},
-		{"short sparse oid", postV2(want("filter sparse:oid=abc\n")), BypassBadFilter},
-		{"unknown object type", postV2(want("filter object:type=any\n")), BypassBadFilter},
-		{"v0 without sideband", post(v0Body(t, "thin-pack ofs-delta agent=git/2.54.0")), BypassBadSideband},
-		{"v0 without capabilities", post(pkts(t, "want "+oidA+"\n", pktline.Flush, "done\n")), BypassBadSideband},
-		{"object-info command", postV2(pkts(t, "command=object-info\n", pktline.Delim, "size\n", pktline.Flush)), BypassUnknownCommand},
-		{"bundle-uri command", postV2(pkts(t, "command=bundle-uri\n", pktline.Flush)), BypassUnknownCommand},
-		{"GET with body", getWithBody, BypassNotAReadShape},
-		{"GET with extra query", getWithQuery, BypassNotAReadShape},
-		{"POST with query", postWithQuery, BypassNotAReadShape},
-		{"wrong content type", wrongType, BypassNotAReadShape},
-		{"empty body", postV2(nil), BypassNotAReadShape},
-		{"flush only", postV2(pkts(t, pktline.Flush)), BypassNotAReadShape},
-		{"first line not a command or want", postV2(pkts(t, "have "+oidA+"\n", pktline.Flush)), BypassNotAReadShape},
+		{"body over the bound", postV2(largeFetchBody(t, testMaxBody)), bypassTooLarge},
+		{"decoded body over the bound", postV2(bomb, "Content-Encoding", "gzip"), bypassTooLarge},
+		{"brotli body", postV2(cloneFetchBody(t), "Content-Encoding", "br"), bypassContentEncoding},
+		{"two content encodings", postV2(cloneFetchBody(t), "Content-Encoding", "gzip", "Content-Encoding", "gzip"), bypassContentEncoding},
+		{"gzip header invalid", postV2(cloneFetchBody(t), "Content-Encoding", "gzip"), bypassDecodeError},
+		{"gzip member truncated", postV2(truncatedGzip, "Content-Encoding", "gzip"), bypassDecodeError},
+		{"bytes after gzip member", postV2(trailingMember, "Content-Encoding", "gzip"), bypassDecodeError},
+		{"invalid length", postV2([]byte("zzzz")), bypassFraming},
+		{"missing terminating flush", postV2(cloneFetchBody(t)[:len(cloneFetchBody(t))-4]), bypassFraming},
+		{"truncated packet", postV2(append(pkts(t, "command=fetch\n"), "0010want"...)), bypassFraming},
+		{"empty data packet", postV2(want(raw("0004"))), bypassFraming},
+		{"response-end packet", postV2(pkts(t, "command=fetch\n", pktline.ResponseEnd)), bypassFraming},
+		{"second delim", postV2(want(pktline.Delim)), bypassFraming},
+		{"v0 delim", post(pkts(t, "want "+oidA+" side-band-64k\n", pktline.Delim, pktline.Flush, "done\n")), bypassFraming},
+		{"v0 missing flush", post(pkts(t, "want "+oidA+" side-band-64k\n")), bypassFraming},
+		{"byte after flush", postV2(append(cloneFetchBody(t), '0')), bypassTrailingBytes},
+		{"second request after flush", postV2(append(cloneFetchBody(t), lsRefsBody(t)...)), bypassTrailingBytes},
+		{"v0 bytes after done", post(append(v0Body(t, "side-band-64k"), "0000"...)), bypassTrailingBytes},
+		{"two commands", postV2(pkts(t, "command=fetch\n", "command=ls-refs\n", pktline.Delim, "done\n", pktline.Flush)), bypassMultipleCommands},
+		{"two agents", postV2(pkts(t, "command=fetch\n", agent, agent, pktline.Delim, "want "+oidA+"\n", "done\n", pktline.Flush)), bypassDuplicateCapability},
+		{"two session ids", postV2(pkts(t, "command=ls-refs\n", "session-id=a\n", "session-id=b\n", pktline.Flush)), bypassDuplicateCapability},
+		{"v0 repeated capability", post(v0Body(t, "side-band-64k thin-pack side-band-64k")), bypassDuplicateCapability},
+		{"v0 two agents", post(v0Body(t, "side-band-64k agent=a agent=b")), bypassDuplicateCapability},
+		{"server-option capability", postV2(pkts(t, "command=fetch\n", "server-option=x\n", pktline.Delim, "want "+oidA+"\n", "done\n", pktline.Flush)), bypassUnknownCapability},
+		{"capability without value", postV2(pkts(t, "command=fetch\n", "thin-pack\n", pktline.Delim, "want "+oidA+"\n", "done\n", pktline.Flush)), bypassUnknownCapability},
+		{"unknown object format", postV2(pkts(t, "command=fetch\n", "object-format=md5\n", pktline.Delim, "want "+oidA+"\n", "done\n", pktline.Flush)), bypassUnknownCapability},
+		{"v0 unknown capability", post(v0Body(t, "side-band-64k report-status")), bypassUnknownCapability},
+		{"v0 empty capability", post(v0Body(t, "side-band-64k  thin-pack")), bypassUnknownCapability},
+		{"want-ref", postV2(want("want-ref refs/heads/main\n")), bypassUnknownArgument},
+		{"deepen-not", postV2(want("deepen-not refs/heads/main\n")), bypassUnknownArgument},
+		{"packfile-uris", postV2(want("packfile-uris https\n")), bypassUnknownArgument},
+		{"sideband-all", postV2(want("sideband-all\n")), bypassUnknownArgument},
+		{"wait-for-done", postV2(want("wait-for-done\n")), bypassUnknownArgument},
+		{"short want oid", postV2(want("want abc\n")), bypassUnknownArgument},
+		{"uppercase want oid", postV2(want("want " + strings.ToUpper(oidB) + "\n")), bypassUnknownArgument},
+		{"deepen 0", postV2(want("deepen 0\n")), bypassUnknownArgument},
+		{"unknown ls-refs argument", postV2(pkts(t, "command=ls-refs\n", pktline.Delim, "peel\n", "all-the-refs\n", pktline.Flush)), bypassUnknownArgument},
+		{"empty ref-prefix", postV2(pkts(t, "command=ls-refs\n", pktline.Delim, "ref-prefix \n", pktline.Flush)), bypassUnknownArgument},
+		{"v0 bad first oid", post(pkts(t, "want xyz side-band-64k\n", pktline.Flush, "done\n")), bypassUnknownArgument},
+		{"v0 capability on later want", post(pkts(t, "want "+oidA+" side-band-64k\n", "want "+oidB+" thin-pack\n", pktline.Flush, "done\n")), bypassUnknownArgument},
+		{"v0 done before flush", post(pkts(t, "want "+oidA+" side-band-64k\n", "done\n", pktline.Flush, "done\n")), bypassUnknownArgument},
+		{"v0 deepen-not", post(pkts(t, "want "+oidA+" side-band-64k\n", "deepen-not main\n", pktline.Flush, "done\n")), bypassUnknownArgument},
+		{"v0 unknown line after flush", post(pkts(t, "want "+oidA+" side-band-64k\n", pktline.Flush, "ready\n")), bypassUnknownArgument},
+		{"v2 have", postV2(want("have " + oidB + "\n")), bypassHasHave},
+		{"v0 have", post(pkts(t, "want "+oidA+" side-band-64k\n", pktline.Flush, "have "+oidB+"\n", "done\n")), bypassHasHave},
+		{"v2 without done", postV2(fetchBody(t, "want "+oidA+"\n")), bypassMissingDone},
+		{"v0 without done", post(pkts(t, "want "+oidA+" side-band-64k\n", "deepen 1\n", pktline.Flush)), bypassMissingDone},
+		{"v2 without want", postV2(fetchBody(t, "thin-pack\n", "done\n")), bypassNoWant},
+		{"v2 fetch without arguments", postV2(pkts(t, "command=fetch\n", pktline.Flush)), bypassNoWant},
+		{"v2 body without Git-Protocol", post(cloneFetchBody(t)), bypassMissingProtocol},
+		{"two Git-Protocol headers", postV2(cloneFetchBody(t), "Git-Protocol", "version=2"), bypassDuplicateProtocol},
+		{"two Git-Protocol headers on GET", get("Git-Protocol", "version=2", "Git-Protocol", "version=2"), bypassDuplicateProtocol},
+		{"unknown protocol version", post(cloneFetchBody(t), "Git-Protocol", "version=3"), bypassBadProtocol},
+		{"empty protocol value", get("Git-Protocol", ""), bypassBadProtocol},
+		{"protocol parameter without value", get("Git-Protocol", "version=2:object-format"), bypassBadProtocol},
+		{"protocol parameter with space", get("Git-Protocol", "version=2:a=b c"), bypassBadProtocol},
+		{"protocol version repeated", get("Git-Protocol", "version=2:version=0"), bypassBadProtocol},
+		{"protocol value too long", get("Git-Protocol", "version=2:k="+strings.Repeat("v", 300)), bypassBadProtocol},
+		{"v2 body declaring version 1", post(cloneFetchBody(t), "Git-Protocol", "version=1"), bypassBadProtocol},
+		{"v0 body declaring version 2", postV2(v0Body(t, "side-band-64k")), bypassBadProtocol},
+		{"combine filter", postV2(want("filter combine:blob:none+tree:0\n")), bypassBadFilter},
+		{"two filters", postV2(want("filter blob:none\n", "filter tree:0\n")), bypassBadFilter},
+		{"uppercase size unit", postV2(want("filter blob:limit=1K\n")), bypassBadFilter},
+		{"filter without spec", postV2(want("filter\n")), bypassBadFilter},
+		{"sparse path filter", postV2(want("filter sparse:path=/x\n")), bypassBadFilter},
+		{"short sparse oid", postV2(want("filter sparse:oid=abc\n")), bypassBadFilter},
+		{"unknown object type", postV2(want("filter object:type=any\n")), bypassBadFilter},
+		{"v0 without sideband", post(v0Body(t, "thin-pack ofs-delta agent=git/2.54.0")), bypassBadSideband},
+		{"v0 without capabilities", post(pkts(t, "want "+oidA+"\n", pktline.Flush, "done\n")), bypassBadSideband},
+		{"object-info command", postV2(pkts(t, "command=object-info\n", pktline.Delim, "size\n", pktline.Flush)), bypassUnknownCommand},
+		{"bundle-uri command", postV2(pkts(t, "command=bundle-uri\n", pktline.Flush)), bypassUnknownCommand},
+		{"GET with body", getWithBody, bypassNotAReadShape},
+		{"GET with extra query", getWithQuery, bypassNotAReadShape},
+		{"POST with query", postWithQuery, bypassNotAReadShape},
+		{"wrong content type", wrongType, bypassNotAReadShape},
+		{"empty body", postV2(nil), bypassNotAReadShape},
+		{"flush only", postV2(pkts(t, pktline.Flush)), bypassNotAReadShape},
+		{"first line not a command or want", postV2(pkts(t, "have "+oidA+"\n", pktline.Flush)), bypassNotAReadShape},
 	}
 
 	covered := map[string]bool{}
 	for _, tt := range tests {
 		covered[tt.reason] = true
 		t.Run(tt.name, func(t *testing.T) {
-			req, bypass, reason := classify(t, tt.r)
+			req, bypass, reason := classifyRequest(t, tt.r)
 			if !bypass || reason != tt.reason {
-				t.Fatalf("Classify() = bypass %v reason %q, want reason %q", bypass, reason, tt.reason)
+				t.Fatalf("classify() = bypass %v reason %q, want reason %q", bypass, reason, tt.reason)
 			}
 			if req.Class != "" || req.Body != nil {
-				t.Errorf("bypassed Classify() returned a request %+v", req)
+				t.Errorf("bypassed classify() returned a request %+v", req)
 			}
 		})
 	}
@@ -433,7 +433,7 @@ func TestClassifyBypassReasons(t *testing.T) {
 
 func TestClassifyGzipMatchesIdentity(t *testing.T) {
 	identity := cloneFetchBody(t)
-	plain, bypass, reason := classify(t, postV2(identity))
+	plain, bypass, reason := classifyRequest(t, postV2(identity))
 	if bypass {
 		t.Fatalf("identity body bypassed with reason %q", reason)
 	}
@@ -443,12 +443,12 @@ func TestClassifyGzipMatchesIdentity(t *testing.T) {
 			if encoding != "identity" {
 				body = gzipped(t, identity)
 			}
-			req, bypass, reason := classify(t, postV2(body, "Content-Encoding", encoding))
+			req, bypass, reason := classifyRequest(t, postV2(body, "Content-Encoding", encoding))
 			if bypass {
-				t.Fatalf("Classify() bypassed with reason %q", reason)
+				t.Fatalf("classify() bypassed with reason %q", reason)
 			}
-			if req.Class != ClassFetch || req.KeyHash != plain.KeyHash || !bytes.Equal(req.Body, plain.Body) {
-				t.Errorf("Classify() = %+v, want the identity twin %+v", req, plain)
+			if req.Class != classFetch || req.KeyHash != plain.KeyHash || !bytes.Equal(req.Body, plain.Body) {
+				t.Errorf("classify() = %+v, want the identity twin %+v", req, plain)
 			}
 		})
 	}
@@ -477,10 +477,10 @@ func TestClassifyIgnoresInformationalCapabilities(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			a, bypassA, reasonA := classify(t, tt.a)
-			b, bypassB, reasonB := classify(t, tt.b)
+			a, bypassA, reasonA := classifyRequest(t, tt.a)
+			b, bypassB, reasonB := classifyRequest(t, tt.b)
 			if bypassA || bypassB {
-				t.Fatalf("Classify() bypassed with reasons %q and %q", reasonA, reasonB)
+				t.Fatalf("classify() bypassed with reasons %q and %q", reasonA, reasonB)
 			}
 			if a.KeyHash != b.KeyHash || !bytes.Equal(a.Body, b.Body) {
 				t.Errorf("keys differ:\n%q\n%q", a.Body, b.Body)
@@ -495,9 +495,9 @@ func TestClassifyIgnoresInformationalCapabilities(t *testing.T) {
 func TestClassifyKeyDistinguishesRequests(t *testing.T) {
 	key := func(r *http.Request) [32]byte {
 		t.Helper()
-		req, bypass, reason := classify(t, r)
+		req, bypass, reason := classifyRequest(t, r)
 		if bypass {
-			t.Fatalf("Classify() bypassed with reason %q", reason)
+			t.Fatalf("classify() bypassed with reason %q", reason)
 		}
 		return req.KeyHash
 	}
@@ -541,9 +541,9 @@ func TestClassifyRestoresBody(t *testing.T) {
 			if tt.encoding != "" {
 				r.Header.Set("Content-Encoding", tt.encoding)
 			}
-			_, bypass, reason := classify(t, r)
+			_, bypass, reason := classifyRequest(t, r)
 			if bypass != tt.bypass {
-				t.Fatalf("Classify() bypass = %v (%q), want %v", bypass, reason, tt.bypass)
+				t.Fatalf("classify() bypass = %v (%q), want %v", bypass, reason, tt.bypass)
 			}
 			got, err := io.ReadAll(r.Body)
 			if err != nil {
@@ -593,9 +593,9 @@ func TestClassifyErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, bypass, reason, err := Classify(tt.r, tt.repo, tt.maxBody)
+			_, bypass, reason, err := classify(tt.r, tt.repo, tt.maxBody)
 			if err == nil {
-				t.Fatalf("Classify() error = nil (bypass %v, reason %q), want an error", bypass, reason)
+				t.Fatalf("classify() error = nil (bypass %v, reason %q), want an error", bypass, reason)
 			}
 		})
 	}

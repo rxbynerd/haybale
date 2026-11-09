@@ -15,17 +15,17 @@ import (
 //
 //	preamble (37 bytes, clear text)
 //	  magic        4 bytes  "HBCE"
-//	  version      2 bytes  FormatVersion
-//	  key id       8 bytes  lowercase hex, see Keyring.ActiveID
+//	  version      2 bytes  formatVersion
+//	  key id       8 bytes  lowercase hex, see Keyring.activeID
 //	  salt        16 bytes  random per entry; derives the entry key
 //	  nonce prefix 7 bytes  random per entry
 //	header (4096 bytes)
-//	  AES-256-GCM seal of a 4080-byte header record (Header fields, then
+//	  AES-256-GCM seal of a 4080-byte header record (entryHeader fields, then
 //	  zero padding); nonce = prefix || counter 0 || flag 0x02; associated
 //	  data = the preamble
 //	body segments, counters 1, 2, ..., each framed as
-//	  length       4 bytes  ciphertext length, 17 to SegmentSize+16
-//	  ciphertext            AES-256-GCM seal of 1 to SegmentSize body
+//	  length       4 bytes  ciphertext length, 17 to segmentSize+16
+//	  ciphertext            AES-256-GCM seal of 1 to segmentSize body
 //	                        bytes; nonce = prefix || counter || flag 0x00;
 //	                        associated data = SHA-256(preamble || header
 //	                        record)
@@ -48,10 +48,10 @@ import (
 // body to the Group, RepoHash and KeyHash in the header; a reader that
 // checks those against the path it asked for detects relocation.
 const (
-	// FormatVersion is the sealed entry format version this package writes.
-	FormatVersion = 1
-	// SegmentSize is the largest plaintext a body segment holds.
-	SegmentSize = 64 << 10
+	// formatVersion is the sealed entry format version this package writes.
+	formatVersion = 1
+	// segmentSize is the largest plaintext a body segment holds.
+	segmentSize = 64 << 10
 
 	magic             = "HBCE"
 	saltLen           = 16
@@ -62,7 +62,7 @@ const (
 	headerSealedLen   = 4096
 	headerRecordLen   = headerSealedLen - tagLen
 	headerFixedPrefix = preambleLen + headerSealedLen
-	maxSegmentCTLen   = SegmentSize + tagLen
+	maxSegmentCTLen   = segmentSize + tagLen
 	trailerPlainLen   = 8
 	trailerCTLen      = trailerPlainLen + tagLen
 	segmentOverhead   = frameLen + tagLen
@@ -72,7 +72,7 @@ const (
 	flagHeader = 0x02
 )
 
-// Bounds on the variable-length Header fields. Their encoded total always
+// Bounds on the variable-length entryHeader fields. Their encoded total always
 // fits headerRecordLen.
 const (
 	maxLabelLen       = 32
@@ -82,14 +82,14 @@ const (
 	maxProtocolLen    = 256
 )
 
-// Header is the authenticated metadata sealed at the front of every entry.
+// entryHeader is the authenticated metadata sealed at the front of every entry.
 // It holds only what is known when a response starts; the body length is
 // in the trailer.
-type Header struct {
-	// Version is the format version. NewSealedWriter sets it; a caller
-	// value other than zero or FormatVersion is rejected.
+type entryHeader struct {
+	// Version is the format version. newSealedWriter sets it; a caller
+	// value other than zero or formatVersion is rejected.
 	Version uint16
-	// KeyID is the id of the key the entry is sealed under. NewSealedWriter
+	// KeyID is the id of the key the entry is sealed under. newSealedWriter
 	// sets it; a caller value other than "" or the active id is rejected.
 	KeyID    string
 	Group    Group
@@ -106,24 +106,24 @@ type Header struct {
 	Protocol string
 }
 
-// SealedSize returns the sealed size of an entry whose body is bodyLen
+// sealedSize returns the sealed size of an entry whose body is bodyLen
 // bytes written without Flush, so that every segment but the last is full.
 // It is the reservation a fill makes for a body of known length. Each
 // Flush that seals a partial segment adds up to 20 bytes beyond it, which
 // the fill must reserve as it goes. A negative bodyLen returns -1.
-func SealedSize(bodyLen int64) int64 {
+func sealedSize(bodyLen int64) int64 {
 	if bodyLen < 0 {
 		return -1
 	}
-	segments := (bodyLen + SegmentSize - 1) / SegmentSize
+	segments := (bodyLen + segmentSize - 1) / segmentSize
 	return int64(headerFixedPrefix) + bodyLen + segments*segmentOverhead + frameLen + trailerCTLen
 }
 
-// SealedWriter seals a body into an entry written to an underlying
+// sealedWriter seals a body into an entry written to an underlying
 // io.Writer. It buffers at most one segment and writes each sealed segment
 // with a single Write call. It is not safe for concurrent use. After any
 // error the writer is unusable and returns that error.
-type SealedWriter struct {
+type sealedWriter struct {
 	w      io.Writer
 	aead   cipher.AEAD
 	prefix [noncePrefixLen]byte
@@ -137,31 +137,31 @@ type SealedWriter struct {
 	err     error
 }
 
-// NewSealedWriter writes the preamble and sealed header for h, under a
+// newSealedWriter writes the preamble and sealed header for h, under a
 // key derived from kr's active key and a fresh salt, to w and returns a
 // writer for the body. Close must be called to write the trailer; without
 // it the entry fails verification.
-func NewSealedWriter(w io.Writer, kr Keyring, h Header) (*SealedWriter, error) {
-	id := kr.ActiveID()
+func newSealedWriter(w io.Writer, kr Keyring, h entryHeader) (*sealedWriter, error) {
+	id := kr.activeID()
 	if !kr.holds(id) {
 		return nil, errors.New("cache: keyring has no active key")
 	}
-	if h.Version != 0 && h.Version != FormatVersion {
-		return nil, fmt.Errorf("cache: header version %d is not %d", h.Version, FormatVersion)
+	if h.Version != 0 && h.Version != formatVersion {
+		return nil, fmt.Errorf("cache: header version %d is not %d", h.Version, formatVersion)
 	}
 	if h.KeyID != "" && h.KeyID != id {
 		return nil, fmt.Errorf("cache: header key id %q is not the active key id %q", h.KeyID, id)
 	}
-	h.Version = FormatVersion
+	h.Version = formatVersion
 	h.KeyID = id
 	record, err := encodeHeader(h)
 	if err != nil {
 		return nil, err
 	}
 
-	sw := &SealedWriter{
+	sw := &sealedWriter{
 		w:       w,
-		buf:     make([]byte, 0, SegmentSize),
+		buf:     make([]byte, 0, segmentSize),
 		out:     make([]byte, 0, frameLen+maxSegmentCTLen),
 		counter: 1,
 	}
@@ -190,20 +190,20 @@ func NewSealedWriter(w io.Writer, kr Keyring, h Header) (*SealedWriter, error) {
 	return sw, nil
 }
 
-// Write buffers p and seals a segment each time SegmentSize bytes are
+// Write buffers p and seals a segment each time segmentSize bytes are
 // buffered.
-func (sw *SealedWriter) Write(p []byte) (int, error) {
+func (sw *sealedWriter) Write(p []byte) (int, error) {
 	if err := sw.usable(); err != nil {
 		return 0, err
 	}
 	n := 0
 	for len(p) > 0 {
-		c := copy(sw.buf[len(sw.buf):SegmentSize], p)
+		c := copy(sw.buf[len(sw.buf):segmentSize], p)
 		sw.buf = sw.buf[:len(sw.buf)+c]
 		p = p[c:]
 		n += c
 		sw.total += int64(c)
-		if len(sw.buf) == SegmentSize {
+		if len(sw.buf) == segmentSize {
 			if err := sw.flush(); err != nil {
 				return n, err
 			}
@@ -214,7 +214,7 @@ func (sw *SealedWriter) Write(p []byte) (int, error) {
 
 // Flush seals any buffered bytes as a segment so that readers can release
 // them. It is a no-op when nothing is buffered.
-func (sw *SealedWriter) Flush() error {
+func (sw *sealedWriter) Flush() error {
 	if err := sw.usable(); err != nil {
 		return err
 	}
@@ -223,7 +223,7 @@ func (sw *SealedWriter) Flush() error {
 
 // Close seals any buffered bytes and writes the trailer. It does not close
 // the underlying writer. Calling Close again returns nil.
-func (sw *SealedWriter) Close() error {
+func (sw *sealedWriter) Close() error {
 	if sw.err != nil {
 		return sw.err
 	}
@@ -243,9 +243,9 @@ func (sw *SealedWriter) Close() error {
 }
 
 // Written returns the number of body bytes accepted so far.
-func (sw *SealedWriter) Written() int64 { return sw.total }
+func (sw *sealedWriter) written() int64 { return sw.total }
 
-func (sw *SealedWriter) usable() error {
+func (sw *sealedWriter) usable() error {
 	if sw.err != nil {
 		return sw.err
 	}
@@ -255,7 +255,7 @@ func (sw *SealedWriter) usable() error {
 	return nil
 }
 
-func (sw *SealedWriter) flush() error {
+func (sw *sealedWriter) flush() error {
 	if len(sw.buf) == 0 {
 		return nil
 	}
@@ -267,13 +267,13 @@ func (sw *SealedWriter) flush() error {
 }
 
 // seal seals plain as the next segment and writes it with its frame.
-func (sw *SealedWriter) seal(plain []byte, flag byte) error {
+func (sw *sealedWriter) seal(plain []byte, flag byte) error {
 	if sw.counter == 0 {
 		sw.err = errors.New("cache: entry exceeds the maximum segment count")
 		return sw.err
 	}
 	nonce := segmentNonce(sw.prefix, sw.counter, flag)
-	out := binary.BigEndian.AppendUint32(sw.out[:0], uint32(len(plain)+tagLen)) //nolint:gosec // at most SegmentSize+tagLen
+	out := binary.BigEndian.AppendUint32(sw.out[:0], uint32(len(plain)+tagLen)) //nolint:gosec // at most segmentSize+tagLen
 	out = sw.aead.Seal(out, nonce[:], plain, sw.aad[:])
 	if _, err := sw.w.Write(out); err != nil {
 		sw.err = err
@@ -284,17 +284,17 @@ func (sw *SealedWriter) seal(plain []byte, flag byte) error {
 	return nil
 }
 
-// SealedReader verifies and decrypts an entry. Each segment is
+// sealedReader verifies and decrypts an entry. Each segment is
 // authenticated before any of its plaintext is returned. It reads one
 // framed segment at a time, so it can follow a source that is still being
 // written as long as reads block until data is available. It is not safe
 // for concurrent use.
-type SealedReader struct {
+type sealedReader struct {
 	r      io.Reader
 	aead   cipher.AEAD
 	prefix [noncePrefixLen]byte
 	aad    [sha256.Size]byte
-	header Header
+	header entryHeader
 
 	frame   [frameLen]byte
 	ct      []byte
@@ -306,11 +306,11 @@ type SealedReader struct {
 	err     error
 }
 
-// NewSealedReader reads and verifies the preamble and header from r using
+// newSealedReader reads and verifies the preamble and header from r using
 // the key named in the preamble. An unknown magic, version or key id, or a
 // header that fails authentication or decoding, is ErrIntegrity. Errors
 // from r other than a premature EOF are returned unchanged.
-func NewSealedReader(r io.Reader, kr Keyring) (*SealedReader, error) {
+func newSealedReader(r io.Reader, kr Keyring) (*sealedReader, error) {
 	buf := make([]byte, headerFixedPrefix)
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return nil, truncated(err, "header")
@@ -319,7 +319,7 @@ func NewSealedReader(r io.Reader, kr Keyring) (*SealedReader, error) {
 	if string(preamble[:len(magic)]) != magic {
 		return nil, fmt.Errorf("%w: unknown magic", ErrIntegrity)
 	}
-	if v := binary.BigEndian.Uint16(preamble[len(magic):]); v != FormatVersion {
+	if v := binary.BigEndian.Uint16(preamble[len(magic):]); v != formatVersion {
 		return nil, fmt.Errorf("%w: unknown format version %d", ErrIntegrity, v)
 	}
 	id := string(preamble[len(magic)+2 : len(magic)+2+keyIDLen])
@@ -328,11 +328,11 @@ func NewSealedReader(r io.Reader, kr Keyring) (*SealedReader, error) {
 	}
 	salt := preamble[len(magic)+2+keyIDLen : len(magic)+2+keyIDLen+saltLen]
 	gcm, _ := kr.aead(id, salt)
-	sr := &SealedReader{
+	sr := &sealedReader{
 		r:       r,
 		aead:    gcm,
 		ct:      make([]byte, maxSegmentCTLen),
-		pt:      make([]byte, 0, SegmentSize),
+		pt:      make([]byte, 0, segmentSize),
 		counter: 1,
 	}
 	copy(sr.prefix[:], preamble[len(magic)+2+keyIDLen+saltLen:])
@@ -346,7 +346,7 @@ func NewSealedReader(r io.Reader, kr Keyring) (*SealedReader, error) {
 	if err != nil {
 		return nil, err
 	}
-	if h.Version != FormatVersion || h.KeyID != id {
+	if h.Version != formatVersion || h.KeyID != id {
 		return nil, fmt.Errorf("%w: header does not match preamble", ErrIntegrity)
 	}
 	sr.header = h
@@ -355,11 +355,11 @@ func NewSealedReader(r io.Reader, kr Keyring) (*SealedReader, error) {
 }
 
 // Header returns the verified entry header.
-func (sr *SealedReader) Header() Header { return sr.header }
+func (sr *sealedReader) Header() entryHeader { return sr.header }
 
 // BodyLength returns the body length recorded in the trailer and true once
 // Read has verified the trailer, and false before.
-func (sr *SealedReader) BodyLength() (int64, bool) {
+func (sr *sealedReader) bodyLength() (int64, bool) {
 	if !sr.done {
 		return 0, false
 	}
@@ -369,7 +369,7 @@ func (sr *SealedReader) BodyLength() (int64, bool) {
 // Read returns verified plaintext. It returns io.EOF only after the
 // trailer has been verified against the bytes released and the source has
 // ended, and ErrIntegrity for a truncated, reordered or modified entry.
-func (sr *SealedReader) Read(p []byte) (int, error) {
+func (sr *sealedReader) Read(p []byte) (int, error) {
 	for sr.off == len(sr.pt) {
 		if sr.err != nil {
 			return 0, sr.err
@@ -386,7 +386,7 @@ func (sr *SealedReader) Read(p []byte) (int, error) {
 
 // next reads and verifies the next segment, leaving body plaintext in
 // sr.pt or, for the trailer, checking the length and the end of the source.
-func (sr *SealedReader) next() error {
+func (sr *sealedReader) next() error {
 	if _, err := io.ReadFull(sr.r, sr.frame[:]); err != nil {
 		return truncated(err, "before the trailer")
 	}
@@ -444,7 +444,7 @@ func truncated(err error, where string) error {
 
 func appendPreamble(dst []byte, keyID string, salt [saltLen]byte, prefix [noncePrefixLen]byte) []byte {
 	dst = append(dst, magic...)
-	dst = binary.BigEndian.AppendUint16(dst, FormatVersion)
+	dst = binary.BigEndian.AppendUint16(dst, formatVersion)
 	dst = append(dst, keyID...)
 	dst = append(dst, salt[:]...)
 	return append(dst, prefix[:]...)
@@ -470,7 +470,7 @@ func headerDigest(preamble, record []byte) [sha256.Size]byte {
 // encodeHeader encodes h as a headerRecordLen-byte record: the fields in
 // declaration order, strings as a 2-byte length then bytes, CreatedAt as
 // 8-byte Unix seconds then 4-byte nanoseconds, then zero padding.
-func encodeHeader(h Header) ([]byte, error) {
+func encodeHeader(h entryHeader) ([]byte, error) {
 	fields := []struct {
 		name  string
 		value string
@@ -513,9 +513,9 @@ func appendString(b []byte, s string) []byte {
 
 // decodeHeader decodes a record written by encodeHeader. Anything other
 // than an exact encoding followed by zero padding is ErrIntegrity.
-func decodeHeader(record []byte) (Header, error) {
+func decodeHeader(record []byte) (entryHeader, error) {
 	d := headerDecoder{b: record}
-	var h Header
+	var h entryHeader
 	h.Version = d.uint16()
 	h.KeyID = d.string(keyIDLen)
 	h.Group = Group(d.string(maxLabelLen))
@@ -529,11 +529,11 @@ func decodeHeader(record []byte) (Header, error) {
 	h.ContentType = d.string(maxContentTypeLen)
 	h.Protocol = d.string(maxProtocolLen)
 	if d.bad || nsec >= 1e9 {
-		return Header{}, fmt.Errorf("%w: malformed header", ErrIntegrity)
+		return entryHeader{}, fmt.Errorf("%w: malformed header", ErrIntegrity)
 	}
 	for _, c := range d.b {
 		if c != 0 {
-			return Header{}, fmt.Errorf("%w: malformed header padding", ErrIntegrity)
+			return entryHeader{}, fmt.Errorf("%w: malformed header padding", ErrIntegrity)
 		}
 	}
 	h.CreatedAt = time.Unix(sec, int64(nsec)).UTC()

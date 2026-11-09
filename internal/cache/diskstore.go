@@ -19,11 +19,11 @@ import (
 )
 
 var (
-	// ErrBudget is returned when a reservation cannot fit within the disk
+	// errBudget is returned when a reservation cannot fit within the disk
 	// budget even after evicting every unopened entry.
-	ErrBudget = errors.New("cache: disk budget exhausted")
-	// ErrSpoolAborted is the error spool readers receive after Abort.
-	ErrSpoolAborted = errors.New("cache: spool aborted")
+	errBudget = errors.New("cache: disk budget exhausted")
+	// errSpoolAborted is the error spool readers receive after Abort.
+	errSpoolAborted = errors.New("cache: spool aborted")
 
 	errStoreClosed = errors.New("cache: disk store is closed")
 	errInvalidPath = errors.New("cache: invalid entry path")
@@ -46,7 +46,7 @@ const (
 // run as pid 1 across restarts.
 var processTempToken = sync.OnceValue(func() string { return randomHex(tempTokenLen / 2) })
 
-// DiskStore is the local disk tier: committed sealed entries addressed by
+// diskStore is the local disk tier: committed sealed entries addressed by
 // "v1/<group>/<repoHash hex>/<keyHash hex>" paths, and spools for entries
 // being written. It moves opaque bytes and knows nothing about
 // repositories or keys. Every file operation goes through an os.Root
@@ -65,9 +65,9 @@ var processTempToken = sync.OnceValue(func() string { return randomHex(tempToken
 // One lock orders reader attach and detach, commits, deletions and
 // eviction, so a reader can never open an entry that is being evicted and
 // eviction never touches an entry or spool that is open. A directory must
-// be served by one DiskStore at a time: opening a store deletes temporary
+// be served by one diskStore at a time: opening a store deletes temporary
 // files left by any other process.
-type DiskStore struct {
+type diskStore struct {
 	root       *os.Root
 	dir        string
 	budget     int64
@@ -80,7 +80,7 @@ type DiskStore struct {
 	closed    bool
 	entries   map[string]*entryState
 	lru       list.List // of *entryState; front is most recently used
-	spools    map[string]*Spool
+	spools    map[string]*spool
 	seq       uint64
 	committed int64
 	inflight  int64
@@ -99,7 +99,7 @@ type entryState struct {
 	seq     uint64
 }
 
-// OpenDiskStore opens the cache directory dir with a budget of budget
+// openDiskStore opens the cache directory dir with a budget of budget
 // bytes. The directory is created with mode 0700 when it does not exist
 // (its parent must), so an operator can mount a root-owned volume at the
 // parent and point the cache at a child. It must be owned by the process
@@ -107,7 +107,7 @@ type entryState struct {
 // permissions. Committed entries are indexed for the budget, and temporary
 // files from other processes are deleted. A nil logger discards, nil
 // metrics record nothing, and a nil now uses time.Now.
-func OpenDiskStore(dir string, budget int64, logger *slog.Logger, metrics *observability.Metrics, now func() time.Time) (*DiskStore, error) {
+func openDiskStore(dir string, budget int64, logger *slog.Logger, metrics *observability.Metrics, now func() time.Time) (*diskStore, error) {
 	if budget <= 0 {
 		return nil, fmt.Errorf("cache: disk budget must be greater than zero, got %d", budget)
 	}
@@ -136,7 +136,7 @@ func OpenDiskStore(dir string, budget int64, logger *slog.Logger, metrics *obser
 		_ = root.Close()
 		return nil, err
 	}
-	s := &DiskStore{
+	s := &diskStore{
 		root:       root,
 		dir:        dir,
 		budget:     budget,
@@ -145,7 +145,7 @@ func OpenDiskStore(dir string, budget int64, logger *slog.Logger, metrics *obser
 		now:        now,
 		tempPrefix: tempNamePrefix + processTempToken() + "-",
 		entries:    make(map[string]*entryState),
-		spools:     make(map[string]*Spool),
+		spools:     make(map[string]*spool),
 	}
 	res, err := s.scan()
 	if err != nil {
@@ -162,11 +162,11 @@ func OpenDiskStore(dir string, budget int64, logger *slog.Logger, metrics *obser
 	}
 	for _, name := range res.temps {
 		if !strings.HasPrefix(name, s.tempPrefix) {
-			s.removeLocked(name, "sweep")
+			s.removeLocked(name, observability.OperationSweep)
 		}
 	}
 	for _, name := range res.irregular {
-		s.logger.Warn("cache: ignoring a non-regular file at an entry path", "path", name)
+		s.logger.Warn("ignoring a non-regular file at an entry path", "path", name)
 	}
 	s.reportLocked()
 	return s, nil
@@ -190,12 +190,12 @@ func checkCacheDir(dir string, info fs.FileInfo, uid int) error {
 	return nil
 }
 
-// Entry is an open committed entry. It reads the sealed bytes from a
+// storedEntry is an open committed entry. It reads the sealed bytes from a
 // descriptor of its own, so it stays readable after the entry is deleted,
 // evicted or replaced; its bytes count against the budget until Close.
-type Entry struct {
+type storedEntry struct {
 	f       *os.File
-	store   *DiskStore
+	store   *diskStore
 	state   *entryState
 	size    int64
 	modTime time.Time
@@ -204,7 +204,7 @@ type Entry struct {
 
 // Open opens the committed entry at path and marks it most recently used.
 // It returns ErrNotFound when there is no such entry.
-func (s *DiskStore) Open(path string) (*Entry, error) {
+func (s *diskStore) Open(path string) (*storedEntry, error) {
 	if !validEntryPath(path) {
 		return nil, fmt.Errorf("%w %q", errInvalidPath, path)
 	}
@@ -224,7 +224,7 @@ func (s *DiskStore) Open(path string) (*Entry, error) {
 			s.reportLocked()
 			return nil, ErrNotFound
 		}
-		s.storeError("open", err)
+		s.storeError(observability.OperationOpen, err)
 		return nil, err
 	}
 	info, err := f.Stat()
@@ -233,7 +233,7 @@ func (s *DiskStore) Open(path string) (*Entry, error) {
 	}
 	if err != nil {
 		_ = f.Close()
-		s.storeError("open", err)
+		s.storeError(observability.OperationOpen, err)
 		return nil, err
 	}
 	if info.Size() != es.size {
@@ -243,24 +243,24 @@ func (s *DiskStore) Open(path string) (*Entry, error) {
 	}
 	es.readers++
 	s.lru.MoveToFront(es.elem)
-	return &Entry{f: f, store: s, state: es, size: es.size, modTime: es.modTime}, nil
+	return &storedEntry{f: f, store: s, state: es, size: es.size, modTime: es.modTime}, nil
 }
 
 // Read reads sealed bytes.
-func (e *Entry) Read(p []byte) (int, error) { return e.f.Read(p) }
+func (e *storedEntry) Read(p []byte) (int, error) { return e.f.Read(p) }
 
 // Seek sets the offset of the next Read.
-func (e *Entry) Seek(offset int64, whence int) (int64, error) { return e.f.Seek(offset, whence) }
+func (e *storedEntry) Seek(offset int64, whence int) (int64, error) { return e.f.Seek(offset, whence) }
 
 // Size returns the sealed size of the entry in bytes.
-func (e *Entry) Size() int64 { return e.size }
+func (e *storedEntry) Size() int64 { return e.size }
 
 // ModTime returns the time the entry was committed.
-func (e *Entry) ModTime() time.Time { return e.modTime }
+func (e *storedEntry) ModTime() time.Time { return e.modTime }
 
 // Close closes the entry, releasing its pinned bytes if it was removed
 // while open. Calling Close again returns nil.
-func (e *Entry) Close() error {
+func (e *storedEntry) Close() error {
 	var err error
 	e.once.Do(func() {
 		err = e.f.Close()
@@ -274,7 +274,7 @@ func (e *Entry) Close() error {
 
 // Delete removes the entry at path. Readers that hold it open keep
 // reading it. Deleting an absent entry returns nil.
-func (s *DiskStore) Delete(path string) error {
+func (s *diskStore) Delete(path string) error {
 	if !validEntryPath(path) {
 		return fmt.Errorf("%w %q", errInvalidPath, path)
 	}
@@ -284,7 +284,7 @@ func (s *DiskStore) Delete(path string) error {
 		return errStoreClosed
 	}
 	if err := s.root.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		s.storeError("delete", err)
+		s.storeError(observability.OperationDelete, err)
 		return err
 	}
 	if es, ok := s.entries[path]; ok {
@@ -296,7 +296,7 @@ func (s *DiskStore) Delete(path string) error {
 
 // DeletePrefix removes every entry under prefix, which must have the form
 // "v1/<group>/<repoHash hex>/", and returns the number of files removed.
-func (s *DiskStore) DeletePrefix(prefix string) (int, error) {
+func (s *diskStore) DeletePrefix(prefix string) (int, error) {
 	dir, ok := strings.CutSuffix(prefix, "/")
 	if !ok || !validRepoDir(dir) {
 		return 0, fmt.Errorf("%w prefix %q", errInvalidPath, prefix)
@@ -314,7 +314,7 @@ func (s *DiskStore) DeletePrefix(prefix string) (int, error) {
 		}
 	})
 	if err != nil {
-		s.storeError("delete", err)
+		s.storeError(observability.OperationDelete, err)
 	}
 	for path, es := range s.entries {
 		if strings.HasPrefix(path, prefix) {
@@ -327,10 +327,10 @@ func (s *DiskStore) DeletePrefix(prefix string) (int, error) {
 }
 
 // PurgeDiskPrefix deletes every entry under prefix ("v1/<group>/<repoHash
-// hex>/") in the cache directory dir without opening a DiskStore, and
+// hex>/") in the cache directory dir without opening a diskStore, and
 // returns the number of files removed. It is for a separate process, such
 // as `haybale cache purge`, while a server may be using the directory: it
-// applies the same directory checks as OpenDiskStore but touches no
+// applies the same directory checks as openDiskStore but touches no
 // temporary file and no name outside the entry pattern. The server treats
 // a purged entry as a miss and corrects its accounting on its next sweep.
 func PurgeDiskPrefix(dir, prefix string) (n int, err error) {
@@ -385,7 +385,7 @@ func deleteRepoDir(root *os.Root, dir string, removed func(path string)) (int, e
 
 // Usage returns the bytes held by committed entries, reserved by live
 // spools, and pinned by readers of removed entries or ended spools.
-func (s *DiskStore) Usage() (committed, inflight, pinned int64) {
+func (s *diskStore) usage() (committed, inflight, pinned int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.committed, s.inflight, s.pinned
@@ -393,7 +393,7 @@ func (s *DiskStore) Usage() (committed, inflight, pinned int64) {
 
 // Close fails every live spool and closes the directory. Open entries and
 // readers stay readable until they are closed.
-func (s *DiskStore) Close() error {
+func (s *diskStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -408,7 +408,7 @@ func (s *DiskStore) Close() error {
 
 // indexLocked adds a committed entry to the index without placing it in
 // the LRU list.
-func (s *DiskStore) indexLocked(path string, size int64, modTime time.Time) *entryState {
+func (s *diskStore) indexLocked(path string, size int64, modTime time.Time) *entryState {
 	s.seq++
 	es := &entryState{path: path, size: size, modTime: modTime, seq: s.seq}
 	s.entries[path] = es
@@ -418,7 +418,7 @@ func (s *DiskStore) indexLocked(path string, size int64, modTime time.Time) *ent
 
 // dropLocked removes es from the index. Its bytes become pinned while it
 // has readers.
-func (s *DiskStore) dropLocked(es *entryState) {
+func (s *diskStore) dropLocked(es *entryState) {
 	if es.elem == nil {
 		return
 	}
@@ -432,7 +432,7 @@ func (s *DiskStore) dropLocked(es *entryState) {
 }
 
 // releaseLocked detaches one reader from es.
-func (s *DiskStore) releaseLocked(es *entryState) {
+func (s *diskStore) releaseLocked(es *entryState) {
 	es.readers--
 	if es.readers == 0 && es.elem == nil {
 		s.pinned -= es.size
@@ -441,9 +441,9 @@ func (s *DiskStore) releaseLocked(es *entryState) {
 
 // reserveLocked reserves n bytes for a spool, evicting unopened entries
 // from the least recently used end as needed.
-func (s *DiskStore) reserveLocked(n int64) error {
+func (s *diskStore) reserveLocked(n int64) error {
 	if n > s.budget {
-		return fmt.Errorf("%w: %d bytes exceed the %d-byte budget", ErrBudget, n, s.budget)
+		return fmt.Errorf("%w: %d bytes exceed the %d-byte budget", errBudget, n, s.budget)
 	}
 	if over := s.committed + s.inflight + s.pinned + n - s.budget; over > 0 {
 		if err := s.evictLocked(over); err != nil {
@@ -457,7 +457,7 @@ func (s *DiskStore) reserveLocked(n int64) error {
 // evictLocked frees at least need bytes by deleting unopened entries from
 // the least recently used end. It evicts nothing when that cannot free
 // enough.
-func (s *DiskStore) evictLocked(need int64) error {
+func (s *diskStore) evictLocked(need int64) error {
 	var candidates []*entryState
 	var available int64
 	for e := s.lru.Back(); e != nil && available < need; e = e.Prev() {
@@ -467,11 +467,11 @@ func (s *DiskStore) evictLocked(need int64) error {
 		}
 	}
 	if available < need {
-		return fmt.Errorf("%w: cannot free %d bytes", ErrBudget, need)
+		return fmt.Errorf("%w: cannot free %d bytes", errBudget, need)
 	}
 	var freed, evicted int64
 	for _, es := range candidates {
-		if !s.removeLocked(es.path, "evict") {
+		if !s.removeLocked(es.path, observability.OperationEvict) {
 			continue
 		}
 		freed += es.size
@@ -482,14 +482,14 @@ func (s *DiskStore) evictLocked(need int64) error {
 		s.metrics.RecordResponseCacheEvictions(context.Background(), evicted)
 	}
 	if freed < need {
-		return fmt.Errorf("%w: cannot free %d bytes", ErrBudget, need)
+		return fmt.Errorf("%w: cannot free %d bytes", errBudget, need)
 	}
 	return nil
 }
 
 // removeLocked deletes name if it is an entry path or temp-file name, and
 // reports whether it is gone.
-func (s *DiskStore) removeLocked(name, operation string) bool {
+func (s *diskStore) removeLocked(name, operation string) bool {
 	if !validEntryPath(name) && !validTempName(name) {
 		s.storeError(operation, fmt.Errorf("%w %q", errInvalidPath, name))
 		return false
@@ -503,16 +503,16 @@ func (s *DiskStore) removeLocked(name, operation string) bool {
 
 // reportLocked brings the disk-bytes gauge up to date with committed and
 // pinned bytes.
-func (s *DiskStore) reportLocked() {
+func (s *diskStore) reportLocked() {
 	if cur := s.committed + s.pinned; cur != s.reported {
 		s.metrics.ResponseCacheDiskBytesAdd(context.Background(), cur-s.reported)
 		s.reported = cur
 	}
 }
 
-func (s *DiskStore) storeError(operation string, err error) {
+func (s *diskStore) storeError(operation string, err error) {
 	s.metrics.RecordResponseCacheStoreError(context.Background(), observability.TierDisk, operation)
-	s.logger.Warn("cache: disk store operation failed", "operation", operation, "error", err)
+	s.logger.Warn("disk store operation failed", "operation", operation, "error", err)
 }
 
 // validEntryPath reports whether p is "v1/<refs|pack>/<64 hex>/<64 hex>".

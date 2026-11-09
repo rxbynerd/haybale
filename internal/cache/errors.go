@@ -10,7 +10,7 @@ import (
 )
 
 var (
-	// ErrNotFound is returned by DiskStore.Open and by a BlobStore for a
+	// ErrNotFound is returned by diskStore.Open and by a BlobStore for a
 	// key the tier does not hold.
 	ErrNotFound = errors.New("cache: object not found")
 	// ErrIntegrity is returned when a stored entry fails verification:
@@ -26,7 +26,7 @@ type ObjectInfo struct {
 	ModTime time.Time
 }
 
-// BlobStore is the optional remote storage tier. Keys are Key.Path
+// BlobStore is the optional remote storage tier. Keys are entryKey.Path
 // values. Implementations are safe for concurrent use; callers own
 // deadlines through ctx.
 type BlobStore interface {
