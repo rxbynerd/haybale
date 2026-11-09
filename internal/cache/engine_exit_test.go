@@ -923,6 +923,14 @@ func TestRefsFillCapBypassesTheNextRequest(t *testing.T) {
 		defer c.mu.Unlock()
 		return c.refsFills == maxRefsFills
 	})
+	// A slot is taken before the fetch runs, so every fill must also have
+	// handed over its body pipe before the pipes are written below;
+	// otherwise a fill that is slow to start would wait forever.
+	waitFor(t, "every refs fill to start fetching", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(bodies) == maxRefsFills
+	})
 	extra := &fixedFetcher{status: 200, contentType: contentTypeResult, body: lsRefsResultBody(t)}
 	if out, ok, _ := serve(c, httptest.NewRecorder(), postV2(lsRefsBody(t)), extra); ok || out.Result != observability.ResultBypass || extra.calls.Load() != 0 {
 		t.Errorf("refs request beyond the cap = %+v handled %v fetches %d, want an unfetched bypass", out, ok, extra.calls.Load())
