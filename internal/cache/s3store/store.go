@@ -234,7 +234,7 @@ func (s *Store) Put(ctx context.Context, key string, body io.ReadSeeker, size in
 		return fmt.Errorf("s3store: put %s: negative size %d", key, size)
 	}
 	if size > maxPutSize {
-		return fmt.Errorf("%w: put %s (%d bytes)", ErrTooLarge, key, size)
+		return fmt.Errorf("s3store: put %s (%d bytes, limit 5 GiB): %w", key, size, ErrTooLarge)
 	}
 	end, err := body.Seek(0, io.SeekEnd)
 	if err != nil {

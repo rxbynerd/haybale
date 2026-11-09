@@ -12,8 +12,10 @@ import (
 )
 
 // ErrTooLarge is returned by Put for an object larger than the 5 GiB
-// limit of a single PutObject request. No request is sent.
-var ErrTooLarge = errors.New("s3store: object exceeds the 5 GiB single-request upload limit")
+// limit of a single PutObject request. No request is sent. It is
+// cache.ErrTooLarge, so the cache can recognise it without importing this
+// package.
+var ErrTooLarge = cache.ErrTooLarge
 
 // errHeaderTimeout is the cancellation cause of a request whose response
 // did not arrive within Config.HeaderTimeout.

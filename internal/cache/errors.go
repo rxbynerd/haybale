@@ -17,6 +17,9 @@ var (
 	// truncation, reordering, relocation under another key, or
 	// modification.
 	ErrIntegrity = errors.New("cache: entry failed integrity check")
+	// ErrTooLarge is returned by a BlobStore's Put for an object larger
+	// than the store accepts in one request.
+	ErrTooLarge = errors.New("cache: object exceeds the remote store's upload size limit")
 )
 
 // ObjectInfo describes one object held by a BlobStore.
@@ -34,7 +37,8 @@ type BlobStore interface {
 	Stat(ctx context.Context, key string) (ObjectInfo, error)
 	// Get reads key from offset to its end.
 	Get(ctx context.Context, key string, offset int64) (io.ReadCloser, ObjectInfo, error)
-	// Put stores size bytes from body under key.
+	// Put stores size bytes from body under key. An object over the
+	// store's size limit returns an error matching ErrTooLarge.
 	Put(ctx context.Context, key string, body io.ReadSeeker, size int64) error
 	// Delete removes key and returns nil when it is already absent.
 	Delete(ctx context.Context, key string) error

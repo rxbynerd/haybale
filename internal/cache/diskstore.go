@@ -343,6 +343,19 @@ func (s *diskStore) DeletePrefix(prefix string) (int, error) {
 	return removed, err
 }
 
+// pathsUnder returns the paths of the indexed entries under prefix.
+func (s *diskStore) pathsUnder(prefix string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var paths []string
+	for path := range s.entries {
+		if strings.HasPrefix(path, prefix) {
+			paths = append(paths, path)
+		}
+	}
+	return paths
+}
+
 // removeForeignEntries deletes every indexed entry whose preamble does not
 // name keyID as its key, or that is too short or malformed to carry a
 // preamble, and returns how many were removed. It runs at startup before

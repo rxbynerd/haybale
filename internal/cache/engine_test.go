@@ -239,7 +239,6 @@ func TestNewRejectsBadOptions(t *testing.T) {
 		"zero fills":      func(o *Options) { o.MaxConcurrentFills = 0 },
 		"zero retention":  func(o *Options) { o.Retention = 0 },
 		"negative age":    func(o *Options) { o.RefsMaxAge = -1 },
-		"remote tier":     func(o *Options) { o.Remote = fakeBlobStore{} },
 	}
 	for name, mutate := range cases {
 		opts := valid
@@ -250,9 +249,6 @@ func TestNewRejectsBadOptions(t *testing.T) {
 		}
 	}
 }
-
-// fakeBlobStore is a non-nil BlobStore for the rejection test only.
-type fakeBlobStore struct{ BlobStore }
 
 func TestServeBypassesUncacheableRequests(t *testing.T) {
 	c, _ := newTestCache(t, func(o *Options) { o.ExposeStatus = true })

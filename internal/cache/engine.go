@@ -67,7 +67,9 @@ type Options struct {
 	IdleTimeout time.Duration
 	// ExposeStatus emits the Cache-Status response header.
 	ExposeStatus bool
-	// Remote is the remote tier; New rejects a non-nil value.
+	// Remote is the optional remote tier, shared by every replica that
+	// holds the same key. The implementation bounds the time to first
+	// byte of its Stat and Get calls; nil disables the tier.
 	Remote BlobStore
 	// Logger receives operational logs; nil discards them.
 	Logger *slog.Logger
@@ -106,12 +108,25 @@ type Cache struct {
 	gens   generations
 	access accessRecords
 	marks  uncacheableMarks
+	purges purgeRecords
+
+	// remote is the remote tier, nil when there is none. Uploads and
+	// remote deletions run under remoteCtx, which Close cancels only once
+	// they have been flushed or its deadline has passed; remoteWG counts
+	// the upload workers and background remote tasks.
+	remote       BlobStore
+	remoteCtx    context.Context
+	remoteCancel context.CancelFunc
+	remoteWG     sync.WaitGroup
+	uploads      chan uploadJob
 
 	// mu orders fill attach, detach, start and teardown, so a request
-	// never joins a fill that is ending.
-	mu     sync.Mutex
-	fills  map[entryKey]*fill
-	closed bool
+	// never joins a fill that is ending. remoteClosed, set by Close under
+	// mu, stops new uploads and remote tasks.
+	mu           sync.Mutex
+	fills        map[entryKey]*fill
+	closed       bool
+	remoteClosed bool
 	// commits counts fills that committed an entry, so a request that
 	// looked the entry up outside mu can tell whether one landed since.
 	commits uint64
@@ -136,7 +151,8 @@ type fillHooks struct {
 
 // New opens the cache directory, indexes its entries, removes entries
 // sealed under any key other than the active one, and starts the
-// janitor. The returned Cache runs until Close.
+// janitor and, with a remote tier, the upload workers. The returned Cache
+// runs until Close.
 func New(opts Options) (*Cache, error) {
 	if err := validateOptions(opts); err != nil {
 		return nil, err
@@ -165,6 +181,7 @@ func New(opts Options) (*Cache, error) {
 		logger.Info("removed cache entries sealed under another key", "entries", removed)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	remoteCtx, remoteCancel := context.WithCancel(context.Background())
 	c := &Cache{
 		opts:          opts,
 		store:         store,
@@ -179,6 +196,10 @@ func New(opts Options) (*Cache, error) {
 		idleGrace:     fillIdleGrace,
 		flushInterval: sealFlushInterval,
 		access:        accessRecords{window: opts.AccessRecheck},
+		purges:        purgeRecords{retention: opts.Retention},
+		remote:        opts.Remote,
+		remoteCtx:     remoteCtx,
+		remoteCancel:  remoteCancel,
 		fills:         make(map[entryKey]*fill),
 	}
 	c.wg.Add(1)
@@ -186,6 +207,13 @@ func New(opts Options) (*Cache, error) {
 		defer c.wg.Done()
 		store.runJanitor(ctx, janitorInterval, opts.Retention)
 	}()
+	if c.remote != nil {
+		c.uploads = make(chan uploadJob, uploadQueueSize)
+		c.remoteWG.Add(uploadWorkers)
+		for range uploadWorkers {
+			go c.runUploads()
+		}
+	}
 	return c, nil
 }
 
@@ -207,8 +235,6 @@ func validateOptions(opts Options) error {
 		return fmt.Errorf("cache: retention must be positive, got %v", opts.Retention)
 	case opts.RefsMaxAge < 0 || opts.AccessRecheck < 0 || opts.ResponseHeaderTimeout < 0 || opts.IdleTimeout < 0:
 		return errors.New("cache: durations must not be negative")
-	case opts.Remote != nil:
-		return errors.New("cache: the remote tier is not supported in this release")
 	}
 	return nil
 }
@@ -323,7 +349,8 @@ func (e *openedEntry) close() { _ = e.entry.Close() }
 
 // openEntry opens and verifies the stored entry for key, returning nil
 // when there is none to serve. An entry that fails verification is
-// deleted. With fresh set the freshness rules apply too: a pack entry
+// deleted, as is an entry older than a purge of its repository recorded in
+// a purge marker. With fresh set the freshness rules apply too: a pack entry
 // needs a recent upstream refs success, an entry past retention is
 // deleted and missed, and a refs entry older than RefsMaxAge is missed.
 // Freshness is judged from the authenticated creation time, never from
@@ -343,6 +370,11 @@ func (c *Cache) openEntry(key entryKey, repo gitproto.Repo, class string, fresh 
 	}
 	if err != nil {
 		c.dropCorrupt(entry, repo, class, err)
+		_ = entry.Close()
+		return nil
+	}
+	if c.purges.covers(key, sr.Header().CreatedAt) {
+		_ = c.store.DeleteEntry(entry)
 		_ = entry.Close()
 		return nil
 	}
@@ -596,7 +628,7 @@ func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, colla
 		if e == nil {
 			return c.declined(w, host, class, "fill_ended"), false
 		}
-		res, ok := c.serveOpened(w, e, repo, class, observability.ResultMiss, collapsed, observability.TierUpstream)
+		res, ok := c.serveOpened(w, e, repo, class, observability.ResultMiss, collapsed, out.tier)
 		if !ok {
 			return c.declined(w, host, class, "verification"), false
 		}
@@ -631,7 +663,7 @@ func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, colla
 		panic(http.ErrAbortHandler)
 	}
 	c.metrics.RecordResponseCacheLookup(ctx, host, class, observability.ResultMiss)
-	c.metrics.RecordResponseCacheServedBytes(ctx, host, class, observability.TierUpstream, n)
+	c.metrics.RecordResponseCacheServedBytes(ctx, host, class, out.tier, n)
 	// The spool reaches EOF only once the fill has committed or discarded
 	// it, so the fill is about to finish and its result is known.
 	<-f.done
@@ -677,11 +709,16 @@ func (c *Cache) stream(w http.ResponseWriter, src io.Reader, contentType, result
 }
 
 // Invalidate records a push to repo: it bumps the repository's generation
-// so an in-flight refs fill is discarded at commit, and deletes the
-// repository's stored refs entries.
+// so an in-flight refs fill is discarded at commit and a queued refs
+// upload is skipped, and deletes the repository's stored refs entries.
+// With a remote tier, the remote refs entries are deleted in the
+// background, best effort.
 func (c *Cache) Invalidate(ctx context.Context, repo gitproto.Repo, baseURL *url.URL) {
 	repoHash := c.keyring.RepoHash(baseURL, repo)
 	c.gens.bump(repoHash)
+	if c.remote != nil {
+		c.goRemote(func(ctx context.Context) { c.invalidateRemote(ctx, repo, repoHash) })
+	}
 	n, err := c.store.DeletePrefix(RepoPrefix(GroupRefs, repoHash))
 	if err != nil {
 		c.logger.WarnContext(ctx, "invalidating refs entries after a push failed", "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "error", err)
@@ -691,8 +728,10 @@ func (c *Cache) Invalidate(ctx context.Context, repo gitproto.Repo, baseURL *url
 }
 
 // Purge deletes the stored entries of repo in group, or in both groups
-// when group is empty, and returns how many were removed.
-func (c *Cache) Purge(_ context.Context, repo gitproto.Repo, baseURL *url.URL, group Group) (int, error) {
+// when group is empty, and returns how many were removed. With a remote
+// tier it also purges the remote tier through PurgeRemote, counting the
+// remote objects deleted, so other replicas drop their older entries.
+func (c *Cache) Purge(ctx context.Context, repo gitproto.Repo, baseURL *url.URL, group Group) (int, error) {
 	groups, err := ParseGroups(string(group))
 	if err != nil {
 		return 0, err
@@ -706,11 +745,23 @@ func (c *Cache) Purge(_ context.Context, repo gitproto.Repo, baseURL *url.URL, g
 			return total, err
 		}
 	}
-	return total, nil
+	if c.remote == nil {
+		return total, nil
+	}
+	now := c.now()
+	var times purgeTimes
+	for _, g := range groups {
+		times.set(g, now)
+	}
+	c.purges.observe(repoHash, times, now)
+	n, err := PurgeRemote(ctx, c.remote, c.keyring, repo, baseURL, groups, now)
+	return total + n, err
 }
 
-// Close stops the janitor, cancels every fill and waits for them until
-// ctx ends, then closes the store. Serve must not be called afterwards.
+// Close stops the janitor, cancels every fill and waits for them, then
+// flushes the upload queue and waits for background remote tasks, all
+// until ctx ends; it then cancels any remote request still running and
+// closes the store. Serve must not be called afterwards.
 func (c *Cache) Close(ctx context.Context) error {
 	c.mu.Lock()
 	if c.closed {
@@ -721,16 +772,32 @@ func (c *Cache) Close(ctx context.Context) error {
 	c.mu.Unlock()
 	c.cancel()
 
+	err := waitUntil(ctx, &c.wg, "fills still running")
+	c.mu.Lock()
+	c.remoteClosed = true
+	if c.uploads != nil {
+		close(c.uploads)
+	}
+	c.mu.Unlock()
+	if err == nil {
+		err = waitUntil(ctx, &c.remoteWG, "uploads still pending")
+	}
+	c.remoteCancel()
+	return errors.Join(err, c.store.Close())
+}
+
+// waitUntil waits for wg until ctx ends, reporting what was still running
+// when it did.
+func waitUntil(ctx context.Context, wg *sync.WaitGroup, what string) error {
 	done := make(chan struct{})
 	go func() {
-		c.wg.Wait()
+		wg.Wait()
 		close(done)
 	}()
-	var err error
 	select {
 	case <-done:
+		return nil
 	case <-ctx.Done():
-		err = fmt.Errorf("cache: close: fills still running: %w", ctx.Err())
+		return fmt.Errorf("cache: close: %s: %w", what, ctx.Err())
 	}
-	return errors.Join(err, c.store.Close())
 }
