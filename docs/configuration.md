@@ -478,7 +478,7 @@ field can never silently fall back to its default.
 | `keyEnv`                | (unset)  | Name of an env var holding the 32-byte, base64-encoded key entries are sealed under. See "Cache key".    |
 | `maxDiskSize`           | `10GiB`  | Disk budget for the cache: stored entries plus space reserved for fills in progress. Least recently used entries are evicted past it. See "Sizing". |
 | `maxEntrySize`          | `1GiB`   | Largest response that is stored. A larger response is streamed to the client without being stored. Must not exceed `maxDiskSize`. |
-| `maxConcurrentFills`    | `4`      | Maximum number of responses being fetched into the cache at once. A request that finds no free slot is proxied without the cache. Must be at least `1`. |
+| `maxConcurrentFills`    | `4`      | Maximum number of pack responses being fetched into the cache at once. A request that finds no free slot is proxied without the cache. Must be at least `1`. Ref advertisements and `ls-refs` responses do not count: they have a fixed separate cap of 64 concurrent fills and reserve 1 MiB each. |
 | `maxRequestBody`        | `1MiB`   | Largest decoded request body the cache will inspect. A read with a larger body bypasses the cache. Must be greater than zero. |
 | `retention`             | `24h`    | Go duration string: the maximum age of any entry, after which it is not served. Must be greater than zero. See "Retention". |
 | `refsMaxAge`            | `0s`     | Go duration string: how long a stored ref advertisement is reused without asking the upstream. `0s` always revalidates. When both are non-zero it must be less than `accessRecheck`. |
