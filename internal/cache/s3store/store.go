@@ -55,7 +55,10 @@ type Store struct {
 	kmsKeyID      *string
 }
 
-var _ cache.BlobStore = (*Store)(nil)
+var (
+	_ cache.BlobStore         = (*Store)(nil)
+	_ cache.ConditionalGetter = (*Store)(nil)
+)
 
 // New validates cfg and builds a Store. It sends no request; credentials
 // are resolved on first use. ctx bounds loading the SDK's shared
@@ -188,6 +191,7 @@ func (s *Store) Stat(ctx context.Context, key string) (cache.ObjectInfo, error) 
 		Key:     key,
 		Size:    aws.ToInt64(out.ContentLength),
 		ModTime: aws.ToTime(out.LastModified),
+		ETag:    aws.ToString(out.ETag),
 	}, nil
 }
 
@@ -198,6 +202,17 @@ func (s *Store) Stat(ctx context.Context, key string) (cache.ObjectInfo, error) 
 // matching cache.ErrNotFound. Get makes a single attempt, so the header
 // timeout bounds it and the caller decides whether to retry.
 func (s *Store) Get(ctx context.Context, key string, offset int64) (io.ReadCloser, cache.ObjectInfo, error) {
+	return s.get(ctx, key, offset, "")
+}
+
+// GetIfMatch is Get with an If-Match condition on etag. An object that no
+// longer carries etag returns an error matching cache.ErrObjectChanged.
+func (s *Store) GetIfMatch(ctx context.Context, key string, offset int64, etag string) (io.ReadCloser, cache.ObjectInfo, error) {
+	return s.get(ctx, key, offset, etag)
+}
+
+// get reads key from offset, conditional on etag when it is not empty.
+func (s *Store) get(ctx context.Context, key string, offset int64, etag string) (io.ReadCloser, cache.ObjectInfo, error) {
 	if offset < 0 {
 		return nil, cache.ObjectInfo{}, fmt.Errorf("s3store: get %s: negative offset %d", key, offset)
 	}
@@ -207,6 +222,9 @@ func (s *Store) Get(ctx context.Context, key string, offset int64) (io.ReadClose
 	}
 	if offset > 0 {
 		in.Range = aws.String("bytes=" + strconv.FormatInt(offset, 10) + "-")
+	}
+	if etag != "" {
+		in.IfMatch = aws.String(etag)
 	}
 	reqCtx, headersArrived, release := s.withHeaderTimeout(ctx)
 	out, err := s.client.GetObject(reqCtx, in, singleAttempt)
@@ -228,7 +246,7 @@ func (s *Store) Get(ctx context.Context, key string, offset int64) (io.ReadClose
 		release()
 		return nil, cache.ObjectInfo{}, responseError("get", key, 0)
 	}
-	info := cache.ObjectInfo{Key: key, Size: size, ModTime: aws.ToTime(out.LastModified)}
+	info := cache.ObjectInfo{Key: key, Size: size, ModTime: aws.ToTime(out.LastModified), ETag: aws.ToString(out.ETag)}
 	return &body{ReadCloser: out.Body, release: release}, info, nil
 }
 
@@ -362,6 +380,7 @@ func (s *Store) List(ctx context.Context, prefix string) iter.Seq2[cache.ObjectI
 					Key:     key,
 					Size:    aws.ToInt64(obj.Size),
 					ModTime: aws.ToTime(obj.LastModified),
+					ETag:    aws.ToString(obj.ETag),
 				}
 				if !yield(info, nil) {
 					return

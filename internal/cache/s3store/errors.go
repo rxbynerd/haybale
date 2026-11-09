@@ -41,6 +41,7 @@ const (
 // error text, request ids or credential material.
 //
 // errors.Is reports cache.ErrNotFound for a missing object,
+// cache.ErrObjectChanged for a failed If-Match condition,
 // context.DeadlineExceeded for a header timeout or caller deadline, and
 // context.Canceled for a cancelled caller context.
 type Error struct {
@@ -104,8 +105,11 @@ func wrapError(ctx context.Context, op, key string, err error) error {
 	default:
 		e.Code = codeRequestFailed
 	}
-	if isNotFound(e) {
+	switch {
+	case isNotFound(e):
 		e.sentinel = cache.ErrNotFound
+	case e.Status == 412:
+		e.sentinel = cache.ErrObjectChanged
 	}
 	return e
 }

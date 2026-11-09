@@ -234,9 +234,11 @@ func (t *spoolTee) Read(p []byte) (int, error) {
 
 // remoteReader reads one remote object of known size from the start. When
 // a body read fails, or stalls for idle, it resumes with a ranged Get from
-// the current offset, up to maxRemoteResumes times, provided the object's
-// size and modification time are unchanged. It ends with io.EOF exactly
-// at the object's size. It is not safe for concurrent use.
+// the current offset, up to maxRemoteResumes times, provided the object is
+// unchanged: the same ETag, through ConditionalGetter when the store
+// implements it, and otherwise the same size and modification time. It
+// ends with io.EOF exactly at the object's size. It is not safe for
+// concurrent use.
 type remoteReader struct {
 	ctx     context.Context
 	store   BlobStore
@@ -246,6 +248,7 @@ type remoteReader struct {
 
 	size    int64
 	modTime time.Time
+	etag    string
 	off     int64
 	rc      io.ReadCloser
 	cancel  context.CancelFunc
@@ -262,7 +265,7 @@ func (r *remoteReader) start() (ObjectInfo, error) {
 		cancel()
 		return ObjectInfo{}, err
 	}
-	r.size, r.modTime = info.Size, info.ModTime
+	r.size, r.modTime, r.etag = info.Size, info.ModTime, info.ETag
 	r.attach(rc, cancel)
 	return info, nil
 }
@@ -322,8 +325,11 @@ func (r *remoteReader) resume() error {
 	case <-t.C:
 	}
 	ctx, cancel := context.WithCancel(r.ctx)
-	rc, info, err := r.store.Get(ctx, r.key, r.off)
+	rc, info, err := r.resumeGet(ctx)
 	switch {
+	case errors.Is(err, ErrObjectChanged):
+		cancel()
+		return errRemoteChanged
 	case err != nil:
 		cancel()
 		if cerr := r.ctx.Err(); cerr != nil {
@@ -331,13 +337,22 @@ func (r *remoteReader) resume() error {
 		}
 		r.failed(err)
 		return nil
-	case info.Size != r.size || !info.ModTime.Equal(r.modTime):
+	case info.Size != r.size || !info.ModTime.Equal(r.modTime) || info.ETag != r.etag:
 		_ = rc.Close()
 		cancel()
 		return errRemoteChanged
 	}
 	r.attach(rc, cancel)
 	return nil
+}
+
+// resumeGet issues the ranged Get of a resume, conditional on the
+// object's ETag when the store supports it.
+func (r *remoteReader) resumeGet(ctx context.Context) (io.ReadCloser, ObjectInfo, error) {
+	if cg, ok := r.store.(ConditionalGetter); ok && r.etag != "" {
+		return cg.GetIfMatch(ctx, r.key, r.off, r.etag)
+	}
+	return r.store.Get(ctx, r.key, r.off)
 }
 
 func (r *remoteReader) failed(err error) {

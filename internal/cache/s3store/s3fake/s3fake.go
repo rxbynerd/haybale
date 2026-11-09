@@ -1,7 +1,7 @@
 // Package s3fake is an in-process S3-compatible HTTP server for tests. It
 // serves one bucket with path-style addressing and implements the subset
-// of the S3 API the s3store backend uses: PutObject, GetObject (with a
-// Range header), HeadObject, DeleteObject and ListObjectsV2 (with prefix,
+// of the S3 API the s3store backend uses: PutObject, GetObject (with
+// Range and If-Match headers), HeadObject, DeleteObject and ListObjectsV2 (with prefix,
 // max-keys and continuation tokens). It does not verify signatures; it
 // records every request, including whether it carried an Authorization
 // header, so tests can assert that requests were signed.
@@ -225,6 +225,10 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, key string) {
 	o, ok := s.lookup(key)
 	if !ok {
 		writeError(w, http.StatusNotFound, "NoSuchKey", "The specified key does not exist.", key)
+		return
+	}
+	if match := r.Header.Get("If-Match"); match != "" && match != "*" && match != etag(o.data) {
+		writeError(w, http.StatusPreconditionFailed, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold.", key)
 		return
 	}
 	size := int64(len(o.data))

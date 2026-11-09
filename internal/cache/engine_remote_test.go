@@ -3,7 +3,9 @@ package cache
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -48,11 +50,17 @@ type memBlobStore struct {
 	statHook func(ctx context.Context, key string) error
 	putHook  func(ctx context.Context, key string) error
 	listErr  error
+	// etags makes the store report an ETag for every object and honour
+	// GetIfMatch.
+	etags bool
 	// wrapBody may replace the body a Get returns.
 	wrapBody func(ctx context.Context, key string, offset int64, body io.Reader) io.Reader
 }
 
-var _ BlobStore = (*memBlobStore)(nil)
+var (
+	_ BlobStore         = (*memBlobStore)(nil)
+	_ ConditionalGetter = (*memBlobStore)(nil)
+)
 
 func newMemBlobStore() *memBlobStore {
 	return &memBlobStore{objects: make(map[string]memObject)}
@@ -80,14 +88,23 @@ func (m *memBlobStore) Stat(ctx context.Context, key string) (ObjectInfo, error)
 	if !ok {
 		return ObjectInfo{}, ErrNotFound
 	}
-	return ObjectInfo{Key: key, Size: int64(len(o.data)), ModTime: o.modTime}, nil
+	return m.infoLocked(key, o), nil
 }
 
 func (m *memBlobStore) Get(ctx context.Context, key string, offset int64) (io.ReadCloser, ObjectInfo, error) {
+	return m.get(ctx, key, offset, "")
+}
+
+func (m *memBlobStore) GetIfMatch(ctx context.Context, key string, offset int64, etag string) (io.ReadCloser, ObjectInfo, error) {
+	return m.get(ctx, key, offset, etag)
+}
+
+func (m *memBlobStore) get(ctx context.Context, key string, offset int64, etag string) (io.ReadCloser, ObjectInfo, error) {
 	m.record("get", key, offset)
 	m.mu.Lock()
 	hook, wrap := m.getHook, m.wrapBody
 	o, ok := m.objects[key]
+	info := m.infoLocked(key, o)
 	m.mu.Unlock()
 	if hook != nil {
 		if err := hook(key, offset); err != nil {
@@ -97,6 +114,9 @@ func (m *memBlobStore) Get(ctx context.Context, key string, offset int64) (io.Re
 	if !ok {
 		return nil, ObjectInfo{}, ErrNotFound
 	}
+	if etag != "" && etag != info.ETag {
+		return nil, ObjectInfo{}, fmt.Errorf("memblob: 412 PreconditionFailed: %w", ErrObjectChanged)
+	}
 	if offset > int64(len(o.data)) {
 		return nil, ObjectInfo{}, fmt.Errorf("memblob: offset %d beyond %d bytes", offset, len(o.data))
 	}
@@ -104,8 +124,17 @@ func (m *memBlobStore) Get(ctx context.Context, key string, offset int64) (io.Re
 	if wrap != nil {
 		body = wrap(ctx, key, offset, body)
 	}
-	info := ObjectInfo{Key: key, Size: int64(len(o.data)), ModTime: o.modTime}
 	return io.NopCloser(&ctxReader{ctx: ctx, r: body}), info, nil
+}
+
+// infoLocked describes o, stored at key. m.mu must be held.
+func (m *memBlobStore) infoLocked(key string, o memObject) ObjectInfo {
+	info := ObjectInfo{Key: key, Size: int64(len(o.data)), ModTime: o.modTime}
+	if m.etags {
+		sum := sha256.Sum256(o.data)
+		info.ETag = hex.EncodeToString(sum[:8])
+	}
+	return info
 }
 
 func (m *memBlobStore) Put(ctx context.Context, key string, body io.ReadSeeker, size int64) error {
@@ -163,6 +192,17 @@ func (m *memBlobStore) List(_ context.Context, prefix string) iter.Seq2[ObjectIn
 			}
 		}
 	}
+}
+
+// replaceInPlace swaps key's bytes without changing its modification
+// time, as a second upload within the same second appears to a client
+// that sees only one-second times.
+func (m *memBlobStore) replaceInPlace(key string, data []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	o := m.objects[key]
+	o.data = bytes.Clone(data)
+	m.objects[key] = o
 }
 
 // store sets key directly, as a peer's upload would.
@@ -595,6 +635,34 @@ func TestRemoteObjectReplacedDuringAResumeIsNotSpliced(t *testing.T) {
 	store.store("k", data)
 	if _, err := r.Read(make([]byte, 10)); !errors.Is(err, errRemoteChanged) {
 		t.Fatalf("Read after the object was replaced: err = %v, want errRemoteChanged", err)
+	}
+}
+
+func TestRemoteResumeRequiresTheSameETag(t *testing.T) {
+	store := newMemBlobStore()
+	store.set(func(m *memBlobStore) { m.etags = true })
+	data := bytes.Repeat([]byte("x"), 3*segmentSize)
+	store.store("k", data)
+	store.set(func(m *memBlobStore) {
+		m.wrapBody = func(ctx context.Context, _ string, offset int64, body io.Reader) io.Reader {
+			if offset == 0 {
+				return cutReader(body, 1000)
+			}
+			return body
+		}
+	})
+	r := &remoteReader{ctx: context.Background(), store: store, key: "k"}
+	defer r.Close()
+	if _, err := r.start(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(r, make([]byte, 1000)); err != nil {
+		t.Fatal(err)
+	}
+	// Same size and modification time: only the ETag tells the copies apart.
+	store.replaceInPlace("k", bytes.Repeat([]byte("z"), len(data)))
+	if _, err := r.Read(make([]byte, 10)); !errors.Is(err, errRemoteChanged) {
+		t.Fatalf("Read after an in-place replacement: err = %v, want errRemoteChanged", err)
 	}
 }
 

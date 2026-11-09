@@ -201,6 +201,53 @@ func TestGetFromOffsetUsesRange(t *testing.T) {
 	}
 }
 
+func TestGetIfMatchResumesOnlyTheSameVersion(t *testing.T) {
+	isolateAWSEnv(t)
+	fake := s3fake.New(t)
+	s := newStore(t, testConfig(fake.URL()))
+	data := randomBytes(t, 4096)
+	put(t, s, testKey, data)
+
+	rc, info, err := s.Get(context.Background(), testKey, 0)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	_ = readAll(t, rc)
+	if info.ETag == "" {
+		t.Fatal("Get returned no ETag")
+	}
+	if st, err := s.Stat(context.Background(), testKey); err != nil || st.ETag != info.ETag {
+		t.Errorf("Stat ETag = %q, %v; want %q", st.ETag, err, info.ETag)
+	}
+	for listed, err := range s.List(context.Background(), "v1/") {
+		if err != nil || listed.ETag != info.ETag {
+			t.Errorf("List ETag = %q, %v; want %q", listed.ETag, err, info.ETag)
+		}
+	}
+
+	rc, _, err = s.GetIfMatch(context.Background(), testKey, 100, info.ETag)
+	if err != nil {
+		t.Fatalf("GetIfMatch with the current ETag: %v", err)
+	}
+	if got := readAll(t, rc); !bytes.Equal(got, data[100:]) {
+		t.Errorf("GetIfMatch returned %d bytes, want %d", len(got), len(data)-100)
+	}
+	reqs := fake.Requests()
+	if got := reqs[len(reqs)-1].Header.Get("If-Match"); got != info.ETag {
+		t.Errorf("If-Match = %q, want %q", got, info.ETag)
+	}
+
+	put(t, s, testKey, randomBytes(t, 4096))
+	_, _, err = s.GetIfMatch(context.Background(), testKey, 100, info.ETag)
+	var e *Error
+	if !errors.Is(err, cache.ErrObjectChanged) || !errors.As(err, &e) || e.Status != http.StatusPreconditionFailed {
+		t.Errorf("GetIfMatch after a replacement: err = %v, want cache.ErrObjectChanged with HTTP 412", err)
+	}
+	if errors.Is(err, cache.ErrNotFound) {
+		t.Error("a failed precondition matched cache.ErrNotFound")
+	}
+}
+
 func TestGetRejectsIgnoredRange(t *testing.T) {
 	isolateAWSEnv(t)
 	fake := s3fake.New(t)
