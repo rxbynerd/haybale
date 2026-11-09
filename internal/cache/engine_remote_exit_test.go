@@ -344,3 +344,223 @@ func TestAnAbortedRemoteFillCountsItsBytes(t *testing.T) {
 		t.Errorf("fill_bytes{tier=remote} = %d, want the verified bytes read before the abort", got)
 	}
 }
+
+// resealed returns data, a sealed entry, sealed again under kr with its
+// header changed by mutate.
+func resealed(t *testing.T, kr Keyring, data []byte, mutate func(*entryHeader)) []byte {
+	t.Helper()
+	sr, err := newSealedReader(bytes.NewReader(data), kr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(sr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := sr.Header()
+	mutate(&h)
+	return sealBytes(t, kr, h, body)
+}
+
+func TestRemoteEntriesThatDoNotBelongAtTheirKeyFallThrough(t *testing.T) {
+	cases := map[string]func(*entryHeader){
+		"copied from another request":    func(h *entryHeader) { h.KeyHash[0] ^= 1 },
+		"copied from another repository": func(h *entryHeader) { h.RepoHash[0] ^= 1 },
+		"another class":                  func(h *entryHeader) { h.Class = classLsRefs },
+		"another Content-Type":           func(h *entryHeader) { h.ContentType = contentTypeAdvertisement },
+		"created in the future":          func(h *entryHeader) { h.CreatedAt = h.CreatedAt.Add(maxCreatedAtSkew + time.Minute) },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			store := newMemBlobStore()
+			pack := remotePack(t)
+			seedPeer(t, store, pack)
+			key := store.keys(packPrefix)[0]
+			data, _ := store.object(key)
+			moved := resealed(t, testKeyring(t), data, mutate)
+			store.store(key, moved)
+
+			logger, logs := newLogCapture()
+			c, _, reader := newRemoteTestCache(t, store, func(o *Options) { o.Logger = logger })
+			lsRefs(t, c, refsFetcher(t))
+			upstream := packFetcher(pack)
+			rec := newCollectWriter()
+			out, _, aborted := serve(c, rec, fetchRequest(t), upstream)
+			if aborted || !out.Stored || upstream.calls.Load() != 1 {
+				t.Fatalf("fetch = %+v aborted %v upstream %d, want a stored miss from upstream", out, aborted, upstream.calls.Load())
+			}
+			if _, body, _ := rec.result(); !bytes.Equal(body, pack) {
+				t.Errorf("received %d bytes, want the upstream pack", len(body))
+			}
+			assertStoreIdle(t, c)
+			if got := logs.securityEvents(t, security.EventCacheIntegrityFailed); len(got) != 1 || got[0]["tier"] != observability.TierRemote {
+				t.Errorf("integrity events = %v, want one for the remote tier", got)
+			}
+			if got := remoteStoreErrors(t, reader, observability.OperationGet); got != 1 {
+				t.Errorf("store_errors{tier=remote,operation=get} = %d, want 1", got)
+			}
+			if n := store.count("delete", key); n != 1 {
+				t.Errorf("remote deletes of the object = %d, want 1", n)
+			}
+			if got := fillsFrom(t, reader, observability.TierRemote, observability.FillResultStored, ""); got != 0 {
+				t.Errorf("remote fills stored = %d, want none", got)
+			}
+		})
+	}
+}
+
+func TestRemoteObjectsOfImplausibleSizeFallThrough(t *testing.T) {
+	cases := map[string]func(c *Cache, data []byte) []byte{
+		"shorter than an empty entry": func(*Cache, []byte) []byte { return make([]byte, sealedSize(0)-1) },
+		"longer than the size bound": func(c *Cache, data []byte) []byte {
+			return append(bytes.Clone(data), make([]byte, sealedSize(c.opts.MaxEntrySize)+remoteSizeSlack+1-int64(len(data)))...)
+		},
+	}
+	for name, object := range cases {
+		t.Run(name, func(t *testing.T) {
+			store := newMemBlobStore()
+			pack := remotePack(t)
+			seedPeer(t, store, pack)
+			key := store.keys(packPrefix)[0]
+			logger, logs := newLogCapture()
+			c, _, reader := newRemoteTestCache(t, store, func(o *Options) { o.Logger = logger })
+			data, _ := store.object(key)
+			store.store(key, object(c, data))
+			lsRefs(t, c, refsFetcher(t))
+			upstream := packFetcher(pack)
+			if out, _, _ := serve(c, newCollectWriter(), fetchRequest(t), upstream); !out.Stored || upstream.calls.Load() != 1 {
+				t.Fatalf("fetch = %+v upstream %d, want a stored miss from upstream", out, upstream.calls.Load())
+			}
+			assertStoreIdle(t, c)
+			if got := logs.securityEvents(t, security.EventCacheIntegrityFailed); len(got) != 0 {
+				t.Errorf("integrity events = %v, want none", got)
+			}
+			if got := remoteStoreErrors(t, reader, observability.OperationGet); got != 0 {
+				t.Errorf("store errors = %d, want none", got)
+			}
+			if n := store.count("delete", key); n != 0 {
+				t.Errorf("remote deletes = %d, want none", n)
+			}
+		})
+	}
+}
+
+func TestRemoteReaderEndsWhenTheObjectSizeChangesOnResume(t *testing.T) {
+	store := newMemBlobStore()
+	data := bytes.Repeat([]byte("x"), 3*segmentSize)
+	store.store("k", data)
+	store.set(func(m *memBlobStore) {
+		m.wrapBody = func(_ context.Context, _ string, offset int64, body io.Reader) io.Reader {
+			if offset == 0 {
+				return cutReader(body, 1000)
+			}
+			return body
+		}
+	})
+	r := &remoteReader{ctx: context.Background(), store: store, key: "k"}
+	defer r.Close()
+	if _, err := r.start(); err != nil {
+		t.Fatal(err)
+	}
+	r.enableResumes()
+	if _, err := io.ReadFull(r, make([]byte, 1000)); err != nil {
+		t.Fatal(err)
+	}
+	store.replaceInPlace("k", data[:len(data)-1])
+	if _, err := r.Read(make([]byte, 10)); !errors.Is(err, errRemoteChanged) {
+		t.Fatalf("Read after the object shrank: err = %v, want errRemoteChanged", err)
+	}
+}
+
+func TestRemoteReaderBackoffEndsWithItsContext(t *testing.T) {
+	store := newMemBlobStore()
+	store.store("k", bytes.Repeat([]byte("x"), 10000))
+	store.set(func(m *memBlobStore) {
+		m.wrapBody = func(_ context.Context, _ string, _ int64, body io.Reader) io.Reader { return cutReader(body, 100) }
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &remoteReader{ctx: ctx, store: store, key: "k"}
+	defer r.Close()
+	if _, err := r.start(); err != nil {
+		t.Fatal(err)
+	}
+	r.enableResumes()
+	if _, err := io.ReadFull(r, make([]byte, 100)); err != nil {
+		t.Fatal(err)
+	}
+	time.AfterFunc(20*time.Millisecond, cancel)
+	start := time.Now()
+	_, err := io.ReadAll(r)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReadAll = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed >= remoteResumeBackoff+remoteResumeBackoff<<1 {
+		t.Errorf("the backoff ran %s after the context ended", elapsed)
+	}
+}
+
+func TestRemoteHeaderThatEndsEarlyFallsThrough(t *testing.T) {
+	store := newMemBlobStore()
+	c, logs, pack, key, _ := newRemoteFillCase(t, store, nil, func(key string, _ []byte) {
+		store.set(func(m *memBlobStore) {
+			m.wrapBody = func(_ context.Context, k string, _ int64, body io.Reader) io.Reader {
+				if k == key {
+					return io.LimitReader(body, 100)
+				}
+				return body
+			}
+		})
+	})
+	upstream := packFetcher(pack)
+	if out, _, _ := serve(c, newCollectWriter(), fetchRequest(t), upstream); !out.Stored || upstream.calls.Load() != 1 {
+		t.Fatalf("fetch = %+v upstream %d, want a stored miss from upstream", out, upstream.calls.Load())
+	}
+	if got := store.getOffsets(key); fmt.Sprint(got) != "[0]" {
+		t.Errorf("remote Get offsets = %v, want one Get", got)
+	}
+	if got := logs.securityEvents(t, security.EventCacheIntegrityFailed); len(got) != 0 {
+		t.Errorf("integrity events = %v, want none", got)
+	}
+	assertStoreIdle(t, c)
+}
+
+func TestPaddedRemoteObjectsReserveAtMostTheSizeBound(t *testing.T) {
+	small := func(o *Options) {
+		o.MaxDiskSize = 4 << 20
+		o.MaxEntrySize = 1 << 20
+	}
+	cases := map[string]struct {
+		corruptHeader bool
+		maxEvicted    func(c *Cache) int64
+	}{
+		"invalid header": {true, func(*Cache) int64 { return 0 }},
+		"valid header":   {false, func(c *Cache) int64 { return sealedSize(c.opts.MaxEntrySize) + remoteSizeSlack }},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			store := newMemBlobStore()
+			pack := remotePack(t)
+			seedPeer(t, store, pack)
+			key := store.keys(packPrefix)[0]
+			c, _, _ := newRemoteTestCache(t, store, small)
+			data, _ := store.object(key)
+			padded := append(bytes.Clone(data), make([]byte, sealedSize(c.opts.MaxEntrySize)+remoteSizeSlack-int64(len(data)))...)
+			if tc.corruptHeader {
+				padded[preambleLen+100] ^= 0xff
+			}
+			store.store(key, padded)
+			lsRefs(t, c, refsFetcher(t))
+			storeEntries(t, c, 15, 40)
+			before, _, _ := c.store.usage()
+
+			serve(c, newCollectWriter(), fetchRequest(t), packFetcher(pack))
+			assertStoreIdle(t, c)
+			after, _, _ := c.store.usage()
+			// The fall-through stores the upstream pack, which may evict too.
+			evicted := before - after + sealedSize(int64(len(pack)))
+			if limit := tc.maxEvicted(c) + sealedSize(int64(len(pack))) + reserveStep; evicted > limit {
+				t.Errorf("committed bytes fell by %d, want at most %d", evicted, limit)
+			}
+		})
+	}
+}
