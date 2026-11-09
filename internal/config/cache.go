@@ -126,9 +126,10 @@ type CacheConfig struct {
 	// Enabled turns the cache on. Defaults to false.
 	Enabled bool `yaml:"enabled"`
 	// Dir is the directory the disk tier stores sealed entries in. It is
-	// required when Enabled and must be private to the haybale process
-	// (mode 0700); that is checked when the directory is opened, not by
-	// validate.
+	// required when Enabled. The last path element is created with mode
+	// 0700 when missing, and the directory must be owned by the process
+	// user with no group or other permission bits; that is checked when
+	// the directory is opened, not by validate.
 	Dir string `yaml:"dir"`
 	// KeyEnv names an environment variable holding the 32-byte base64
 	// cache key. Optional for a disk-only cache, in which case an
