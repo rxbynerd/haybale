@@ -192,10 +192,7 @@ type Metrics struct {
 	ResponseCacheUploads metric.Int64Counter
 	// ResponseCacheDiskBytes tracks the bytes the disk tier currently
 	// holds. It is an up/down counter fed with deltas, like InFlight,
-	// rather than an observable gauge: Metrics is built before the cache
-	// exists, so there is no cache to register a callback against, and
-	// the cache already knows each delta at the moment it commits or
-	// removes an entry.
+	// because Metrics is built before the cache exists.
 	ResponseCacheDiskBytes metric.Int64UpDownCounter
 }
 

@@ -355,6 +355,7 @@ func TestLeaderAndFollowerStreamTheSameBytesAndLaterRequestsHit(t *testing.T) {
 	if calls.Load() != 1 {
 		t.Errorf("a hit fetched upstream (calls = %d)", calls.Load())
 	}
+	assertStoreIdle(t, c)
 }
 
 func TestPackHitRequiresRecentRefsSuccess(t *testing.T) {
@@ -505,6 +506,7 @@ func TestNon200ResponseIsSharedByEverySubscriber(t *testing.T) {
 	if _, handled, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), fetch); handled {
 		t.Error("request after a shared non-200 was handled by the cache, want a bypass")
 	}
+	assertStoreIdle(t, c)
 }
 
 func TestFetchErrorReleasesSubscribersToPassthrough(t *testing.T) {
@@ -520,6 +522,7 @@ func TestFetchErrorReleasesSubscribersToPassthrough(t *testing.T) {
 	if rec.Code != http.StatusOK || rec.Body.Len() != 0 || rec.Header().Get("Cache-Status") != "haybale; fwd=bypass" {
 		t.Errorf("response was touched: %d %q %v", rec.Code, rec.Body.String(), rec.Header())
 	}
+	assertStoreIdle(t, c)
 }
 
 func TestUpstreamErrorMidStreamAbortsSubscribers(t *testing.T) {
@@ -556,6 +559,7 @@ func TestUpstreamErrorMidStreamAbortsSubscribers(t *testing.T) {
 	if _, handled, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), fetch); handled {
 		t.Error("key was not marked uncacheable after a transport failure")
 	}
+	assertStoreIdle(t, c)
 }
 
 func TestIdleTimeoutAbortsStalledFill(t *testing.T) {
@@ -585,6 +589,7 @@ func TestIdleTimeoutAbortsStalledFill(t *testing.T) {
 	if aborted := <-done; !aborted {
 		t.Fatal("subscriber was not aborted after the idle timeout")
 	}
+	assertStoreIdle(t, c)
 }
 
 func TestResponseHeaderTimeoutReleasesSubscribers(t *testing.T) {
@@ -601,6 +606,7 @@ func TestResponseHeaderTimeoutReleasesSubscribers(t *testing.T) {
 	if time.Since(start) > 2*time.Second {
 		t.Error("header timeout did not cancel the fetch promptly")
 	}
+	assertStoreIdle(t, c)
 }
 
 func TestFillWithNoSubscribersIsCancelled(t *testing.T) {
@@ -637,6 +643,7 @@ func TestFillWithNoSubscribersIsCancelled(t *testing.T) {
 	if _, handled, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), fetch2); !handled {
 		t.Error("request after an abandoned fill was not handled")
 	}
+	assertStoreIdle(t, c)
 }
 
 func TestErrPacketAndTruncationAreServedButNotStored(t *testing.T) {
@@ -673,6 +680,7 @@ func TestErrPacketAndTruncationAreServedButNotStored(t *testing.T) {
 			if _, handled, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), fetch); handled {
 				t.Error("next request did not pass through during the cooldown")
 			}
+			assertStoreIdle(t, c)
 		})
 	}
 }
@@ -714,6 +722,7 @@ func TestPushDuringRefsFillDiscardsIt(t *testing.T) {
 	if out, handled, _ := serve(c, httptest.NewRecorder(), get(), fixed); !handled || !out.Stored {
 		t.Errorf("next advertisement = %+v handled %v, want a stored miss", out, handled)
 	}
+	assertStoreIdle(t, c)
 }
 
 func TestInvalidateDeletesRefsEntriesOnly(t *testing.T) {
