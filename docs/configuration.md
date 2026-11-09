@@ -384,7 +384,9 @@ upstreams:
 ```
 
 At least one upstream is required; `host` must be unique across all of
-them.
+them. `baseURL` must be an absolute URL with a scheme and a host, and must not
+contain credentials (userinfo such as `https://user:token@host`); configure a
+`credential` block instead.
 
 haybale's URL scheme encodes the upstream as the **first path segment**:
 a client requests `http://haybale.internal:8466/{host}/{owner}/{repo}.git/<endpoint>`,
@@ -464,7 +466,9 @@ and fetches from local disk, so the upstream is not asked for it again. Ref
 lookups still reach the upstream unless `refsMaxAge` is set. **The cache is off
 by default**: leaving the block out, or leaving `enabled` false, serves every
 request straight from the upstream. A disabled block is inert: it is not
-defaulted or validated, although an unknown key in it is still rejected. Writes
+defaulted or validated, although an unknown key in it is still rejected, and a
+value of the wrong type, such as a malformed size, still fails when the file is
+decoded. Writes
 (pushes) are never served from the cache. The [caching guide](caching.md)
 explains what the cache stores and how to operate it;
 [`observability.md`](observability.md) describes what it emits.
@@ -499,9 +503,10 @@ Sizes (`maxDiskSize`, `maxEntrySize`, `maxRequestBody`) are written as a
 number followed by an IEC unit: `KiB`, `MiB`, `GiB` or `TiB`, for example
 `512MiB` or `1.5GiB`. Units are case-sensitive, one space before the unit is
 allowed, and the number may be an integer or a decimal that works out to a
-whole number of bytes. A bare integer (`1073741824`), an SI unit (`KB`, `MB`,
-`GB`), a negative value, or anything else fails startup, so a size can never be
-misread by a factor of 1024.
+whole number of bytes. The one exception is a bare `0`, which means zero bytes
+and so selects the default. Any other bare integer (`1073741824`), an SI unit
+(`KB`, `MB`, `GB`), a negative value, or anything else fails startup, so a size
+can never be misread by a factor of 1024.
 
 Durations (`retention`, `refsMaxAge`, `accessRecheck`,
 `responseHeaderTimeout`, `idleTimeout`) are Go duration strings such as `30s`
@@ -533,8 +538,9 @@ without the cache key or directory. The directory and key are checked when
 
 `dir` holds repository contents. The final path element is created with mode
 `0700` when it is missing, but its parent must exist. An existing directory must
-be owned by the haybale process user and be inaccessible to group and other
-(mode `0700`); `haybale serve` refuses to start otherwise. Mount the volume
+be owned by the haybale process user (where the platform reports ownership) and
+have no group or other permission bits; `haybale serve` refuses to start
+otherwise. Mount the volume
 only into the haybale container; any sidecar sharing it runs with the same UID
 and can read every entry.
 

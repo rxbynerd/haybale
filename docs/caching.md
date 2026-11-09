@@ -109,8 +109,11 @@ If the upstream answers a fill's request with something other than a cacheable
 `200`, for example a `404` or `503`, haybale buffers up to 64KiB of that
 response and every request waiting on the same fill receives it. A larger error
 body, or a failure before response headers, sends the waiting requests straight
-to the upstream instead. After any discarded fill except an oversize or generation discard,
-requests for the same key go straight to the upstream for one minute.
+to the upstream instead. After a discarded or aborted fill, requests for the
+same key go straight to the upstream for one minute. Two reasons differ: after
+an oversize response (`too_large`) the period is `retention`, and a `generation`
+discard, or a fill cancelled because every request waiting on it left, marks
+nothing.
 
 With the default settings, fifty concurrent clones of one repository cost one
 hundred small upstream requests (the advertisement and `ls-refs` of each clone)
@@ -141,6 +144,12 @@ reserve at most 4GiB plus 64MiB, leaving the rest for stored entries. Set
 `maxEntrySize` to a small multiple of the largest repository clone that should
 be cached, and raise `maxDiskSize` to match the formula.
 
+At startup haybale logs a Warn line, `concurrent fills can reserve more than the
+disk budget`, with the three values, when `maxConcurrentFills` is greater than
+`maxDiskSize` divided by `maxEntrySize`. That is a floor, not the whole formula:
+it ignores the 64MiB for ref fills and the space for stored entries, so a
+configuration can satisfy it and still be undersized.
+
 A request that cannot obtain a fill slot or space is proxied without the cache,
 so undersizing costs hit rate. One case also affects clients: see [Clients see a
 connection closed mid-clone](#clients-see-a-connection-closed-mid-clone) below.
@@ -154,8 +163,8 @@ process in the directory.
 
 haybale creates the last element of `cache.dir` with mode `0700` when it is
 missing; the parent must exist. An existing directory must be owned by the
-haybale user and have mode `0700`, and `haybale serve` refuses to start
-otherwise. A freshly mounted volume is usually owned by root with open
+haybale user (where the platform reports ownership) and have no group or other
+permission bits, and `haybale serve` refuses to start otherwise. A freshly mounted volume is usually owned by root with open
 permissions, so do not use its mount point as `cache.dir`: mount the volume at a
 parent and point `cache.dir` at a subdirectory.
 
@@ -270,21 +279,52 @@ Log lines to alert on, all at Warn unless noted:
 
 - `fill aborted`: a fill could not continue and its clients were released or
   disconnected. Check the `reason` field.
-- `entry failed verification; deleting it` and `entry failed mid-stream;
-  aborting the response`: a stored entry failed its integrity check. Each is
-  accompanied by a `cache_integrity_failed` security event. A single event can
+- the `cache_integrity_failed` security event: a stored entry failed its
+  integrity check and was deleted. The accompanying `entry failed verification;
+  deleting it` line is logged at Debug, so alert on the event. A single event can
   be disk corruption. Repeated events, or events after nobody changed the key,
   suggest someone is writing to the cache directory.
+- `entry failed mid-stream; aborting the response`: a stored entry failed while
+  it was being sent, after the client had received bytes, so that response was
+  cut short. The `cache_integrity_failed` event accompanies it only when the
+  failure was an integrity failure.
+- `entry could not be read; deleting it`: a stored entry could not be read for a
+  reason other than failing its integrity check, so there is no security event.
+  The entry is deleted and counted in `store_errors.total` with
+  `operation=open`.
+- `entry could not be committed`: a finished response could not be stored.
+  Clients still received it.
 - `disk store operation failed` and `disk usage exceeds the budget and open
   entries cannot be evicted`: storage trouble.
-- `fill panicked` (Error): a bug. Report it with the logged stack.
+- `fill panicked` and `flush panicked` (both Error): a bug. Report it with the
+  logged stack.
 - `fill failed mid-stream; aborting the response`: the upstream or the disk
   failed after clients had received bytes.
+- `invalidating refs entries after a push failed`: the push's cached refs
+  entries could not be deleted. With `refsMaxAge` above `0s`, later reads can
+  receive the tips from before the push until the entries expire.
 - `response cache did not close cleanly`: shutdown left fills running.
 
-Informational lines to expect, at Info: `response cache enabled` (with `dir`,
-`keyMode` and the sizes), the ephemeral-key notice, `removed cache entries sealed
-under another key` (at start, after a key change) and `response cache closed`.
+Lines of lower value, all at Warn except where noted:
+
+- `request could not be classified`: the request body could not be read or
+  classified, so the request was proxied without the cache;
+- `removing cache entries sealed under another key failed`: the start-up cleanup
+  after a key change did not finish;
+- `ignoring a non-regular file at an entry path`: something other than a regular
+  file sits where an entry belongs, and haybale leaves it alone;
+- `subscribers did not open the spool in time; releasing it`: a discarded fill's
+  temporary file was released after a grace period although a waiting request
+  had not yet opened it;
+- `set entry modification time`: a stored entry's file time could not be set.
+  Freshness does not depend on it; and
+- `janitor not started: interval and retention must be positive` (Error): the
+  cache runs without its periodic cleanup.
+
+Informational lines to expect, at Info, in start-up order: the ephemeral-key
+notice (when `keyEnv` is unset), `removed cache entries sealed under another key`
+(after a key change), and `response cache enabled` (with `dir`, `keyMode` and the
+sizes); and `response cache closed` at shutdown.
 
 Metrics to alert on: any increase of `store_errors.total`; a sustained rate of
 `fills.total` with `reason` of `store_error`, `disk_budget` or `encoding`; and
@@ -329,8 +369,10 @@ needs three things:
 `purged 0 entries` is reported with exit status 0. It means that nothing is
 cached for that repository in this directory (another replica may hold it), that
 the key in `keyEnv` is not the key the entries were sealed under, that the host,
-owner or repository is spelled differently from what clients send, or that
-`--group` excluded the entries that exist. The command cannot tell these apart.
+owner or repository is spelled differently from what clients send, that the
+upstream's `baseURL` is not the one the entries were stored under (it is part
+of the keyed hash), or that `--group` excluded the entries that exist. The
+command cannot tell these apart.
 
 The command fails with an error when the cache is not enabled, when `keyEnv` is
 not set in the config (an ephemeral key cannot address entries), when the
@@ -367,17 +409,28 @@ remote tier is not supported in this release.
 - Check the `class=fetch` lookups, not the ref requests (see [Observing the
   cache](#observing-the-cache)). Ref requests miss by design while `refsMaxAge`
   is `0s`.
-- Look at the `cache` log field. `bypass` means the request was not eligible:
-  an incremental fetch, a `want-ref` request, a body over `maxRequestBody`, a
-  filter or argument outside the allowlists, or a protocol v2 request without
-  the `Git-Protocol` header that Git normally sends. The reason is in the
-  debug-level `bypass` log line, so set `logLevel: debug` to see it.
+- Look at the `cache` log field. `bypass` means the cache did not serve the
+  request. The reason is in the debug-level `bypass` log line, so set
+  `logLevel: debug` to see it. A request can be ineligible: an incremental
+  fetch, a `want-ref` request, a body over `maxRequestBody`, a filter or
+  argument outside the allowlists, or a protocol v2 request without the
+  `Git-Protocol` header that Git normally sends. In the logs and metrics such a
+  request has `class=bypass`, because it could not be classified. A request
+  that was classified but not served has its real class and one of these
+  reasons:
+  - `uncacheable`: the key was marked after a discarded fill and the mark has
+    not expired. An upstream `401` that haybale turned into a `502` is one
+    example;
+  - `no_slot`: every fill slot was busy (`maxConcurrentFills` for packs, 64 for
+    refs); and
+  - `verification`: a freshly stored entry failed its integrity check, so the
+    request was proxied instead.
 - Repeated `miss` results for the `fetch` class usually mean the clones ask for
   different commits or use different options. A busy branch changes the
   requested commit with each push, and each combination of options is its own
   entry.
 - A fill that was discarded marks its key uncacheable for one minute, or for
-  `retention` after an oversize or out-of-budget fill, so clones for that key
+  `retention` after an oversize response (`too_large`), so clones for that key
   miss until the mark expires.
 - With several replicas behind a load balancer, each replica has its own cache.
 
@@ -393,39 +446,53 @@ entry can delay that renewal by up to `refsMaxAge`.
 The `reason` on `fills.total` says why, and what clients see depends on it:
 
 - `too_large`: the response exceeded `maxEntrySize`. Clients still receive it
-  when the space was available. The key goes straight to the upstream for
-  `retention`.
-- `error_packet`, `sideband_error`, `framing`, `truncated`, `generation`: the
-  response was not safe or not valid to store. Clients still receive it.
+  when the space was available. If the response outgrew `maxEntrySize` while
+  streaming and the free disk budget cannot hold the rest, the fill aborts and
+  clients that had received bytes lose the connection. In every case the key
+  goes straight to the upstream for `retention`.
+- `error_packet`, `sideband_error`, `framing`, `truncated`: the response was not
+  safe or not valid to store. Clients still receive it.
+- `generation`: a push finished while a refs fill was in flight, so its response
+  might carry the tips from before the push and is not kept. Clients still
+  receive it, and the key is not marked.
 - `upstream_status`: the upstream answered with something other than a
   cacheable `200`. The waiting requests share that one response, or go to the
   upstream if it was over 64KiB.
 - `fetch_error`: a transport failure, a timeout, a failure to obtain a
   credential, or a failure reading an error body. Requests that had not yet
-  received bytes go to the upstream directly.
+  received bytes go to the upstream directly. If the failure comes mid-response,
+  clients that had received bytes lose the connection.
 - `encoding`: the upstream answered with a content encoding. The waiting
   requests go to the upstream directly.
-- `store_error`: the disk failed. If it failed after the body was fully
-  received, clients still receive the response. If it failed before, requests
-  that had received bytes lose the connection.
+- `store_error`: the disk failed, or the fill panicked. If the entry could not
+  be committed after the whole body was received and sealed, clients still
+  receive the response. If the disk failed earlier, including while writing the
+  entry's trailer, requests that had received bytes lose the connection, and
+  requests that had not go to the upstream directly.
 - `disk_budget`: no space could be reserved, so requests go to the upstream
-  directly. If space ran out while a response of unknown length was larger than
-  `maxEntrySize`, the clients sharing it lose the connection, and the key goes
-  straight to the upstream for `retention`.
+  directly. If more space cannot be reserved while a response within
+  `maxEntrySize` is still arriving (a ref advertisement beyond its 1MiB
+  reservation, or a body longer than its `Content-Length`), the fill aborts and
+  clients that had received bytes lose the connection.
+
+Except where noted above, each of these marks the key for one minute.
 
 Keep `maxDiskSize` well above `maxEntrySize`, and size it by the formula in
 [Sizing and volumes](#sizing-and-volumes). Most Git hosts send packs without a
-length, so the last case is the one to plan for.
+length, so a pack that outgrows `maxEntrySize` while the budget is full (the
+`too_large` abort) is the case to plan for.
 
 ### Clients see a connection closed mid-clone
 
 The connection is closed without a clean ending only after bytes were sent: the
-upstream failed or went silent mid-response, the disk failed mid-response, space
-ran out for a response larger than `maxEntrySize`, or a stored entry failed its
-integrity check while it was being read. If the upstream does not send response
-headers within `responseHeaderTimeout`, waiting requests are instead sent to the
-upstream directly, and clients see only the delay. In both cases, requests for
-the same key go straight to the upstream for one minute.
+upstream failed or went silent mid-response, the disk failed or its budget ran
+out mid-response (including a response that outgrew `maxEntrySize` with no free
+budget left), or a stored entry failed its integrity check while it was being
+read. If the upstream does not send response headers within
+`responseHeaderTimeout`, waiting requests are instead sent to the upstream
+directly, and clients see only the delay. After a failed fill, requests for the
+same key go straight to the upstream for one minute, or for `retention` after an
+oversize response.
 
 ### `haybale serve` refuses to start
 

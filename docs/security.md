@@ -223,10 +223,10 @@ end-to-end headers continue to follow reverse-proxy forwarding rules.
 ## Response cache
 
 The optional [response cache](caching.md) serves the pack transfer of repeated
-identical clones and fetches from local disk. It is off by default. This section describes what it
-changes about haybale's security properties; the properties above hold for
-every request, cached or not. Stale-if-error is reserved for a later release
-and is not available.
+identical clones and fetches from local disk. It is off by default. This
+section describes what it changes about haybale's security properties; the
+properties above hold for every request, cached or not. Stale-if-error is
+reserved for a later release and is not available.
 
 ### Authentication and policy before any lookup
 

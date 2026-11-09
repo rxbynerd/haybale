@@ -377,10 +377,14 @@ Lifecycle:
 > `maxEntrySize` is spooled and served to completion without committing when
 > the reservation can be made from free space, so concurrent requests still
 > coalesce. Otherwise the waiting requests are released to passthrough.
-> Either way the key is marked for `retention`. Budget exhaustion mid-fill
-> aborts the subscribers and marks the key for `retention`. A shared non-200
-> response marks the key for one minute. A commit failure after a fully
-> spooled body is a discard: subscribers are served to completion.
+> Either way the key is marked for `retention`. Growth past
+> `SealedSize(maxEntrySize)` that free space cannot hold aborts the subscribers
+> (reason `too_large`) and marks the key for `retention`. Any other budget
+> exhaustion (reason `disk_budget`), a shared non-200 response and every other
+> discard or abort mark the key for one minute. A `generation` discard, and a
+> fill cancelled because its subscribers left, mark nothing. A commit failure
+> after a fully spooled body is a discard: subscribers are served to
+> completion, while a failure to write the trailer aborts them.
 
 > Implemented as: A pack fill reserves the sealed size of the upstream
 > `Content-Length`, or of `maxEntrySize` when the length is unknown, plus a
@@ -711,7 +715,7 @@ Metrics (host and class only, never owner or repository), under the
 - `fills.total` labels host, class, result (`stored`, `discarded`),
   reason (`error_packet`, `sideband_error`, `framing`, `truncated`,
   `too_large`, `disk_budget`, `store_error`, `generation`,
-  `upstream_status`, `fetch_error`);
+  `upstream_status`, `fetch_error`, `encoding`);
 - `fill_bytes.total` and `served_bytes.total` labels host, class, tier
   (`disk`, `remote`, `upstream`);
 - `collapsed.total` labels host (subscribers that joined an in-flight
@@ -739,7 +743,7 @@ upstream-load panels should use the fill metrics instead.
 ```yaml
 cache:
   enabled: false
-  dir: /var/cache/haybale          # required when enabled; 0700, owned by the process user
+  dir: /var/cache/haybale          # required when enabled; no group or other permission bits, owned by the process user
   keyEnv: HAYBALE_CACHE_KEY        # 32-byte base64 key; optional for disk-only, required with remote
   maxDiskSize: 10GiB               # tier-1 budget: committed + in-flight + evicted-but-open
   maxEntrySize: 1GiB               # larger responses stream through unstored
@@ -767,9 +771,9 @@ cache:
 The `cache` block is decoded strictly (unknown keys are errors) even
 though the rest of the file is not, so a mistyped or renamed key fails
 startup instead of silently reverting to a default. Sizes use a
-`ByteSize` YAML type that accepts IEC units only (`KiB`,
-`MiB`, `GiB`, `TiB`) and rejects bare integers and SI units, so a value
-can never be misread by a factor of 1024. Durations use Go duration
+`ByteSize` YAML type that accepts IEC units only (`KiB`, `MiB`, `GiB`, `TiB`)
+and rejects bare integers other than 0 and SI units, so a value can never be
+misread by a factor of 1024. Durations use Go duration
 strings as elsewhere. `cache` follows the configuration package's
 pattern: a structural `validate()` at load time (parses sizes and
 durations, requires `retention > 0`, requires `refsMaxAge < accessRecheck`

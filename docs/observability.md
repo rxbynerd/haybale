@@ -73,6 +73,11 @@ values (repo owner/name, identity) are **never** metric labels — they would
 explode series cardinality on a backend like Mimir — and appear only on
 spans.
 
+The tables below write attribute names without their prefix. The keys a
+backend receives are `haybale.host`, `haybale.verb`, `haybale.outcome`,
+`haybale.result`, `haybale.class`, `haybale.reason`, `haybale.tier` and
+`haybale.operation`; the status is `http.response.status_code`.
+
 | Instrument                          | Type              | Attributes                        | Meaning                                                    |
 |-------------------------------------|-------------------|-----------------------------------|-------------------------------------------------------------|
 | `haybale.requests.total`            | counter           | `host`, `verb`, `outcome`, `status` | Every terminal request outcome. `status` is present on proxied requests. |
@@ -102,8 +107,12 @@ carry a repository owner or name.
 | `haybale.response_cache.disk_bytes`           | up/down counter | (none)                             | Bytes currently held by the disk tier: committed entries plus bytes pinned by readers of removed entries. Space reserved for fills in progress is not counted, so the gauge can sit below the `maxDiskSize` budget the cache enforces. |
 
 The `class` attribute is the request class the cache recognised
-(`advertisement`, `ls-refs`, `fetch`, or `bypass`). `bypass` is used for
-requests the cache did not classify. The other closed sets are:
+(`advertisement`, `ls-refs`, `fetch`, or `bypass`). `class=bypass` is used for
+requests the cache could not classify as a cacheable shape. A request that was
+classified but that the cache then declined to serve is recorded under its real
+class with `result=bypass`: its key is marked uncacheable after a discarded
+fill, no fill slot was free, or a freshly stored entry failed verification
+again. The other closed sets are:
 
 | Attribute | Values |
 |-----------|--------|

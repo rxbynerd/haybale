@@ -95,11 +95,13 @@ For each smart-HTTP request, haybale:
 1. parses the upstream host, owner, repository, and Git read/write operation;
 2. verifies the caller's JWT and derives its policy identity;
 3. authorizes the identity against `policy.yaml` and any token repository scope;
-4. replaces the caller's authorization header with the configured upstream
-   credential;
-5. with the optional response cache enabled, reads the request body, and serves
-   a stored response or joins a fetch already in progress; and
-6. otherwise streams the request and response between the client and upstream.
+4. with the optional response cache enabled, offers a read to the cache, which
+   reads the request body and serves a stored response without contacting the
+   upstream; and
+5. when the request needs the upstream (a cache miss, a request the cache does
+   not handle, a push, or no cache), mints the upstream credential, replaces the
+   caller's authorization header with it, and streams the request and response
+   between the client and upstream.
 
 See the [configuration reference](docs/configuration.md) for complete examples.
 
