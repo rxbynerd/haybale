@@ -65,6 +65,8 @@ const (
 	headerCutTimeout
 	// headerCutArrived: response headers arrived before the timer.
 	headerCutArrived
+	// headerCutFailed: the upstream request failed before the timer.
+	headerCutFailed
 )
 
 // errOversizeGrowth reports that a response outgrew the entry size limit
@@ -342,6 +344,13 @@ func (f *fill) fetchHeaders(probing bool) (resp *http.Response, done context.Can
 		if !f.headerCut.CompareAndSwap(headerCutNone, headerCutArrived) {
 			_ = resp.Body.Close()
 			err = context.Canceled
+		}
+	} else {
+		// Once claimed, a failure keeps its own classification even if the
+		// timer fires before the caller reads headerCut.
+		f.headerCut.CompareAndSwap(headerCutNone, headerCutFailed)
+		if h := f.c.hooks.afterFetchFailed; h != nil {
+			h(f.key)
 		}
 	}
 	if err != nil {

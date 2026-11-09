@@ -164,6 +164,26 @@ func TestHeaderTimerFiringAfterFetchReturnsIsAHeaderTimeout(t *testing.T) {
 	}
 }
 
+// TestHeaderTimerFiringAfterAFetchErrorKeepsItsClass: a header timer that
+// fires after the fill has claimed a connect failure leaves it a connect
+// failure, which opens the gate, rather than a neutral header timeout.
+func TestHeaderTimerFiringAfterAFetchErrorKeepsItsClass(t *testing.T) {
+	const timeout = 20 * time.Millisecond
+	h := newStaleHarness(t, func(o *Options) { o.ResponseHeaderTimeout = timeout })
+	h.clock.Advance(10 * time.Minute)
+	h.c.hooks.afterFetchFailed = func(entryKey) { <-time.After(5 * timeout) }
+	if out, _, _ := serve(h.c, newCollectWriter(), fetchRequest(t), &failing{err: errDialRefused}); out.Result != observability.ResultStale {
+		t.Fatalf("refused fetch = %+v, want stale", out)
+	}
+	events := h.logs.securityEvents(t, security.EventCacheStaleServed)
+	if len(events) != 1 || events[0]["reason"] != staleReasonConnect {
+		t.Errorf("events = %v, want one with reason %s", events, staleReasonConnect)
+	}
+	if !h.c.gates.isOpen(testRepo.Host) {
+		t.Error("the refused connection did not open the gate")
+	}
+}
+
 // TestFetchErrorsLeaveTheKeyUnmarkedWithStaleService: with stale service
 // enabled a fetch error, before the body or during it, leaves the key
 // cacheable; without it the key is marked as before.
