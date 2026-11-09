@@ -1,0 +1,714 @@
+# Design: response cache for Git smart HTTP reads
+
+Status: proposed, revised 2026-11-09 after design review (pressure test,
+security threat model, API design review, adversarial document review)
+and a research survey of prior art. This document records the design
+decisions behind haybale's optional response cache so that future changes
+can be checked against the reasoning, not only the code.
+
+## Problem
+
+Fleets of sandboxed agents frequently clone the same repository within
+seconds or minutes of one another. Today every clone is a full upstream
+transfer: haybale authenticates, authorizes, injects a credential, and
+streams the pack from the Git host. For a 500 MiB repository and fifty
+agents that is 25 GiB of upstream egress and fifty rounds of upstream
+pack generation to deliver the same bytes. (Installation-token minting is
+already deduplicated by the token cache in `internal/upstream`; the cost
+here is bandwidth and upstream CPU, not credentials.)
+
+Two capabilities are wanted:
+
+1. **Deduplication.** Identical read requests, sequential or concurrent,
+   should cost one upstream transfer.
+2. **Reads during an upstream outage** (operator opt-in). When the Git
+   host or the GitHub API is unreachable, recently fetched content should
+   still be servable, with the staleness risk accepted explicitly.
+
+Writes (pushes) are never cached and never served during an outage.
+
+## Constraints inherited from haybale's security model
+
+The cache preserves every invariant in [security.md](../security.md):
+
+- the client token never reaches upstream; the upstream credential never
+  reaches the client;
+- authentication and policy run before anything else, including any
+  body read or cache lookup, and a policy denial is a 404 byte-identical
+  to a missing repository (no existence oracle);
+- `GET info/refs?service=git-receive-pack` is a write;
+- the `Git-Protocol` header is always forwarded; and
+- a post-injection upstream 401/403 becomes a 502 with no upstream
+  headers leaking through.
+
+Two stated properties change, and the security document is updated with
+the implementation:
+
+- haybale reads the body of a *read* request, bounded by
+  `cache.maxRequestBody`, to derive a cache key and to build the upstream
+  request; and
+- haybale scans the pkt-line *framing* of a read response to decide
+  whether it is safe to store.
+
+It still never buffers a response body in memory, never interprets pack
+contents, and never reads a push body. Bypassed and write requests take
+exactly today's passthrough path.
+
+Standards note: by the definition in RFC 9111 haybale with the cache
+enabled is a shared cache, and the Git smart-HTTP specification forbids
+clients from reusing cached `POST` responses. This cache is deliberately
+non-standard. It is safe because policy runs before every lookup at the
+same granularity as the key (the repository), which is the authorization
+check RFC 9111 section 3.5 requires before a stored authenticated
+response may be reused.
+
+## Observed protocol behaviour
+
+A capture of real `git` 2.54 clients against `git http-backend`, taken
+while writing this design, and the research survey's experiments against
+GitHub established the following. Specifications:
+[gitprotocol-http](https://git-scm.com/docs/gitprotocol-http),
+[gitprotocol-v2](https://git-scm.com/docs/gitprotocol-v2),
+[gitprotocol-pack](https://git-scm.com/docs/gitprotocol-pack), and
+[gitprotocol-common](https://git-scm.com/docs/gitprotocol-common).
+
+- Two `git clone` runs of the same repository send byte-identical
+  request bodies for `ls-refs` and `fetch`. The only client-variable
+  lines are `agent=` and, when `transfer.advertiseSID` is on,
+  `session-id=`; the specification marks both informational.
+- A protocol v2 clone is three requests: `GET info/refs` (empty body;
+  the response is a capability advertisement, static for a server
+  version), `POST git-upload-pack` with `command=ls-refs` (the
+  freshness-sensitive request: its response is the current ref tips), and
+  `POST git-upload-pack` with `command=fetch` listing `want` lines and
+  `done`. Against GitHub, a v2 `POST` without the `Git-Protocol` header
+  is rejected with 400.
+- **git gzips any fetch request body over 1024 bytes** (`remote-curl.c`),
+  so a clone of a repository with more than roughly twenty refs arrives
+  with `Content-Encoding: gzip`. Bodies above `http.postBuffer` (1 MiB)
+  stream chunked and uncompressed.
+- `--depth 1` adds `deepen 1` and `include-tag`; protocol v0 sends one
+  `want` line carrying the capability list (including `agent=`) followed
+  by `done`. Partial-clone filters appear as `filter <spec>`.
+- An incremental fetch sends `have` lines and omits `done`; the server
+  answers with acknowledgments, `ready`, and the pack in one response.
+- An in-band error (for example `want` of an unknown object) is an HTTP
+  200 whose body is a single `ERR ...` pkt-line. Status codes alone
+  cannot decide cacheability.
+- Against GitHub, repeated identical fetches are **not** byte-identical:
+  sideband framing differs between runs while the pack payload and the
+  object set are identical. Only semantic equivalence matters; the
+  client validates every object id and the pack checksum.
+- Servers send `Cache-Control: no-cache`; clients send
+  `Accept-Encoding: deflate, gzip`.
+
+The decisive property is narrower than "packs are immutable". For a
+request whose arguments are all content-addressed (`want <oid>` with no
+`have`, no ref names, `done`), the response is a function of the request
+and of immutable objects: a pack satisfying `want X` is a complete
+closure of `X` and stays a correct answer to that exact request. Requests
+that name refs (`want-ref`, `deepen-not`), depend on negotiation state
+(`have`), or ask the server to emit URLs (`packfile-uris`) are not
+immutable and are never cached. Only the ref advertisement (which tips
+are current) has a freshness problem, and the design separates the two.
+
+## Decision 1: a request-keyed response cache, not a bare-repository mirror
+
+Two architectures were considered.
+
+**Response cache.** Store upstream responses keyed by (repository,
+canonical request). Serve identical requests from the store. This is the
+model of GitLab's Gitaly pack-objects cache, built to absorb exactly the
+"many CI runners clone the same commit" burst, and of Varnish's git
+caching, which keys on the request body minus `agent` and `session-id`.
+
+**Bare mirror.** Maintain a bare clone per repository on local disk,
+fetch from upstream on demand, and serve `git-upload-pack` locally (the
+model of GitHub Enterprise Server repository caching and
+`git-cache-http-server`).
+
+The mirror serves any request shape from local state and offers true
+offline reads. It was rejected because it changes what haybale is:
+haybale would become a Git server, carrying the attack surface of a `git`
+binary or a Go reimplementation of `upload-pack` inside a distroless
+image, holding long-lived repository state that must be garbage-collected
+and repaired, and doing every first fetch twice. A pluggable storage
+backend is also meaningless for a mirror. The response cache keeps
+haybale a proxy whose stored artefacts are opaque sealed blobs, which is
+what makes local disk and object storage interchangeable.
+
+The cost is coverage: only content-addressed requests with no `have`
+lines are cached, so incremental fetches always go upstream. Those are
+small by construction and are not the fleet-clone case.
+
+## Decision 2: request classes, canonical form and key
+
+Only requests whose verb is `read` are considered. The request body is
+read in full, bounded by `cache.maxRequestBody` (default `1MiB`) on the
+*decoded* size, and gzip-decoded when `Content-Encoding: gzip` is
+present. The body is then parsed strictly into pkt-lines. Any of the
+following classifies the request `bypass`, which takes today's
+passthrough path unchanged and stores nothing: a body over the bound, a
+`Content-Encoding` other than gzip or identity, a decode error, a pkt-line
+framing error, trailing bytes after the terminating flush, more than one
+command, more than one `agent=` or `session-id=`, a capability or
+argument outside the allowlists below, a `Git-Protocol` header that is
+absent for a v2-shaped body or present more than once, or any other
+surprise. The parser guesses nothing: doubt means bypass.
+
+| Class | Request | Freshness | Stored |
+| --- | --- | --- | --- |
+| `advertisement` | `GET info/refs?service=git-upload-pack` (v0 ref advertisement or v2 capability advertisement) | refs policy | yes |
+| `ls-refs` | v2 `command=ls-refs` with arguments from {`symrefs`, `peel`, `unborn`, `ref-prefix <p>`} | refs policy | yes |
+| `fetch` | v2 `command=fetch`, or v0 `want` lines, with arguments only from the fetch allowlist, at least one `want`, no `have`, and `done` | content-addressed | yes |
+| `bypass` | everything else | n/a | no |
+
+The fetch allowlist is: `want <oid>`, `done`, `thin-pack`, `no-progress`,
+`include-tag`, `ofs-delta`, `deepen <n>`, `deepen-relative`,
+`deepen-since <ts>`, `shallow <oid>`, and `filter <spec>` where `<spec>`
+matches `blob:none`, `blob:limit=<n>[kmg]`, `tree:<depth>`,
+`object:type=<blob|tree|commit|tag>`, or `sparse:oid=<full hex oid>`.
+For v0 the capability list must include `side-band-64k` or `side-band`.
+Explicitly bypassed: `have`, `want-ref` (sent automatically by stock
+clients when a server advertises `ref-in-want`; it resolves a ref name at
+request time), `deepen-not`, `packfile-uris`, `sideband-all`,
+`wait-for-done`, `server-option`, any other filter spec, and any unknown
+command (`object-info`, `bundle-uri`). Capability lines before the
+delimiter must be from {`command=`, `agent=`, `session-id=`,
+`object-format=`}; `object-format` stays in the key.
+
+`include-tag` is allowed with a documented limit. A full clone sends an
+explicit `want` for every tag it saw in `ls-refs`, so a new tag changes
+the key and no drift occurs. A `--depth` or `--single-branch` clone
+relies on `include-tag` for annotated tags that point into the wanted
+history; served from the cache, such a clone lacks annotated tags created
+after the entry was stored, for at most `retention`. This is accepted
+because shallow clones are the dominant agent pattern and tags are rarely
+load-bearing for them; tag-aware invalidation is deferred.
+
+**Canonical form.** The canonical body is the parsed body re-encoded as
+pkt-lines with the `agent=` and `session-id=` lines removed (for v0, the
+`agent=` token removed from the capability list) and nothing else
+changed, including line order and duplicate `want` lines. Clients built
+from the same image produce identical canonical bodies.
+
+**The upstream request is synthesised from the canonical form, not
+cloned from the client.** For cacheable classes the request sent upstream
+has exactly: the method and rewritten path; the canonical body with
+`Content-Length` and no `Content-Encoding`; `Content-Type`
+`application/x-git-upload-pack-request` (POST only); `Accept`
+`application/x-git-upload-pack-result` or `*/*`; the single validated
+`Git-Protocol` header; `Accept-Encoding: identity`; a fixed haybale
+`User-Agent` beginning `git/`; and the injected `Authorization`. Nothing
+else from the client is forwarded. The key is computed over exactly these
+forwarded inputs, so no unkeyed input can select the response other
+readers receive (this is the cache-poisoning vector the security review
+rated high).
+
+**Key.** `keyHash = sha256(class || "\n" || Git-Protocol value || "\n" || canonical body)`.
+`repoHash = HMAC-SHA256(cacheKey, upstream base URL || "\n" || owner || "/" || name)`,
+where `cacheKey` is the deployment's cache key (Decision 6). Including
+the configured base URL means repointing a host key or sharing a bucket
+between deployments with different upstreams never serves another
+origin's entries. Owner and repository case is not normalised: policy
+matching is exact-case, and the cache follows policy.
+
+Entries are addressed on both tiers as
+`v1/<group>/<repoHash>/<keyHash>` where `group` is `refs` (classes
+`advertisement` and `ls-refs`) or `pack` (class `fetch`). Grouping by
+freshness rather than by class lets push invalidation delete one prefix
+(`v1/refs/<repoHash>/`), lets a bucket lifecycle rule give the two groups
+different ages, and lets new v2 commands join a group without a layout
+change. Every
+path component is a hex digest; no client-supplied string is ever a path
+segment, and names read back from disk or a bucket are re-validated
+against the pattern before use.
+
+Inbound `Cache-Control`, `Pragma` and `Cache-Status` request headers have
+no effect on cache behaviour.
+
+## Decision 3: freshness policy
+
+- **`pack` entries are content-addressed.** They are retained for
+  `cache.retention` (default `24h`) or until evicted for space. No
+  retained pack is ever an incorrect answer to its request, but it may
+  be an answer upstream would no longer give: after a force-push that
+  removed a leaked secret, a deleted or transferred repository, or
+  revocation of haybale's own upstream access. Two controls bound that
+  window. A `pack` hit is served only if this instance saw a successful
+  upstream refs response (`advertisement` or `ls-refs`) for the
+  repository within `cache.accessRecheck` (default `5m`); with the
+  default refs policy every clone performs that request, so this costs
+  nothing for normal traffic and stops a client that posts `want` lines
+  directly from reading retained packs after access ends. `haybale cache
+  purge` (below) removes a repository's entries from both tiers on
+  demand. Retention is therefore also the exposure window after a
+  history rewrite, and the operational notes say so.
+- **`refs` entries are served from the cache only if younger than
+  `cache.refsMaxAge`** (default `0s`: always revalidate with upstream).
+  They are still stored and uploaded, because stale-if-error needs them
+  and they are a few hundred bytes. Refs requests are coalesced only
+  when `refsMaxAge > 0`; with the default every refs request reaches
+  upstream, so no client ever observes tips older than its own request.
+  An operator who wants to absorb a burst of ref lookups sets a few
+  seconds and accepts tips up to that age. The v2 capability
+  advertisement follows the refs policy deliberately: it is tiny and
+  the request is the first of every clone, so it must exist in the
+  cache for stale service.
+- **Pushes invalidate refs.** Any `git-receive-pack` `POST` for a
+  repository through this instance, whatever its status (a rejected push
+  still returns 200), deletes the repository's `refs` prefix in both
+  tiers and bumps an in-memory per-repository generation. A refs fill
+  whose upstream request began under an older generation is discarded at
+  commit. Replicas that did not see the push keep their tier-1 refs
+  entries until they age out, which matters only when `refsMaxAge > 0`.
+
+With the defaults, fifty concurrent v2 clones cost one hundred small
+upstream requests (advertisement and `ls-refs` per clone) and one pack
+transfer, with no staleness.
+
+## Decision 4: coalescing through a shared spool
+
+Every cacheable read that misses tier 1 (and tier 2, when configured)
+subscribes to a *fill* for its key. The first subscriber starts the fill;
+later subscribers attach while it is in flight. The fill runs in its own
+goroutine: it performs the upstream round trip through the proxy's
+fetcher (Decision 7) and writes the sealed response into a spool file on
+tier 1. **Every subscriber, including the first, is served by reading the
+spool**, decrypting and verifying each segment as soon as it is complete.
+Subscribers therefore run at their own pace, a slow client never
+throttles the fill or other clients, and leader, follower and later hit
+all take one read path and emit identical response headers.
+
+Lifecycle:
+
+- The fill's context derives from the server lifetime, not from any
+  request. It is cancelled when the subscriber count has been zero for a
+  short grace period, and on `Close` after graceful drain.
+- Before the first byte is spooled, a subscriber waits for the fill's
+  *header outcome*. On a 200 with an allowlisted `Content-Type`, the
+  subscriber streams. On any other status the fill buffers the response
+  body up to 64 KiB, applies the same sanitising as passthrough
+  (401/403 become a header-less 502), and every subscriber receives that
+  one response: the upstream answer depends only on haybale's credential
+  and the identical request, so fifty subscribers never become fifty
+  upstream attempts against a 404, 429 or 503. A non-200 body over
+  64 KiB, or a transport failure before headers, releases every
+  subscriber at once to the passthrough path (no serial re-election).
+  Attach, detach and cancellation take one lock, so a request cannot
+  attach to a fill that is being torn down.
+- If the fill fails after bytes were spooled (upstream transport error,
+  spool write error, disk budget exceeded, entry over `maxEntrySize`,
+  storability check failed), the spool is discarded and every subscriber
+  is aborted with `panic(http.ErrAbortHandler)`, which closes the
+  connection without a clean chunk terminator so no client can mistake a
+  truncated body for a complete one. The key is then marked uncacheable
+  in memory: for `retention` when the failure was an oversize response
+  (a deterministic key would otherwise fail every retry burst at the same
+  byte), and for a short cooldown for transient errors, so retries pass
+  straight through instead of refilling.
+- `recover()` guards every fill goroutine; a panic in the scanner or
+  sealing code aborts that fill and its subscribers, never the process.
+- Concurrent fills are bounded by `cache.maxConcurrentFills` (default
+  `32`); a request that cannot obtain a slot bypasses.
+
+A fill that completes the storability checks (Decision 5) commits the
+spool by rename and becomes a normal entry.
+
+## Decision 5: what may be stored
+
+An entry is committed only when all of the following hold:
+
+1. the response came from the configured upstream for that host, with
+   the injected credential, for a request that passed authentication and
+   policy;
+2. the status was 200 and `Content-Type` was
+   `application/x-git-upload-pack-advertisement` (advertisement) or
+   `application/x-git-upload-pack-result` (POST);
+3. the response was identity-encoded (haybale asked for identity);
+4. the body ended with a clean EOF, the byte count matched any
+   `Content-Length`, and the body did not exceed `cache.maxEntrySize`
+   (default `1GiB`);
+5. a pkt-line framing scan saw no in-band error and a terminating
+   flush-pkt exactly at EOF: no `ERR` packet in any section, no sideband
+   channel 3 frame inside the `packfile` section (v2) or the sideband
+   stream (v0), no malformed length (below 4 and not a special, `0003`,
+   or above 65520), and no unexpected section order; and
+6. the per-repository invalidation generation is unchanged since the
+   upstream request began (refs only).
+
+The scanner is a streaming state machine over pkt-line lengths and the
+first byte of each sideband frame. It treats lengths as skip counts,
+never allocates from a length field, never looks at channel 1 content,
+and handles frames split at any byte offset. Any state it does not
+recognise means "do not store". It never alters or delays the stream.
+It is fuzzed.
+
+## Decision 6: sealed entries, two storage tiers
+
+**Entry format.** Every stored object, on both tiers, is a header
+followed by sealed segments. The header is a small versioned record
+(format version, key id, `repoHash`, group, class, `keyHash`, plain
+repository name and upstream base URL for operators, creation time,
+`Content-Type`, body length, canonical-request digest) in clear text;
+the body is encrypted and authenticated in 64 KiB segments with
+AES-256-GCM in a STREAM-style construction (per-entry random nonce
+prefix, segment counter, final-segment flag) with the header's digest as
+associated data on every segment. A reader verifies the header and each
+segment before releasing bytes to the client; truncation, reordering,
+relocation under another key, and modification all fail verification.
+Verification failure is a miss plus a store-error metric; if bytes were
+already sent, the connection is aborted.
+
+The sealing key comes from the environment variable named by
+`cache.keyEnv` (32 bytes, base64), matching every other haybale secret.
+It is optional when only tier 1 is configured: haybale then generates an
+ephemeral key at startup and discards entries sealed under any other key
+id, so a local-only cache does not survive a process restart. It is
+required when `cache.remote` is set, because replicas must read each
+other's entries. The key is distinct from any storage credential; whoever
+can write to the bucket still cannot forge or relocate an entry
+(the security review's highest-severity finding). A key id in the header
+allows rotation by running two keys for a retention period.
+
+**Tier 1, local disk (`cache.dir`), required when the cache is enabled.**
+It is the spool for in-flight fills, the read path for every subscriber,
+and the local cache. Requirements: the directory must exist, be owned by
+the process user with no group or other permission bits, and every file
+operation goes through `os.Root` so symlinks cannot escape it. Files are
+created `0600`, written to a temporary name under the directory, synced,
+and renamed into place; a partially written entry is never visible.
+Temporary names carry a per-process prefix, so the startup sweep removes
+every temporary file from earlier processes without an age heuristic and
+the janitor never touches a live spool. A disk budget (`cache.maxDiskSize`, default `10GiB`) counts committed
+bytes, in-flight spool reservations, and evicted-but-still-open bytes;
+a fill that cannot reserve its first segment bypasses. A janitor evicts
+least-recently-used entries past the budget, removes expired entries and
+orphaned temporary files, and only ever deletes names matching the entry
+pattern. Operators deploy an `emptyDir` with `sizeLimit` above
+`maxDiskSize` so a full cache can never evict unrelated pods.
+
+**Tier 2, remote object storage (`cache.remote`), optional.** After a
+tier-1 commit, the sealed file is uploaded by a bounded worker pool from
+its finalised length (a `Stat` first skips the upload when a peer already
+stored the key). On a tier-1 miss, tier 2 is consulted before upstream
+under `cache.remote.timeout`; a tier-2 hit is streamed into the tier-1
+spool as a fill source, so subscribers coalesce on it exactly as on an
+upstream fill. A tier-2 failure before the first byte falls through to
+upstream inside the same fill; a failure mid-stream resumes with a ranged
+`Get` from the current offset a bounded number of times, since the object
+is immutable and its length is known from the header, and only then
+aborts. Bucket lifecycle expiry is day-granular on every cloud, so expiry
+is decided from the header's creation time and lifecycle rules are
+garbage collection only. Objects are stored as `application/octet-stream`
+with no user metadata (limits and encoding rules differ per vendor; the
+in-object header is the only metadata). Entries over 5 GiB are not
+uploaded (single-request PUT limit), which the default `maxEntrySize`
+already guarantees.
+
+```go
+// BlobStore is the remote tier. Implementations are safe for concurrent
+// use; callers own deadlines through ctx.
+type BlobStore interface {
+    Stat(ctx context.Context, key string) (ObjectInfo, error)             // ErrNotFound
+    Get(ctx context.Context, key string, offset int64) (io.ReadCloser, ObjectInfo, error)
+    Put(ctx context.Context, key string, body io.ReadSeeker, size int64) error
+    Delete(ctx context.Context, key string) error                        // nil when absent
+    List(ctx context.Context, prefix string) iter.Seq2[ObjectInfo, error]
+}
+```
+
+Tier 1 is a concrete spool store inside `internal/cache`, not a
+`BlobStore`; it needs growing-file reads, atomic rename and eviction that
+no remote store has. `BlobStore` is defined on the consumer side in
+`internal/cache`; each backend lives in its own package so the AWS SDK
+never enters the core.
+
+**`s3` backend** (first implementation) uses the AWS SDK for Go v2 (S3,
+config and credentials modules; no upload manager, since every upload has
+a known length). The research survey measured the alternatives: the
+official SDK adds 19 modules, minio-go 14, and a hand-rolled SigV4 client
+2, but the weight is the credential chain, and IRSA, EKS Pod Identity and
+IMDS support is exactly what a Kubernetes deployment needs and what is
+not worth owning. Configuration covers AWS S3, S3 Express One Zone
+directory buckets, Cloudflare R2, Ceph RGW, and Google Cloud Storage's
+S3 interoperability endpoint through `endpoint`, `region` and
+`forcePathStyle`. Constraints: `endpoint` must be `https` (loopback
+`http` allowed for tests, matching the JWKS URL rule); the endpoint is
+always set explicitly from configuration so `AWS_ENDPOINT_URL*` cannot
+redirect the cache; the SDK's HTTP client uses an explicit transport with
+no environment proxy; request and response checksums are set to `WhenRequired`
+(the SDK's default CRC32 checksums break several non-AWS stores);
+`prefix` must end with `/` (directory buckets require it); optional `sse` and `kmsKeyID`
+fields request server-side encryption where the store supports it (R2
+has none); errors are logged by operation,
+error code and status only; and the log scrubber gains AWS access-key-id
+patterns. Documentation recommends workload identity (IRSA or Pod
+Identity) with IMDSv2 hop limit 1, and names Cloudflare R2 as the
+zero-egress vendor-neutral option. Azure Blob Storage and native Google
+Cloud Storage are future `BlobStore` implementations; the MinIO server is
+archived and is not recommended for new deployments.
+
+Memcached and Redis were rejected as the remote tier: packs are routinely
+hundreds of megabytes, memcached's item limit is 1 MiB by default, and
+Redis would hold every pack in RAM. OCI registries were rejected: entries
+are keyed by request, not content digest, so every entry would need a
+manifest and tag, and registries offer no expiry.
+
+## Decision 7: integration with the proxy
+
+The proxy keeps one upstream transport and one set of credential-boundary
+functions, used by both the passthrough and the cache paths:
+
+- request construction (strip the client `Authorization`, inject the
+  upstream credential, never set `X-Forwarded-*`, empty trace
+  propagator), today in `rewrite`;
+- response sanitising (the 401/403-to-502 reset), today in
+  `modifyResponse`; and
+- the transport (`DisableCompression`, HTTP/1.1, and new dial and TLS
+  handshake timeouts of 30 s, which also apply to passthrough).
+
+The proxy exposes a `Fetcher` built from these pieces to the cache; the
+cache never constructs an upstream request itself. `proxy.New` gains a
+variadic option `WithCache`, so existing callers are unchanged and a nil
+cache is exactly today's behaviour. Within `ServeHTTP`, after policy
+allows a read, the cache is offered the request; it returns an outcome and
+whether it handled the response, and the proxy keeps the single place that
+records metrics and the request log.
+
+**Lookup precedes credential minting.** Today the credential is minted
+before forwarding. With the cache, a hit never contacts upstream or the
+GitHub API, so the fetcher mints lazily, and the `CredentialSource`
+documentation changes accordingly. `CredentialSource` implementations
+wrap transport failures and upstream-API 5xx responses in a new sentinel,
+`upstream.ErrUnavailable`; every other mint error (bad key, suspended app,
+installation removed, repository not in installation, rate limiting)
+remains opaque and is never treated as an outage.
+
+Existing tests for `Authorization` replacement, `X-Forwarded`
+suppression, no upstream `traceparent`, and 401/403-to-502 become
+table-driven over both paths.
+
+## Decision 8: stale-if-error (operator opt-in)
+
+`cache.staleIfErrorFor` (default `0s`, disabled) is the maximum age of an
+entry that may be served when upstream cannot answer. It must not exceed
+`retention`. The configuration reference and the security model describe
+the risk in plain terms: a stale clone can lack a security fix or still
+contain a reverted or scrubbed commit, and git shows no indication to the
+user.
+
+A read becomes eligible for stale service when, for that request:
+
+- the credential source returned `upstream.ErrUnavailable`;
+- the upstream connection failed (DNS, dial, TLS) or no response headers
+  arrived within `cache.responseHeaderTimeout`; or
+- upstream returned 500, 502, 503 or 504.
+
+Not eligible: 401 and 403 (a credential problem, still mapped to 502),
+404 and other 4xx (passed through), 429 or rate-limit 403 (a policy
+signal, not an outage), and every write. An eligible request is answered
+from the newest entry for its key no older than `staleIfErrorFor`; the
+`accessRecheck` rule is waived for stale service; the response carries
+`Cache-Status` with `fwd=stale` when exposed; a `cache_stale_served`
+security event records identity, repository, class and entry age; and a
+metric is recorded. Without a qualifying entry the request fails as it
+does today. A 5xx induced by one client's own request can only steer that
+client's own key to its stale entry; it changes nothing for other
+readers.
+
+**Health gate.** Each upstream host carries a gate so an outage does not
+cost every request a connection timeout before falling back. The gate
+opens only on failures a client cannot induce: DNS, dial and TLS errors,
+and `ErrUnavailable` from the credential source. Response-header timeouts
+and 5xx never open it. While open, requests that have a qualifying stale
+entry are served immediately; requests without one, and one probe request
+at a time, go upstream. A success closes the gate; an open gate re-probes
+every 5 s. The probe interval is a constant, not configuration.
+
+A clone during an outage therefore succeeds only if the same clone (same
+tips, same options) happened recently through this instance or a peer
+sharing tier 2. The latest stored refs may name tips for which no pack is
+stored (for example after a peer's incremental fetch refreshed `ls-refs`);
+that clone then fails at the fetch step as it would without the cache.
+Both limits are stated in the documentation.
+
+## Decision 9: what the client sees
+
+Responses served through the cache path carry the stored `Content-Type`,
+`Content-Encoding: identity` semantics (no header), the same
+`Cache-Control: no-cache` posture upstream sends, and nothing else from
+upstream. When `cache.exposeStatus` is `true` (default `false`), the
+response also carries an RFC 9211 `Cache-Status: haybale; ...` header with
+`hit`, `fwd=miss` (with `collapsed` for a subscriber that joined an
+in-flight fill and `stored` when the fill committed), `fwd=bypass`, or
+`hit; fwd=stale; fwd-status=<n>` for stale service. The header is off by
+default because within a repository that several tenants may read, a
+`hit` reveals that another identity made the identical request recently.
+The request log's `cache` field carries the same values for operators.
+
+## Operator controls
+
+`haybale cache purge --config haybale.yaml --repo HOST/OWNER/REPO [--group refs|pack]`
+removes a repository's entries from tier 1 and, when configured, tier 2.
+It is the documented response to a history rewrite that removed a secret,
+a repository deletion or transfer, or a suspected poisoned entry. Like
+`policy check` it runs offline against the local directory; the remote
+step opens the bucket client only when `--remote` is passed.
+
+## Observability
+
+Metrics (host and class only, never owner or repository), under the
+`haybale.response_cache.` prefix to avoid colliding with the token cache:
+
+- `lookups.total` labels host, class, result (`hit`, `miss`, `stale`,
+  `bypass`);
+- `fills.total` labels host, class, result (`stored`, `discarded`),
+  reason (`error_packet`, `sideband_error`, `framing`, `truncated`,
+  `too_large`, `disk_budget`, `store_error`, `generation`,
+  `upstream_status`, `fetch_error`);
+- `fill_bytes.total` and `served_bytes.total` labels host, class, tier
+  (`disk`, `remote`, `upstream`);
+- `collapsed.total` labels host (subscribers that joined an in-flight
+  fill);
+- `store_errors.total` labels tier, operation;
+- `uploads.total` labels result; `evictions.total`; `disk_bytes` gauge.
+
+Spans `haybale.response_cache.lookup` and `haybale.response_cache.fill`
+nest under the request span; the fill span is linked from, not parented
+to, the first subscriber's span because the fill outlives it. The request
+log gains a `cache` field. Security events: `cache_stale_served`
+(warning). Hits keep `outcome=proxied` on the existing request metrics so
+current dashboards and SLOs include them.
+
+## Configuration
+
+```yaml
+cache:
+  enabled: false
+  dir: /var/cache/haybale          # required when enabled; 0700, owned by the process user
+  keyEnv: HAYBALE_CACHE_KEY        # 32-byte base64 key; optional for disk-only, required with remote
+  maxDiskSize: 10GiB               # tier-1 budget: committed + in-flight + evicted-but-open
+  maxEntrySize: 1GiB               # larger responses stream through unstored
+  maxConcurrentFills: 32
+  maxRequestBody: 1MiB             # decoded size; larger read bodies bypass
+  retention: 24h                   # all entries; also the post-rewrite exposure window
+  refsMaxAge: 0s                   # 0s = always revalidate refs upstream
+  accessRecheck: 5m                # pack hits need a recent upstream refs success
+  responseHeaderTimeout: 0s        # 0s = none; set (e.g. 60s) when staleIfErrorFor is on
+  exposeStatus: false              # emit Cache-Status
+  remote:                          # optional tier 2
+    type: s3
+    bucket: haybale-cache
+    prefix: prod/
+    region: us-east-1
+    endpoint: ""                   # https; set for R2, Ceph, GCS interop
+    forcePathStyle: false
+    timeout: 10s                   # per remote operation on the miss path
+    sse: ""                        # "AES256" or "aws:kms"
+    kmsKeyID: ""
+  staleIfErrorFor: 0s              # 0s = disabled; must not exceed retention
+```
+
+Sizes use a `ByteSize` YAML type that accepts IEC units only (`KiB`,
+`MiB`, `GiB`, `TiB`) and rejects bare integers and SI units, so a value
+can never be misread by a factor of 1024. Durations use Go duration
+strings as elsewhere. `cache` follows the configuration package's
+pattern: a structural `validate()` at load time (parses sizes and
+durations, checks `staleIfErrorFor <= retention`, requires `keyEnv` with
+`remote`, recognises the remote type) with no filesystem or network side
+effects, so `haybale policy check` stays offline; and a
+`BuildCache(ctx, logger, metrics)` step called from `serve` that opens
+the directory, loads or generates the key, constructs the remote client,
+and starts the janitor and upload workers. The cache has `Close(ctx)`,
+called after graceful drain so fills and uploads survive the drain window
+and pending uploads are flushed within a bound; its goroutines are not
+bound to the SIGTERM context. `BuildCache` probes the bucket with a
+`Stat` of a sentinel key: `ErrNotFound` is healthy, an authorization
+error fails startup, matching the fail-fast JWKS behaviour.
+
+## Operational notes
+
+- The cache directory and bucket contain repository contents, sealed
+  under the cache key. Protect the key as a credential, give the bucket
+  no public access, and set a lifecycle rule at `retention` plus a margin
+  as garbage collection. Server-side encryption is additional defence.
+- Mount the cache volume only into the haybale container; any sidecar
+  sharing it runs as the same UID.
+- One `remote.prefix` is one trust domain: one upstream per host key and
+  one credential scope. Deployments whose host keys point at different
+  base URLs must not share a prefix (the `repoHash` already includes the
+  base URL, so they would not collide, but they should not share a key).
+- Cache entries are shared across every identity policy allows to read a
+  repository. Policy, not the cache, decides who may read what.
+- A hit does not contact upstream. haybale's own access being revoked
+  becomes visible at the next `accessRecheck` boundary, and stale-if-error
+  extends reads to `staleIfErrorFor`. After a history rewrite that
+  removed a secret, run `haybale cache purge` for the repository.
+- Sideband progress text is replayed verbatim to later readers. For
+  GitHub it is identity-neutral; an upstream that embeds per-session text
+  in progress output would replay it.
+
+## Alternatives considered
+
+- **HTTP-level caching (Varnish, nginx `proxy_cache`).** Git marks every
+  response `no-cache`, keys would be raw POST bodies, and no
+  general-purpose cache coalesces streaming POST responses. Rejected;
+  Varnish's purpose-built git module confirms a body-keyed design.
+- **Caching with `have` lines.** Replaying an acknowledgment set is
+  valid for the client but has a near-zero hit rate. Rejected.
+- **Keying on `Accept-Encoding`.** Requesting identity upstream removes
+  encoding from the problem entirely.
+- **Serving subscribers only after the fill completes** (singleflight).
+  Turns a burst of fifty clones into one transfer and forty-nine waits;
+  the spool costs little more and is what Gitaly does.
+- **Tee to the leader's client.** Couples fill speed to the slowest
+  client and gives the leader different headers from followers; the
+  spool-for-everyone model avoids both.
+- **Per-identity cache isolation.** Defeats the purpose and adds no
+  protection policy does not already provide.
+- **Unauthenticated digests for integrity.** Anyone who can rewrite an
+  entry can rewrite its digest; only a keyed construction helps.
+- **A bare-mirror backend behind the same interface.** A mirror is a
+  POSIX filesystem, not a blob; see Decision 1.
+
+## Delivery plan
+
+Three stacked pull requests. Each is independently shippable with the
+cache disabled by default, and PR 1 rejects configuration that later PRs
+introduce (`remote`, `staleIfErrorFor`) rather than ignoring it, since the
+YAML loader is not strict.
+
+1. **Core**: `internal/pktline` (framing reader and streaming scanner,
+   fuzzed), `internal/cache` (classification, canonical form, key, sealed
+   entry format, tier-1 spool store, fills and subscribers, janitor,
+   generation and invalidation, `BlobStore` interface and fill-source
+   abstraction with no remote implementation yet), `upstream.ErrUnavailable`,
+   proxy `Fetcher` and `WithCache`, shared transport timeouts,
+   configuration with `ByteSize`, `BuildCache` and `Close`, metrics,
+   `haybale cache purge` (tier 1), documentation, and end-to-end tests
+   with real `git` including a fixture with at least forty refs so request
+   bodies are gzip-encoded.
+2. **Remote tier**: the `s3` backend package, upload workers,
+   read-through fill source, `purge --remote`, scrubber patterns, tests
+   against an in-process S3-compatible fake, documentation.
+3. **Stale-if-error**: eligibility, health gate, `cache_stale_served`,
+   `Cache-Status` stale form, documentation of the risk in the security
+   model.
+
+## Deferred
+
+- Git over SSH: haybale is HTTPS-only. The canonical form and key would
+  carry over to an SSH front end, but SSH support is out of scope.
+- Azure Blob Storage and native Google Cloud Storage backends.
+- Pre-warming a repository into the cache ahead of a fleet run.
+- Caching negotiation rounds that carry `have` lines.
+- Tag-aware invalidation of `include-tag` pack entries (would require
+  parsing `ls-refs` responses).
+- A plain-`http` remote endpoint for in-cluster stores; entries are
+  sealed, so the remaining exposure is traffic analysis, but the option
+  is withheld until there is demand.
+- Case-normalising owner and repository names for case-insensitive
+  upstreams (would need the same change in policy matching).
+- Admission policies (cache on second sight) if one-off keys are found to
+  evict hot entries in practice.
