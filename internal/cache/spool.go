@@ -31,9 +31,15 @@ const (
 
 // spool is an entry being written: a temporary file in the cache
 // directory that readers can follow while it grows. It has a single
-// writer; Write, Reserve, Commit and Discard must not be called
+// writer; Write, Reserve, Commit, Discard and Release must not be called
 // concurrently with each other. Abort, Fail and NewReader may be called
 // from any goroutine.
+//
+// A spool ends in one of three ways. Commit renames it into place. Fail
+// (or Abort) removes it at once and its readers receive the error.
+// Discard keeps the file and reservation so that readers already attached,
+// and readers opened after the decision, drain every written byte to EOF;
+// Release then removes the file and frees the reservation.
 type spool struct {
 	store *diskStore
 	path  string
@@ -43,9 +49,10 @@ type spool struct {
 	reserved atomic.Int64
 
 	// Guarded by store.mu.
-	readers int
-	entry   *entryState // the committed entry, after Commit
-	pinned  int64       // bytes held by readers after Discard or failure
+	readers  int
+	entry    *entryState // the committed entry, after Commit
+	pinned   int64       // bytes held by readers after the file is removed
+	released bool        // the file is gone and the reservation freed
 
 	mu      sync.Mutex
 	cond    *sync.Cond
@@ -55,9 +62,10 @@ type spool struct {
 }
 
 // Create starts a spool for the entry at path with reserve bytes reserved
-// against the budget, evicting unopened least-recently-used entries to make
-// room. It returns errBudget when the reservation cannot fit.
-func (s *diskStore) Create(path string, reserve int64) (*spool, error) {
+// against the budget. With evict set, unopened least-recently-used entries
+// are evicted to make room; without it only free budget is used. It
+// returns errBudget when the reservation cannot fit.
+func (s *diskStore) Create(path string, reserve int64, evict bool) (*spool, error) {
 	if !validEntryPath(path) {
 		return nil, fmt.Errorf("%w %q", errInvalidPath, path)
 	}
@@ -69,7 +77,7 @@ func (s *diskStore) Create(path string, reserve int64) (*spool, error) {
 	if s.closed {
 		return nil, errStoreClosed
 	}
-	if err := s.reserveLocked(reserve); err != nil {
+	if err := s.reserveLocked(reserve, evict); err != nil {
 		s.reportLocked()
 		return nil, err
 	}
@@ -119,7 +127,7 @@ func (sp *spool) Write(p []byte) (int, error) {
 
 // Reserve grows the reservation by additional bytes, with the same
 // eviction and errBudget behaviour as Create.
-func (sp *spool) Reserve(additional int64) error {
+func (sp *spool) Reserve(additional int64, evict bool) error {
 	if additional < 0 {
 		return fmt.Errorf("cache: reservation must not be negative, got %d", additional)
 	}
@@ -129,7 +137,7 @@ func (sp *spool) Reserve(additional int64) error {
 	if err := sp.openErr(); err != nil {
 		return err
 	}
-	err := s.reserveLocked(additional)
+	err := s.reserveLocked(additional, evict)
 	if err == nil {
 		sp.reserved.Add(additional)
 	}
@@ -138,12 +146,14 @@ func (sp *spool) Reserve(additional int64) error {
 }
 
 // NewReader returns a reader over the bytes written so far that blocks for
-// more until the spool is committed, aborted or failed.
+// more until the spool is committed, discarded or failed. It succeeds
+// while the spool is open or discarded but not yet released; a committed
+// spool returns errSpoolCommitted, and the caller opens the entry instead.
 func (sp *spool) NewReader() (*spoolReader, error) {
 	s := sp.store
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := sp.openErr(); err != nil {
+	if err := sp.readableErr(); err != nil {
 		return nil, err
 	}
 	f, err := s.root.Open(sp.temp)
@@ -157,8 +167,9 @@ func (sp *spool) NewReader() (*spoolReader, error) {
 
 // Commit syncs the spool and renames it to its entry path, replacing any
 // entry already there. The reservation becomes committed bytes and
-// existing readers keep reading to EOF. On failure the spool is failed
-// with the returned error.
+// existing readers keep reading to EOF. On failure the spool is left
+// discarded, since every byte is already written and readable, and the
+// error is returned; the caller releases it as it would any discard.
 func (sp *spool) Commit() error {
 	if err := sp.openErr(); err != nil {
 		return err
@@ -228,41 +239,93 @@ func (sp *spool) failCommit(err error) error {
 	return sp.failCommitLocked(err)
 }
 
+// failCommitLocked records a commit failure and leaves the spool
+// discarded: the body is complete on disk, so readers drain it to EOF.
 func (sp *spool) failCommitLocked(err error) error {
 	sp.store.storeError(observability.OperationCommit, err)
-	sp.store.failLocked(sp, err)
+	sp.setStateLocked(spoolDiscarded, errSpoolDiscarded)
 	return err
 }
 
-// Discard ends the spool without committing it: readers receive every byte
-// already written and then io.EOF, and the file is removed and the
-// reservation released. Call it after the last Write. The written bytes
-// stay pinned until its readers close. Discarding a finished spool does
-// nothing.
+// Discard ends the spool without committing it: readers, including ones
+// opened after this call, receive every byte already written and then
+// io.EOF. The file and reservation stay until Release. Call it after the
+// last Write. Discarding a finished spool does nothing.
 func (sp *spool) Discard() {
 	s := sp.store
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.endLocked(sp, spoolDiscarded, errSpoolDiscarded)
+	sp.setStateLocked(spoolDiscarded, errSpoolDiscarded)
 }
 
-// failLocked moves an open spool to the failed state; see endLocked.
-func (s *diskStore) failLocked(sp *spool, err error) { s.endLocked(sp, spoolFailed, err) }
-
-// endLocked moves an open spool to state, which is spoolDiscarded or
-// spoolFailed, removes its file and releases its reservation. err is what
-// later spool operations return. Bytes already written stay pinned until
-// its readers close.
-func (s *diskStore) endLocked(sp *spool, state spoolState, err error) {
+// discarded reports whether the spool ended in a discard.
+func (sp *spool) discarded() bool {
 	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	return sp.state == spoolDiscarded
+}
+
+// DeleteEntry removes the entry a committed spool produced, unless another
+// entry has replaced it at that path since. Readers that hold the entry
+// open keep reading it.
+func (sp *spool) DeleteEntry() error {
+	s := sp.store
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sp.entry == nil {
+		return nil
+	}
+	return s.deleteStateLocked(sp.entry)
+}
+
+// Release removes a discarded spool's file and frees its reservation. Bytes
+// already written stay pinned until its readers close. It does nothing for
+// a spool that is open, committed, failed or already released.
+func (sp *spool) Release() {
+	s := sp.store
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sp.mu.Lock()
+	state := sp.state
+	sp.mu.Unlock()
+	if state == spoolDiscarded {
+		s.removeSpoolLocked(sp)
+	}
+}
+
+// failLocked moves an open spool to the failed state and removes its file
+// at once: readers receive err instead of further bytes.
+func (s *diskStore) failLocked(sp *spool, err error) {
+	if sp.setStateLocked(spoolFailed, err) {
+		s.removeSpoolLocked(sp)
+	}
+}
+
+// setStateLocked moves an open spool to state, which is spoolDiscarded or
+// spoolFailed, and wakes its readers. err is what later spool operations
+// return. It reports whether the spool was open. store.mu must be held.
+func (sp *spool) setStateLocked(state spoolState, err error) bool {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
 	if sp.state != spoolOpen {
-		sp.mu.Unlock()
-		return
+		return false
 	}
 	sp.state = state
 	sp.err = err
-	written := sp.written
 	sp.cond.Broadcast()
+	return true
+}
+
+// removeSpoolLocked removes an ended spool's file, releases its
+// reservation and pins the written bytes while readers hold them. It runs
+// once per spool.
+func (s *diskStore) removeSpoolLocked(sp *spool) {
+	if sp.released {
+		return
+	}
+	sp.released = true
+	sp.mu.Lock()
+	written := sp.written
 	sp.mu.Unlock()
 
 	_ = sp.f.Close()
@@ -288,6 +351,21 @@ func (sp *spool) openErr() error {
 		return sp.err
 	}
 	return nil
+}
+
+// readableErr returns nil while a new reader may be opened: the spool is
+// open, or discarded and not yet released. store.mu must be held.
+func (sp *spool) readableErr() error {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	switch {
+	case sp.state == spoolOpen, sp.state == spoolDiscarded && !sp.released:
+		return nil
+	case sp.state == spoolCommitted:
+		return errSpoolCommitted
+	default:
+		return sp.err
+	}
 }
 
 // spoolReader reads a spool from the start through its own descriptor,
@@ -369,7 +447,7 @@ func (r *spoolReader) Close() error {
 	case spoolCommitted:
 		s.releaseLocked(sp.entry)
 	case spoolDiscarded, spoolFailed:
-		if sp.readers == 0 {
+		if sp.readers == 0 && sp.released {
 			s.pinned -= sp.pinned
 			sp.pinned = 0
 		}

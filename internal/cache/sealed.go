@@ -322,7 +322,7 @@ func newSealedReader(r io.Reader, kr Keyring) (*sealedReader, error) {
 	if v := binary.BigEndian.Uint16(preamble[len(magic):]); v != formatVersion {
 		return nil, fmt.Errorf("%w: unknown format version %d", ErrIntegrity, v)
 	}
-	id := string(preamble[len(magic)+2 : len(magic)+2+keyIDLen])
+	id, _ := preambleKeyID(preamble)
 	if !kr.holds(id) {
 		return nil, fmt.Errorf("%w: unknown key id", ErrIntegrity)
 	}
@@ -440,6 +440,18 @@ func truncated(err error, where string) error {
 		return fmt.Errorf("%w: truncated %s", ErrIntegrity, where)
 	}
 	return err
+}
+
+// preambleKeyID returns the key id named by a preamble, and false when the
+// bytes are not a preamble of this format version.
+func preambleKeyID(preamble []byte) (string, bool) {
+	if len(preamble) < preambleLen || string(preamble[:len(magic)]) != magic {
+		return "", false
+	}
+	if binary.BigEndian.Uint16(preamble[len(magic):]) != formatVersion {
+		return "", false
+	}
+	return string(preamble[len(magic)+2 : len(magic)+2+keyIDLen]), true
 }
 
 func appendPreamble(dst []byte, keyID string, salt [saltLen]byte, prefix [noncePrefixLen]byte) []byte {

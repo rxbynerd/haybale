@@ -95,6 +95,7 @@ const (
 	FillReasonGeneration     = "generation"
 	FillReasonUpstreamStatus = "upstream_status"
 	FillReasonFetchError     = "fetch_error"
+	FillReasonEncoding       = "encoding"
 )
 
 // Response-cache storage tier values for the attrTier label. TierUpstream
@@ -442,9 +443,9 @@ func (m *Metrics) RecordMint(ctx context.Context, host, verb string) {
 	))
 }
 
-// RecordCacheLookup counts one token-cache lookup for host/verb with the
+// RecordTokenCacheLookup counts one token-cache lookup for host/verb with the
 // given result (ResultHit or ResultMiss).
-func (m *Metrics) RecordCacheLookup(ctx context.Context, host, verb, result string) {
+func (m *Metrics) RecordTokenCacheLookup(ctx context.Context, host, verb, result string) {
 	m.TokenCacheLookups.Add(ctx, 1, metric.WithAttributes(
 		attribute.String(attrHost, host),
 		attribute.String(attrVerb, verb),

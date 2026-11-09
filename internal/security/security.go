@@ -32,6 +32,12 @@ const (
 	// EventTokenMinted is emitted when a CredentialSource mints a
 	// short-lived credential. The event never includes the token itself.
 	EventTokenMinted = "token_minted"
+	// EventCacheIntegrityFailed is emitted when a response-cache entry
+	// fails verification: its seal does not authenticate, it has been
+	// moved to another path, or its creation time lies in the future.
+	// The entry is deleted. The event carries the repository and request
+	// class only, never a key id, path, hash or error text.
+	EventCacheIntegrityFailed = "cache_integrity_failed"
 )
 
 // Log emits a structured security event on logger. Security events are

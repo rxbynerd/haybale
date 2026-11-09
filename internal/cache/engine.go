@@ -13,6 +13,7 @@ import (
 
 	"github.com/rxbynerd/haybale/internal/gitproto"
 	"github.com/rxbynerd/haybale/internal/observability"
+	"github.com/rxbynerd/haybale/internal/security"
 )
 
 const (
@@ -22,6 +23,10 @@ const (
 	// maxCreatedAtSkew is how far in the future an entry's creation time
 	// may lie before the entry is treated as corrupt.
 	maxCreatedAtSkew = 5 * time.Minute
+	// maxClassifications bounds how many request bodies are held in
+	// memory for classification at once; a request that finds no slot
+	// passes through unclassified.
+	maxClassifications = 128
 )
 
 // errClientGone reports that the client stopped accepting the response.
@@ -35,7 +40,9 @@ type Options struct {
 	Keyring Keyring
 	// MaxDiskSize is the disk budget in bytes.
 	MaxDiskSize int64
-	// MaxEntrySize is the largest response body stored, in bytes.
+	// MaxEntrySize is the largest response body stored, in bytes. It must
+	// not exceed half of MaxDiskSize, so that a pack fill of unknown
+	// length can always reserve its sealed size.
 	MaxEntrySize int64
 	// MaxConcurrentFills bounds pack fills in flight, each of which may
 	// reserve maxEntrySize; a request that finds no free slot bypasses
@@ -89,6 +96,8 @@ type Cache struct {
 	// flight against maxRefsFills and is guarded by mu.
 	slots     chan struct{}
 	refsFills int
+	// classifySlots bounds request bodies held for classification.
+	classifySlots chan struct{}
 
 	idleGrace     time.Duration
 	flushInterval time.Duration
@@ -102,9 +111,27 @@ type Cache struct {
 	mu     sync.Mutex
 	fills  map[entryKey]*fill
 	closed bool
+	// commits counts fills that committed an entry, so a request that
+	// looked the entry up outside mu can tell whether one landed since.
+	commits uint64
+
+	hooks fillHooks
 }
 
-// New opens the cache directory, indexes its entries and starts the
+// fillHooks are seams for tests; every field is nil in production.
+type fillHooks struct {
+	// beforeCommit runs between a fill's generation check and its Commit.
+	beforeCommit func(key entryKey)
+	// afterDecision runs once a fill has committed or discarded its spool
+	// and before it ends.
+	afterDecision func(key entryKey)
+	// beforeOpenReader runs in a subscriber just before it opens the
+	// spool of a streaming fill.
+	beforeOpenReader func(key entryKey)
+}
+
+// New opens the cache directory, indexes its entries, removes entries
+// sealed under any key other than the active one, and starts the
 // janitor. The returned Cache runs until Close.
 func New(opts Options) (*Cache, error) {
 	if err := validateOptions(opts); err != nil {
@@ -126,6 +153,13 @@ func New(opts Options) (*Cache, error) {
 	if err != nil {
 		return nil, err
 	}
+	removed, err := store.removeForeignEntries(opts.Keyring.activeID())
+	if err != nil {
+		logger.Warn("removing cache entries sealed under another key failed", "error", err)
+	}
+	if removed > 0 {
+		logger.Info("removed cache entries sealed under another key", "entries", removed)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Cache{
 		opts:          opts,
@@ -137,6 +171,7 @@ func New(opts Options) (*Cache, error) {
 		ctx:           ctx,
 		cancel:        cancel,
 		slots:         make(chan struct{}, opts.MaxConcurrentFills),
+		classifySlots: make(chan struct{}, maxClassifications),
 		idleGrace:     fillIdleGrace,
 		flushInterval: sealFlushInterval,
 		access:        accessRecords{window: opts.AccessRecheck},
@@ -158,8 +193,8 @@ func validateOptions(opts Options) error {
 		return errors.New("cache: keyring has no active key")
 	case opts.MaxDiskSize <= 0:
 		return fmt.Errorf("cache: max disk size must be positive, got %d", opts.MaxDiskSize)
-	case opts.MaxEntrySize <= 0 || opts.MaxEntrySize > opts.MaxDiskSize:
-		return fmt.Errorf("cache: max entry size must be between 1 and the disk size, got %d", opts.MaxEntrySize)
+	case opts.MaxEntrySize <= 0 || opts.MaxEntrySize > opts.MaxDiskSize/2:
+		return fmt.Errorf("cache: max entry size %d must be between 1 and half of the disk size %d", opts.MaxEntrySize, opts.MaxDiskSize)
 	case opts.MaxConcurrentFills < 1:
 		return fmt.Errorf("cache: max concurrent fills must be at least 1, got %d", opts.MaxConcurrentFills)
 	case opts.MaxRequestBody <= 0:
@@ -183,9 +218,44 @@ func validateOptions(opts Options) error {
 // the Cache-Status bypass header is already set on w. A subscriber whose
 // response fails after bytes were written aborts the connection with
 // panic(http.ErrAbortHandler).
-func (c *Cache) Serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher) (Outcome, bool) {
+func (c *Cache) Serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher) (out Outcome, handled bool) {
+	release, ok := c.takeClassifySlot(r)
+	if !ok {
+		return c.declined(w, repo.Host, observability.ClassBypass, "body_budget"), false
+	}
+	// On the passthrough path the replayed body releases the slot once it
+	// has been read or closed; every other exit, including a panic,
+	// releases it here.
+	passthrough := false
+	defer func() {
+		if !passthrough {
+			release()
+		}
+	}()
+	out, handled = c.serve(w, r, repo, baseURL, fetch, release)
+	passthrough = !handled
+	return out, handled
+}
+
+// takeClassifySlot reserves a classification slot for a request with a
+// body and returns a function that releases it exactly once. A request
+// without a body needs no slot. ok is false when every slot is busy.
+func (c *Cache) takeClassifySlot(r *http.Request) (release func(), ok bool) {
+	if r.Body == nil || r.Body == http.NoBody || r.ContentLength == 0 {
+		return func() {}, true
+	}
+	select {
+	case c.classifySlots <- struct{}{}:
+	default:
+		return nil, false
+	}
+	var once sync.Once
+	return func() { once.Do(func() { <-c.classifySlots }) }, true
+}
+
+func (c *Cache) serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher, released func()) (Outcome, bool) {
 	host := repo.Host
-	req, bypass, reason, err := classify(r, repo, c.opts.MaxRequestBody)
+	req, bypass, reason, err := classify(r, repo, c.opts.MaxRequestBody, released)
 	if err != nil {
 		c.logger.WarnContext(r.Context(), "cache: request could not be classified", "host", host, "error", err)
 		return c.declined(w, host, observability.ClassBypass, "classify_error"), false
@@ -198,31 +268,34 @@ func (c *Cache) Serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo
 	if c.marks.marked(key, c.now()) {
 		return c.declined(w, host, class, "uncacheable"), false
 	}
-
-	entry := c.lookupEntry(key)
-	// A second pass runs when a stored entry fails verification: the
-	// entry has been deleted, so the request joins or starts a fill.
-	for range 2 {
-		if entry != nil {
-			if out, ok := c.serveEntry(w, entry, key, host, class); ok {
-				return out, true
-			}
-			entry = nil
-		}
-		var f *fill
-		var collapsed, ok bool
-		if key.Group == GroupRefs && c.opts.RefsMaxAge <= 0 {
-			f, ok = c.startSingle(key, req, repo, baseURL, fetch)
-		} else {
-			f, entry, collapsed, ok = c.joinOrStart(key, req, repo, baseURL, fetch)
-		}
+	if key.Group == GroupRefs && c.opts.RefsMaxAge <= 0 {
+		f, ok := c.startSingle(key, req, repo, baseURL, fetch)
 		if !ok {
 			return c.declined(w, host, class, "no_slot"), false
 		}
-		if entry != nil {
+		return c.subscribe(w, r, f, false, repo, class)
+	}
+
+	if e := c.openEntry(key, repo, class, true); e != nil {
+		if out, ok := c.serveOpened(w, e, repo, class, observability.ResultHit, false, observability.TierDisk); ok {
+			return out, true
+		}
+	}
+	// A stored entry that fails verification before any byte is written
+	// has been deleted, so the request joins or starts a fill instead; a
+	// second failure of a freshly committed entry is declined.
+	for range 2 {
+		f, e, collapsed, ok := c.joinOrStart(key, req, repo, baseURL, fetch, class)
+		if !ok {
+			return c.declined(w, host, class, "no_slot"), false
+		}
+		if e != nil {
+			if out, ok := c.serveOpened(w, e, repo, class, observability.ResultHit, false, observability.TierDisk); ok {
+				return out, true
+			}
 			continue
 		}
-		return c.subscribe(w, r, f, collapsed, host, class)
+		return c.subscribe(w, r, f, collapsed, repo, class)
 	}
 	return c.declined(w, host, class, "verification"), false
 }
@@ -236,74 +309,103 @@ func (c *Cache) declined(w http.ResponseWriter, host, class, reason string) Outc
 	return Outcome{Result: observability.ResultBypass}
 }
 
-// lookupEntry opens the stored entry for key if it may be served: it
-// exists, is within retention, and satisfies the freshness rule of its
-// group. An expired entry is deleted. The caller closes the entry.
-func (c *Cache) lookupEntry(key entryKey) *storedEntry {
-	if key.Group == GroupRefs && c.opts.RefsMaxAge <= 0 {
+// openedEntry is a stored entry whose header has been verified and whose
+// body is ready to stream.
+type openedEntry struct {
+	entry *storedEntry
+	sr    *sealedReader
+}
+
+func (e *openedEntry) close() { _ = e.entry.Close() }
+
+// openEntry opens and verifies the stored entry for key, returning nil
+// when there is none to serve. An entry that fails verification is
+// deleted. With fresh set the freshness rules apply too: a pack entry
+// needs a recent upstream refs success, an entry past retention is
+// deleted and missed, and a refs entry older than RefsMaxAge is missed.
+// Freshness is judged from the authenticated creation time, never from
+// the file. The caller closes the result.
+func (c *Cache) openEntry(key entryKey, repo gitproto.Repo, class string, fresh bool) *openedEntry {
+	now := c.now()
+	if fresh && key.Group == GroupPack && !c.access.recent(key.RepoHash, now) {
 		return nil
 	}
 	entry, err := c.store.Open(key.Path())
 	if err != nil {
 		return nil
 	}
-	now := c.now()
-	age := now.Sub(entry.ModTime())
-	switch {
-	case age > c.opts.Retention:
-		_ = entry.Close()
-		_ = c.store.Delete(key.Path())
-		return nil
-	case key.Group == GroupRefs && age > c.opts.RefsMaxAge,
-		key.Group == GroupPack && !c.access.recent(key.RepoHash, now):
-		_ = entry.Close()
-		return nil
-	}
-	return entry
-}
-
-// serveEntry streams a stored entry to the client. ok is false when the
-// entry failed verification before any byte was written; it has then been
-// deleted and the caller treats the request as a miss.
-func (c *Cache) serveEntry(w http.ResponseWriter, entry *storedEntry, key entryKey, host, class string) (Outcome, bool) {
-	defer func() { _ = entry.Close() }()
 	sr, err := newSealedReader(entry, c.keyring)
-	if err == nil && !headerMatches(sr.Header(), key, c.now()) {
-		err = fmt.Errorf("%w: header does not match the entry path", ErrIntegrity)
+	if err == nil {
+		err = verifyHeader(sr.Header(), key, now)
 	}
 	if err != nil {
-		c.dropCorrupt(key, err)
-		return Outcome{}, false
+		c.dropCorrupt(entry, repo, class, err)
+		_ = entry.Close()
+		return nil
 	}
-	n, started, err := c.stream(w, sr, sr.Header().ContentType, observability.ResultHit, false)
+	if fresh {
+		age := now.Sub(sr.Header().CreatedAt)
+		switch {
+		case age > c.opts.Retention:
+			_ = c.store.DeleteEntry(entry)
+			_ = entry.Close()
+			return nil
+		case key.Group == GroupRefs && age > c.opts.RefsMaxAge:
+			_ = entry.Close()
+			return nil
+		}
+	}
+	return &openedEntry{entry: entry, sr: sr}
+}
+
+// serveOpened streams a verified entry to the client, labelled with
+// result and tier. ok is false when the body failed verification before
+// any byte was written; the entry has then been deleted and the caller
+// treats the request as a miss. A failure after bytes were written also
+// deletes the entry and then aborts the response.
+func (c *Cache) serveOpened(w http.ResponseWriter, e *openedEntry, repo gitproto.Repo, class, result string, collapsed bool, tier string) (Outcome, bool) {
+	defer e.close()
+	n, started, err := c.stream(w, e.sr, e.sr.Header().ContentType, result, collapsed)
 	switch {
 	case errors.Is(err, errClientGone):
 	case err != nil && !started:
-		c.dropCorrupt(key, err)
+		c.dropCorrupt(e.entry, repo, class, err)
 		return Outcome{}, false
 	case err != nil:
-		c.logger.Warn("entry failed mid-stream; aborting the response", "host", host, "class", class, "error", err)
-		c.metrics.RecordResponseCacheStoreError(context.Background(), observability.TierDisk, observability.OperationOpen)
+		c.dropCorrupt(e.entry, repo, class, err)
+		c.logger.Warn("entry failed mid-stream; aborting the response", "host", repo.Host, "class", class, "error", err)
 		panic(http.ErrAbortHandler)
 	}
 	ctx := context.Background()
-	c.metrics.RecordResponseCacheLookup(ctx, host, class, observability.ResultHit)
-	c.metrics.RecordResponseCacheServedBytes(ctx, host, class, observability.TierDisk, n)
-	return Outcome{Result: observability.ResultHit, Status: http.StatusOK, BytesOut: n}, true
+	c.metrics.RecordResponseCacheLookup(ctx, repo.Host, class, result)
+	c.metrics.RecordResponseCacheServedBytes(ctx, repo.Host, class, tier, n)
+	return Outcome{Result: result, Collapsed: collapsed, Status: http.StatusOK, BytesOut: n}, true
 }
 
-// headerMatches reports whether a verified header belongs at key and
-// carries a plausible creation time.
-func headerMatches(h entryHeader, key entryKey, now time.Time) bool {
-	return h.Group == key.Group && h.RepoHash == key.RepoHash && h.KeyHash == key.KeyHash &&
-		!h.CreatedAt.After(now.Add(maxCreatedAtSkew))
+// verifyHeader checks that a verified header belongs at key and carries a
+// plausible creation time.
+func verifyHeader(h entryHeader, key entryKey, now time.Time) error {
+	if h.Group != key.Group || h.RepoHash != key.RepoHash || h.KeyHash != key.KeyHash {
+		return fmt.Errorf("%w: header does not match the entry path", ErrIntegrity)
+	}
+	if h.CreatedAt.After(now.Add(maxCreatedAtSkew)) {
+		return fmt.Errorf("%w: creation time is in the future", ErrIntegrity)
+	}
+	return nil
 }
 
-// dropCorrupt deletes an entry that failed verification.
-func (c *Cache) dropCorrupt(key entryKey, err error) {
+// dropCorrupt deletes an entry that could not be served, leaving any
+// entry committed at the same path since untouched. A verification
+// failure is a security event; a plain read error is a store error only.
+func (c *Cache) dropCorrupt(entry *storedEntry, repo gitproto.Repo, class string, err error) {
 	c.metrics.RecordResponseCacheStoreError(context.Background(), observability.TierDisk, observability.OperationOpen)
-	c.logger.Warn("entry failed verification; deleting it", "group", key.Group, "error", err)
-	_ = c.store.Delete(key.Path())
+	if errors.Is(err, ErrIntegrity) {
+		security.Log(c.logger, security.EventCacheIntegrityFailed, "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "class", class)
+		c.logger.Debug("entry failed verification; deleting it", "host", repo.Host, "class", class, "error", err)
+	} else {
+		c.logger.Warn("entry could not be read; deleting it", "host", repo.Host, "class", class, "error", err)
+	}
+	_ = c.store.DeleteEntry(entry)
 }
 
 // startSingle starts a fill that no other request can join, for a refs
@@ -320,22 +422,59 @@ func (c *Cache) startSingle(key entryKey, req Request, repo gitproto.Repo, baseU
 
 // joinOrStart attaches the request to the in-flight fill for key, or
 // returns a stored entry committed since the caller's lookup, or starts a
-// new fill. ok is false when no fill slot is free or the cache is closed.
-func (c *Cache) joinOrStart(key entryKey, req Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher) (f *fill, entry *storedEntry, collapsed, ok bool) {
+// new fill. The entry lookup runs without mu held; a fill is started only
+// if no commit landed meanwhile, so a request never duplicates a fill
+// that has just committed. ok is false when no fill slot is free or the
+// cache is closed.
+func (c *Cache) joinOrStart(key entryKey, req Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher, class string) (f *fill, e *openedEntry, collapsed, ok bool) {
+	for {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return nil, nil, false, false
+		}
+		if f := c.fills[key]; f != nil && !f.ended {
+			f.attachLocked()
+			c.mu.Unlock()
+			return f, nil, true, true
+		}
+		commits := c.commits
+		c.mu.Unlock()
+
+		e := c.openEntry(key, repo, class, true)
+
+		c.mu.Lock()
+		switch {
+		case c.closed:
+			c.mu.Unlock()
+			if e != nil {
+				e.close()
+			}
+			return nil, nil, false, false
+		case e != nil:
+			c.mu.Unlock()
+			return nil, e, false, true
+		}
+		if f := c.fills[key]; f != nil && !f.ended {
+			f.attachLocked()
+			c.mu.Unlock()
+			return f, nil, true, true
+		}
+		if c.commits != commits {
+			c.mu.Unlock()
+			continue
+		}
+		f = c.startFillLocked(key, req, repo, baseURL, fetch, true)
+		c.mu.Unlock()
+		return f, nil, false, f != nil
+	}
+}
+
+// noteCommit records that a fill committed an entry.
+func (c *Cache) noteCommit() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
-		return nil, nil, false, false
-	}
-	if f := c.fills[key]; f != nil && !f.ended {
-		f.attachLocked()
-		return f, nil, true, true
-	}
-	if entry := c.lookupEntry(key); entry != nil {
-		return nil, entry, false, true
-	}
-	f = c.startFillLocked(key, req, repo, baseURL, fetch, true)
-	return f, nil, false, f != nil
+	c.commits++
+	c.mu.Unlock()
 }
 
 // startFillLocked takes a fill slot for the key's group and starts the
@@ -347,6 +486,7 @@ func (c *Cache) startFillLocked(key entryKey, req Request, repo gitproto.Repo, b
 	}
 	f := c.newFill(key, req, repo, baseURL, fetch, shared)
 	f.subscribers = 1
+	f.pending = 1
 	if shared {
 		c.fills[key] = f
 	}
@@ -384,9 +524,14 @@ func (c *Cache) releaseSlot(group Group) {
 	<-c.slots
 }
 
-// subscribe serves the request from fill f.
-func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, collapsed bool, host, class string) (Outcome, bool) {
-	defer f.detach()
+// subscribe serves the request from fill f. A subscriber that attaches
+// after the fill committed is served from the committed entry; one that
+// attaches after a discard decision still reads the spool, which the fill
+// keeps until every attached subscriber has opened it.
+func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, collapsed bool, repo gitproto.Repo, class string) (Outcome, bool) {
+	host := repo.Host
+	opened := false
+	defer func() { f.detach(opened) }()
 	ctx := context.Background()
 	if collapsed {
 		c.metrics.RecordResponseCacheCollapsed(ctx, host)
@@ -403,7 +548,7 @@ func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, colla
 	case fillShared:
 		h := w.Header()
 		for k, vs := range out.header {
-			h[k] = vs
+			h[k] = append([]string(nil), vs...)
 		}
 		c.setCacheStatus(h, observability.ResultMiss, collapsed)
 		w.WriteHeader(out.status)
@@ -412,17 +557,41 @@ func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, colla
 		return Outcome{Result: observability.ResultMiss, Collapsed: collapsed, Status: out.status, BytesOut: int64(n)}, true
 	}
 
-	rd, err := f.spool.NewReader()
-	if err != nil {
-		// The fill ended before this subscriber could open the spool.
-		return c.declined(w, host, class, "fill_ended"), false
+	if h := c.hooks.beforeOpenReader; h != nil {
+		h(f.key)
 	}
+	rd, err := f.spool.NewReader()
+	if errors.Is(err, errSpoolCommitted) {
+		opened = true
+		f.readerOpened()
+		e := c.openEntry(f.key, repo, class, false)
+		if e == nil {
+			return c.declined(w, host, class, "fill_ended"), false
+		}
+		res, ok := c.serveOpened(w, e, repo, class, observability.ResultMiss, collapsed, observability.TierUpstream)
+		if !ok {
+			return c.declined(w, host, class, "verification"), false
+		}
+		<-f.done
+		res.Stored = f.stored
+		return res, true
+	}
+	if err != nil {
+		return c.declined(w, host, class, "fill_failed"), false
+	}
+	opened = true
+	f.readerOpened()
 	defer func() { _ = rd.Close() }()
+	stop := context.AfterFunc(r.Context(), func() { _ = rd.Close() })
+	defer stop()
 	sr, err := newSealedReader(rd, c.keyring)
 	if err != nil {
-		return c.declined(w, host, class, "fill_ended"), false
+		return c.declined(w, host, class, "fill_failed"), false
 	}
 	n, started, err := c.stream(w, sr, out.contentType, observability.ResultMiss, collapsed)
+	if err != nil && r.Context().Err() != nil {
+		err = errClientGone
+	}
 	switch {
 	case errors.Is(err, errClientGone):
 		c.metrics.RecordResponseCacheLookup(ctx, host, class, observability.ResultMiss)

@@ -15,8 +15,9 @@ type uncacheableMarks struct {
 	until map[entryKey]time.Time
 }
 
-// mark records key as uncacheable until the given time.
-func (m *uncacheableMarks) mark(key entryKey, until time.Time) {
+// mark records key as uncacheable until the given time. Once the map
+// reaches pruneThreshold, marks already expired at now are dropped.
+func (m *uncacheableMarks) mark(key entryKey, now, until time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.until == nil {
@@ -24,7 +25,7 @@ func (m *uncacheableMarks) mark(key entryKey, until time.Time) {
 	}
 	if len(m.until) >= pruneThreshold {
 		for k, t := range m.until {
-			if !until.Before(t) {
+			if !now.Before(t) {
 				delete(m.until, k)
 			}
 		}

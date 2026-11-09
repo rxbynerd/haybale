@@ -28,6 +28,9 @@ const (
 	// fillIdleGrace is how long a fill keeps running after its last
 	// subscriber leaves before it is cancelled.
 	fillIdleGrace = 2 * time.Second
+	// lateSubscriberGrace bounds how long a discarded spool waits for
+	// subscribers that attached before the fill ended to open it.
+	lateSubscriberGrace = 2 * time.Second
 	// sealFlushInterval bounds how long body bytes wait in the sealed
 	// writer before they are sealed into a segment subscribers can read,
 	// so upload-pack keepalives and progress reach clients promptly.
@@ -36,7 +39,8 @@ const (
 	// fails for any reason other than an oversize response.
 	transientCooldown = time.Minute
 	// reserveStep is the smallest amount by which a fill grows its spool
-	// reservation once the sealed output outruns it.
+	// reservation once the sealed output outruns it, and the headroom a
+	// pack fill reserves above the sealed size of the expected body.
 	reserveStep = 4 * segmentSize
 	// refsInitialReservation is the disk a refs fill reserves up front.
 	// Refs responses are kilobytes, so they neither reserve maxEntrySize
@@ -53,6 +57,10 @@ const (
 	// response must carry.
 	contentTypeAdvertisement = "application/x-git-upload-pack-advertisement"
 )
+
+// errOversizeGrowth reports that a response outgrew the entry size limit
+// and the free disk budget could not hold the rest of it.
+var errOversizeGrowth = errors.New("cache: response exceeds the entry size limit and the free budget")
 
 type fillOutcomeKind uint8
 
@@ -118,10 +126,15 @@ type fill struct {
 		err    error
 	}
 
-	// Guarded by Cache.mu.
-	subscribers int
-	ended       bool
-	idle        *time.Timer
+	// Guarded by Cache.mu. pending counts subscribers that have attached
+	// but not yet opened the spool or left; noPending is closed once the
+	// fill has ended and pending is zero.
+	subscribers   int
+	pending       int
+	ended         bool
+	idle          *time.Timer
+	noPending     chan struct{}
+	pendingClosed bool
 }
 
 func (c *Cache) newFill(key entryKey, req Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher, shared bool) *fill {
@@ -139,6 +152,7 @@ func (c *Cache) newFill(key entryKey, req Request, repo gitproto.Repo, baseURL *
 		cancel:      cancel,
 		headerReady: make(chan struct{}),
 		done:        make(chan struct{}),
+		noPending:   make(chan struct{}),
 	}
 }
 
@@ -148,6 +162,7 @@ func (f *fill) run() {
 	defer close(f.done)
 	defer f.c.wg.Done()
 	defer f.c.releaseSlot(f.key.Group)
+	defer f.releaseSpool()
 	defer f.end()
 	defer func() {
 		if r := recover(); r != nil {
@@ -161,7 +176,9 @@ func (f *fill) run() {
 func (f *fill) perform() {
 	resp, err := f.fetchHeaders()
 	if err != nil {
-		f.logger().Debug("upstream fetch failed", "error", err)
+		// The error is not logged: a credential source's error may carry
+		// upstream response bytes.
+		f.logger().Debug("upstream fetch failed")
 		f.release(observability.FillReasonFetchError, transientCooldown)
 		return
 	}
@@ -172,13 +189,13 @@ func (f *fill) perform() {
 		f.share(resp, body)
 		return
 	}
+	if !identityEncoded(resp.Header) {
+		f.release(observability.FillReasonEncoding, transientCooldown)
+		return
+	}
 	now := f.c.now()
 	if f.key.Group == GroupRefs {
 		f.c.access.record(f.key.RepoHash, now)
-	}
-	if resp.ContentLength > f.c.opts.MaxEntrySize {
-		f.release(observability.FillReasonTooLarge, f.c.opts.Retention)
-		return
 	}
 	if !f.openSpool(resp.ContentLength, now) {
 		return
@@ -231,21 +248,31 @@ func (f *fill) share(resp *http.Response, body io.Reader) {
 
 // openSpool reserves disk for the response and writes the sealed header.
 // A pack fill reserves the sealed size of the upstream Content-Length, or
-// of maxEntrySize when the length is unknown (contentLength -1); a refs
-// fill reserves refsInitialReservation. Either grows as sealed bytes
-// arrive.
+// of maxEntrySize when the length is unknown (contentLength -1), plus
+// headroom for flushes; a refs fill reserves refsInitialReservation. A
+// response whose Content-Length already exceeds maxEntrySize will not be
+// stored, so it reserves its sealed size from free budget only, without
+// evicting entries; if that cannot be made its subscribers pass through.
 func (f *fill) openSpool(contentLength int64, now time.Time) bool {
+	oversize := contentLength > f.c.opts.MaxEntrySize
 	reserve := int64(refsInitialReservation)
-	if f.key.Group == GroupPack {
+	switch {
+	case oversize:
+		reserve = sealedSize(contentLength) + reserveStep
+	case f.key.Group == GroupPack:
 		expected := f.c.opts.MaxEntrySize
 		if contentLength >= 0 {
 			expected = contentLength
 		}
-		reserve = sealedSize(expected)
+		reserve = sealedSize(expected) + reserveStep
 	}
-	sp, err := f.c.store.Create(f.key.Path(), reserve)
+	sp, err := f.c.store.Create(f.key.Path(), reserve, !oversize)
 	if err != nil {
-		f.release(storeReason(err), transientCooldown)
+		if oversize {
+			f.release(observability.FillReasonTooLarge, f.c.opts.Retention)
+		} else {
+			f.release(storeReason(err), transientCooldown)
+		}
 		return false
 	}
 	f.spool = sp
@@ -260,7 +287,8 @@ func (f *fill) openSpool(contentLength int64, now time.Time) bool {
 		ContentType: responseContentType(f.req.Class),
 		Protocol:    f.req.Protocol,
 	}
-	sw, err := newSealedWriter(&spoolWriter{sp: sp, reserved: reserve}, f.c.keyring, hdr)
+	w := &spoolWriter{sp: sp, reserved: reserve, evictBelow: sealedSize(f.c.opts.MaxEntrySize) + reserveStep}
+	sw, err := newSealedWriter(w, f.c.keyring, hdr)
 	if err != nil {
 		sp.Abort()
 		f.release(storeReason(err), transientCooldown)
@@ -273,6 +301,11 @@ func (f *fill) openSpool(contentLength int64, now time.Time) bool {
 // streamBody copies the upstream body into the spool through the sealed
 // writer and the storability scanner, then commits or discards the spool.
 func (f *fill) streamBody(contentLength int64, body io.Reader) {
+	defer func() {
+		if h := f.c.hooks.afterDecision; h != nil {
+			h(f.key)
+		}
+	}()
 	scanner := pktline.NewScanner(scanMode(f.req))
 	buf := make([]byte, fetchBufferSize)
 	for {
@@ -312,13 +345,31 @@ func (f *fill) streamBody(contentLength int64, body io.Reader) {
 	case f.key.Group == GroupRefs && f.c.gens.current(f.key.RepoHash) != f.gen:
 		f.discard(observability.FillReasonGeneration, 0)
 	default:
-		if err := f.spool.Commit(); err != nil {
-			f.abort(err, observability.FillReasonStoreError)
-			return
-		}
-		f.stored = true
-		f.finish(observability.FillResultStored, "", 0)
+		f.commit()
 	}
+}
+
+// commit stores the spool. The body is complete and readable by then, so
+// a commit failure is a discard, not an abort. A refs entry committed
+// after a push bumped the repository's generation is deleted again,
+// since it may carry the pre-push tips.
+func (f *fill) commit() {
+	if h := f.c.hooks.beforeCommit; h != nil {
+		h(f.key)
+	}
+	if err := f.spool.Commit(); err != nil {
+		f.logger().Warn("entry could not be committed", "error", err)
+		f.finish(observability.FillResultDiscarded, observability.FillReasonStoreError, transientCooldown)
+		return
+	}
+	if f.key.Group == GroupRefs && f.c.gens.current(f.key.RepoHash) != f.gen {
+		_ = f.spool.DeleteEntry()
+		f.finish(observability.FillResultDiscarded, observability.FillReasonGeneration, 0)
+		return
+	}
+	f.stored = true
+	f.c.noteCommit()
+	f.finish(observability.FillResultStored, "", 0)
 }
 
 // write seals p into the spool and arms the flush timer so that bytes
@@ -344,10 +395,18 @@ func (f *fill) write(p []byte) error {
 	return nil
 }
 
-// flushSeal runs on the flush timer and seals whatever is buffered.
+// flushSeal runs on the flush timer and seals whatever is buffered. A
+// panic here is recorded as the seal error so the fill aborts on its
+// next write instead of the process ending.
 func (f *fill) flushSeal() {
 	f.seal.mu.Lock()
 	defer f.seal.mu.Unlock()
+	defer func() {
+		if r := recover(); r != nil {
+			f.c.logger.Error("flush panicked", "class", f.req.Class, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+			f.seal.err = fmt.Errorf("cache: flush panicked: %v", r)
+		}
+	}()
 	f.seal.armed = false
 	if f.seal.closed || f.seal.err != nil {
 		return
@@ -361,14 +420,20 @@ func (f *fill) flushSeal() {
 func (f *fill) closeSeal() error {
 	f.seal.mu.Lock()
 	defer f.seal.mu.Unlock()
-	f.seal.closed = true
-	if f.seal.timer != nil {
-		f.seal.timer.Stop()
-	}
+	f.stopFlushLocked()
 	if f.seal.err != nil {
 		return f.seal.err
 	}
 	return f.seal.w.Close()
+}
+
+// stopFlushLocked ends sealing so no later flush runs. seal.mu must be
+// held.
+func (f *fill) stopFlushLocked() {
+	f.seal.closed = true
+	if f.seal.timer != nil {
+		f.seal.timer.Stop()
+	}
 }
 
 // setOutcome fixes the header outcome and wakes waiting subscribers. Only
@@ -388,7 +453,8 @@ func (f *fill) release(reason string, markFor time.Duration) {
 }
 
 // discard ends a spool that served its subscribers but is not storable:
-// readers receive every byte and then EOF, and the file is removed.
+// readers receive every byte and then EOF. The file is removed by
+// releaseSpool once every attached subscriber has opened it.
 func (f *fill) discard(reason string, markFor time.Duration) {
 	f.spool.Discard()
 	f.finish(observability.FillResultDiscarded, reason, markFor)
@@ -396,17 +462,26 @@ func (f *fill) discard(reason string, markFor time.Duration) {
 
 // abort ends a fill that cannot continue: readers of the spool receive err
 // and abort their clients' connections, and subscribers that have not yet
-// started reading take the passthrough path.
+// started reading take the passthrough path. A response that outgrew the
+// entry size limit marks its key for the retention period; any other
+// cause marks it for the transient cooldown.
 func (f *fill) abort(err error, reason string) {
 	if f.abandoned.Load() {
 		f.logger().Debug("fill cancelled after its subscribers left")
 	} else {
 		f.logger().Warn("fill aborted", "reason", reason, "error", err)
 	}
+	f.seal.mu.Lock()
+	f.stopFlushLocked()
+	f.seal.mu.Unlock()
 	if f.spool != nil {
 		f.spool.Fail(err)
 	}
-	f.release(reason, transientCooldown)
+	markFor := transientCooldown
+	if errors.Is(err, errOversizeGrowth) {
+		markFor = f.c.opts.Retention
+	}
+	f.release(reason, markFor)
 }
 
 // finish records the fill's result once and marks the key uncacheable for
@@ -423,7 +498,8 @@ func (f *fill) finish(result, reason string, markFor time.Duration) {
 		f.c.metrics.RecordResponseCacheFillBytes(ctx, f.repo.Host, string(f.req.Class), observability.TierUpstream, f.fetched)
 	}
 	if markFor > 0 && !f.abandoned.Load() {
-		f.c.marks.mark(f.key, f.c.now().Add(markFor))
+		now := f.c.now()
+		f.c.marks.mark(f.key, now, now.Add(markFor))
 	}
 	attrs := []any{"result", result, "bytes", f.fetched}
 	if reason != "" {
@@ -444,28 +520,70 @@ func (f *fill) end() {
 	if f.shared && c.fills[f.key] == f {
 		delete(c.fills, f.key)
 	}
+	f.signalPendingLocked()
 	c.mu.Unlock()
 	f.cancel()
+}
+
+// releaseSpool removes a discarded spool once every subscriber attached
+// before the fill ended has opened it or left, or the grace period has
+// passed. Committed and failed spools need nothing here.
+func (f *fill) releaseSpool() {
+	if f.spool == nil || !f.spool.discarded() {
+		return
+	}
+	timer := time.NewTimer(lateSubscriberGrace)
+	defer timer.Stop()
+	select {
+	case <-f.noPending:
+	case <-timer.C:
+		f.logger().Warn("subscribers did not open the spool in time; releasing it")
+	}
+	f.spool.Release()
 }
 
 // attachLocked adds a subscriber. Cache.mu must be held.
 func (f *fill) attachLocked() {
 	f.subscribers++
+	f.pending++
 	if f.idle != nil {
 		f.idle.Stop()
 		f.idle = nil
 	}
 }
 
+// readerOpened records that a subscriber has opened the spool, or has
+// found it committed and opened the entry instead.
+func (f *fill) readerOpened() {
+	f.c.mu.Lock()
+	f.pending--
+	f.signalPendingLocked()
+	f.c.mu.Unlock()
+}
+
 // detach removes a subscriber and, when none remain, schedules the fill's
-// cancellation after the idle grace period.
-func (f *fill) detach() {
+// cancellation after the idle grace period. opened reports whether the
+// subscriber called readerOpened.
+func (f *fill) detach(opened bool) {
 	c := f.c
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	f.subscribers--
+	if !opened {
+		f.pending--
+		f.signalPendingLocked()
+	}
 	if f.subscribers == 0 && !f.ended {
 		f.idle = time.AfterFunc(c.idleGrace, f.abandon)
+	}
+}
+
+// signalPendingLocked closes noPending once the fill has ended and no
+// attached subscriber is still to open the spool. Cache.mu must be held.
+func (f *fill) signalPendingLocked() {
+	if f.ended && f.pending == 0 && !f.pendingClosed {
+		f.pendingClosed = true
+		close(f.noPending)
 	}
 }
 
@@ -486,17 +604,25 @@ func (f *fill) logger() *slog.Logger {
 }
 
 // spoolWriter writes sealed bytes to a spool, growing the reservation
-// ahead of the bytes so that a write never exceeds it.
+// ahead of the bytes so that a write never exceeds it. Growth up to
+// evictBelow sealed bytes may evict committed entries; beyond it, where
+// the response can no longer be stored, only free budget is used.
 type spoolWriter struct {
-	sp       *spool
-	written  int64
-	reserved int64
+	sp         *spool
+	written    int64
+	reserved   int64
+	evictBelow int64
 }
 
 func (w *spoolWriter) Write(p []byte) (int, error) {
-	if need := w.written + int64(len(p)) - w.reserved; need > 0 {
+	end := w.written + int64(len(p))
+	if need := end - w.reserved; need > 0 {
 		add := max(need, reserveStep)
-		if err := w.sp.Reserve(add); err != nil {
+		evict := end <= w.evictBelow
+		if err := w.sp.Reserve(add, evict); err != nil {
+			if !evict && errors.Is(err, errBudget) {
+				err = fmt.Errorf("%w: %w", errOversizeGrowth, err)
+			}
 			return 0, err
 		}
 		w.reserved += add
@@ -546,6 +672,20 @@ func responseContentType(class Class) string {
 	return contentTypeResult
 }
 
+// identityEncoded reports whether a response carries no Content-Encoding
+// other than identity. Any other coding cannot be streamed to clients or
+// stored, since the fill requests identity and relays no coding header.
+func identityEncoded(h http.Header) bool {
+	for _, v := range h.Values("Content-Encoding") {
+		for coding := range strings.SplitSeq(v, ",") {
+			if c := strings.ToLower(strings.TrimSpace(coding)); c != "" && c != "identity" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // scanMode selects the response grammar for a request.
 func scanMode(req Request) pktline.Mode {
 	switch req.Class {
@@ -583,13 +723,17 @@ func verdictReason(reason string) string {
 	}
 }
 
-// storeReason labels a spool error: a budget failure or any other store
-// error.
+// storeReason labels a spool error: a response that outgrew the entry
+// size limit, a budget failure, or any other store error.
 func storeReason(err error) string {
-	if errors.Is(err, errBudget) {
+	switch {
+	case errors.Is(err, errOversizeGrowth):
+		return observability.FillReasonTooLarge
+	case errors.Is(err, errBudget):
 		return observability.FillReasonDiskBudget
+	default:
+		return observability.FillReasonStoreError
 	}
-	return observability.FillReasonStoreError
 }
 
 // hopByHopHeader reports whether name is a hop-by-hop header that must

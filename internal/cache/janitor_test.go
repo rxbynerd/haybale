@@ -65,7 +65,7 @@ func TestJanitorRetentionSurvivesReopen(t *testing.T) {
 func TestJanitorRemovesStaleTempsOnly(t *testing.T) {
 	dir := cacheDir(t)
 	s := openStore(t, dir, 1<<20, nil)
-	live, err := s.Create(entryPath(GroupPack, 1, 1), 10)
+	live, err := s.Create(entryPath(GroupPack, 1, 1), 10, true)
 	if err != nil {
 		t.Fatal(err)
 	}

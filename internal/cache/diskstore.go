@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -194,12 +195,11 @@ func checkCacheDir(dir string, info fs.FileInfo, uid int) error {
 // descriptor of its own, so it stays readable after the entry is deleted,
 // evicted or replaced; its bytes count against the budget until Close.
 type storedEntry struct {
-	f       *os.File
-	store   *diskStore
-	state   *entryState
-	size    int64
-	modTime time.Time
-	once    sync.Once
+	f     *os.File
+	store *diskStore
+	state *entryState
+	size  int64
+	once  sync.Once
 }
 
 // Open opens the committed entry at path and marks it most recently used.
@@ -243,7 +243,7 @@ func (s *diskStore) Open(path string) (*storedEntry, error) {
 	}
 	es.readers++
 	s.lru.MoveToFront(es.elem)
-	return &storedEntry{f: f, store: s, state: es, size: es.size, modTime: es.modTime}, nil
+	return &storedEntry{f: f, store: s, state: es, size: es.size}, nil
 }
 
 // Read reads sealed bytes.
@@ -254,9 +254,6 @@ func (e *storedEntry) Seek(offset int64, whence int) (int64, error) { return e.f
 
 // Size returns the sealed size of the entry in bytes.
 func (e *storedEntry) Size() int64 { return e.size }
-
-// ModTime returns the time the entry was committed.
-func (e *storedEntry) ModTime() time.Time { return e.modTime }
 
 // Close closes the entry, releasing its pinned bytes if it was removed
 // while open. Calling Close again returns nil.
@@ -270,6 +267,33 @@ func (e *storedEntry) Close() error {
 		e.store.mu.Unlock()
 	})
 	return err
+}
+
+// DeleteEntry removes the entry e was opened from, but only while the
+// index still holds that same entry: an entry committed at the path since
+// e was opened is left alone. Readers that hold e open keep reading it.
+func (s *diskStore) DeleteEntry(e *storedEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deleteStateLocked(e.state)
+}
+
+// deleteStateLocked removes es while the index still holds it; an entry
+// committed at the same path since is left alone.
+func (s *diskStore) deleteStateLocked(es *entryState) error {
+	if s.closed {
+		return errStoreClosed
+	}
+	if s.entries[es.path] != es {
+		return nil
+	}
+	if err := s.root.Remove(es.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		s.storeError(observability.OperationDelete, err)
+		return err
+	}
+	s.dropLocked(es)
+	s.reportLocked()
+	return nil
 }
 
 // Delete removes the entry at path. Readers that hold it open keep
@@ -316,14 +340,61 @@ func (s *diskStore) DeletePrefix(prefix string) (int, error) {
 	if err != nil {
 		s.storeError(observability.OperationDelete, err)
 	}
+	return removed, err
+}
+
+// removeForeignEntries deletes every indexed entry whose preamble does not
+// name keyID as its key, or that is too short or malformed to carry a
+// preamble, and returns how many were removed. It runs at startup before
+// any fill or reader exists, so no entry is pinned.
+func (s *diskStore) removeForeignEntries(keyID string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return 0, errStoreClosed
+	}
+	defer s.reportLocked()
+	var removed int
+	var firstErr error
 	for path, es := range s.entries {
-		if strings.HasPrefix(path, prefix) {
-			if _, statErr := s.root.Lstat(path); errors.Is(statErr, fs.ErrNotExist) {
-				s.dropLocked(es)
+		keep, err := s.sealedUnderLocked(path, keyID)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
 			}
+			continue
+		}
+		if keep {
+			continue
+		}
+		if s.removeLocked(path, observability.OperationDelete) {
+			s.dropLocked(es)
+			removed++
 		}
 	}
-	return removed, err
+	return removed, firstErr
+}
+
+// sealedUnderLocked reports whether the entry at path carries a valid
+// preamble naming keyID. A short or malformed preamble reports false.
+func (s *diskStore) sealedUnderLocked(path, keyID string) (bool, error) {
+	f, err := s.root.Open(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer func() { _ = f.Close() }()
+	var preamble [preambleLen]byte
+	if _, err := io.ReadFull(f, preamble[:]); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return false, nil
+		}
+		return false, err
+	}
+	id, ok := preambleKeyID(preamble[:])
+	return ok && id == keyID, nil
 }
 
 // PurgeDiskPrefix deletes every entry under prefix ("v1/<group>/<repoHash
@@ -391,8 +462,9 @@ func (s *diskStore) usage() (committed, inflight, pinned int64) {
 	return s.committed, s.inflight, s.pinned
 }
 
-// Close fails every live spool and closes the directory. Open entries and
-// readers stay readable until they are closed.
+// Close fails every live spool, releases every discarded one, and closes
+// the directory. Open entries and readers stay readable until they are
+// closed.
 func (s *diskStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -401,6 +473,7 @@ func (s *diskStore) Close() error {
 	}
 	for _, sp := range s.spools {
 		s.failLocked(sp, errStoreClosed)
+		s.removeSpoolLocked(sp)
 	}
 	s.closed = true
 	return s.root.Close()
@@ -439,13 +512,17 @@ func (s *diskStore) releaseLocked(es *entryState) {
 	}
 }
 
-// reserveLocked reserves n bytes for a spool, evicting unopened entries
-// from the least recently used end as needed.
-func (s *diskStore) reserveLocked(n int64) error {
+// reserveLocked reserves n bytes for a spool. With evict set it evicts
+// unopened entries from the least recently used end as needed; without it
+// only free budget is used.
+func (s *diskStore) reserveLocked(n int64, evict bool) error {
 	if n > s.budget {
 		return fmt.Errorf("%w: %d bytes exceed the %d-byte budget", errBudget, n, s.budget)
 	}
 	if over := s.committed + s.inflight + s.pinned + n - s.budget; over > 0 {
+		if !evict {
+			return fmt.Errorf("%w: %d bytes over the free budget", errBudget, over)
+		}
 		if err := s.evictLocked(over); err != nil {
 			return err
 		}

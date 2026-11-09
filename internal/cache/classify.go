@@ -11,6 +11,7 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/rxbynerd/haybale/internal/gitproto"
 )
@@ -66,7 +67,7 @@ const (
 // caller can pass the request through as received. err is non-nil only
 // for a misuse (a write request, a repo that does not match r, a
 // non-positive maxBody) or a failure reading the body from the client.
-func classify(r *http.Request, repo gitproto.Repo, maxBody int64) (req Request, bypass bool, reason string, err error) {
+func classify(r *http.Request, repo gitproto.Repo, maxBody int64, released func()) (req Request, bypass bool, reason string, err error) {
 	if maxBody <= 0 {
 		return Request{}, false, "", errors.New("cache: classify: maxBody must be positive")
 	}
@@ -88,7 +89,7 @@ func classify(r *http.Request, repo gitproto.Repo, maxBody int64) (req Request, 
 	if r.Method == http.MethodGet {
 		return classifyAdvertisement(r, repo, protocol)
 	}
-	return classifyUploadPack(r, repo, protocol, version, maxBody)
+	return classifyUploadPack(r, repo, protocol, version, maxBody, released)
 }
 
 func bypassed(reason string) (Request, bool, string, error) {
@@ -111,7 +112,7 @@ func classifyAdvertisement(r *http.Request, repo gitproto.Repo, protocol string)
 	return req, false, "", nil
 }
 
-func classifyUploadPack(r *http.Request, repo gitproto.Repo, protocol string, version int, maxBody int64) (Request, bool, string, error) {
+func classifyUploadPack(r *http.Request, repo gitproto.Repo, protocol string, version int, maxBody int64, released func()) (Request, bool, string, error) {
 	if r.URL.RawQuery != "" {
 		return bypassed(bypassNotAReadShape)
 	}
@@ -122,7 +123,7 @@ func classifyUploadPack(r *http.Request, repo gitproto.Repo, protocol string, ve
 	if !ok {
 		return bypassed(bypassContentEncoding)
 	}
-	decoded, reason, err := readBody(r, gzipped, maxBody)
+	decoded, reason, err := readBody(r, gzipped, maxBody, released)
 	if err != nil {
 		return Request{}, false, "", err
 	}
@@ -255,19 +256,49 @@ func (c *captureReader) Read(p []byte) (int, error) {
 }
 
 // replayBody serves the captured bytes and then the unread remainder of
-// the original body, and closes the original.
+// the original body, and closes the original. The captured bytes are
+// dropped, and released is called, once they have been replayed or the
+// body is closed, whichever comes first.
 type replayBody struct {
-	io.Reader
-	io.Closer
+	captured []byte
+	rest     io.ReadCloser
+	released func()
+	once     sync.Once
+}
+
+func (b *replayBody) Read(p []byte) (int, error) {
+	if len(b.captured) > 0 {
+		n := copy(p, b.captured)
+		b.captured = b.captured[n:]
+		if len(b.captured) == 0 {
+			b.drop()
+		}
+		return n, nil
+	}
+	return b.rest.Read(p)
+}
+
+func (b *replayBody) Close() error {
+	b.drop()
+	return b.rest.Close()
+}
+
+func (b *replayBody) drop() {
+	b.captured = nil
+	b.once.Do(b.released)
 }
 
 // readBody reads and decodes r's body, bounded by maxBody, and replaces
 // r.Body with a replay of the raw bytes it consumed followed by the
-// remainder.
-func readBody(r *http.Request, gzipped bool, maxBody int64) (decoded []byte, reason string, err error) {
+// remainder. released is called once the replay no longer holds the
+// captured bytes; nil means nothing is waiting on that.
+func readBody(r *http.Request, gzipped bool, maxBody int64, released func()) (decoded []byte, reason string, err error) {
 	body := r.Body
 	if body == nil {
 		body = http.NoBody
+	}
+	if released == nil {
+		released = func() {}
 	}
 	limit := maxBody
 	if limit < math.MaxInt64 {
@@ -275,7 +306,7 @@ func readBody(r *http.Request, gzipped bool, maxBody int64) (decoded []byte, rea
 	}
 	capture := &captureReader{r: io.LimitReader(body, limit)}
 	defer func() {
-		r.Body = replayBody{Reader: io.MultiReader(bytes.NewReader(capture.buf.Bytes()), body), Closer: body}
+		r.Body = &replayBody{captured: capture.buf.Bytes(), rest: body, released: released}
 	}()
 
 	decoded, decodeFailed := decodeBody(capture, gzipped, limit)

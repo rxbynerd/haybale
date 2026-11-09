@@ -90,7 +90,7 @@ func entryPath(group Group, repo, key byte) string {
 
 func commitEntry(t *testing.T, s *diskStore, path string, data []byte) {
 	t.Helper()
-	sp, err := s.Create(path, int64(len(data)))
+	sp, err := s.Create(path, int64(len(data)), true)
 	if err != nil {
 		t.Fatalf("Create(%s): %v", path, err)
 	}
@@ -236,7 +236,7 @@ func TestDiskStoreRejectsInvalidPaths(t *testing.T) {
 		if _, err := s.Open(p); !errors.Is(err, errInvalidPath) {
 			t.Errorf("Open(%q) err = %v", p, err)
 		}
-		if _, err := s.Create(p, 1); !errors.Is(err, errInvalidPath) {
+		if _, err := s.Create(p, 1, true); !errors.Is(err, errInvalidPath) {
 			t.Errorf("Create(%q) err = %v", p, err)
 		}
 		if err := s.Delete(p); !errors.Is(err, errInvalidPath) {
@@ -267,7 +267,7 @@ func TestDiskStoreSymlinksCannotEscape(t *testing.T) {
 			t.Fatal(err)
 		}
 		s := openStore(t, dir, 1<<20, nil)
-		sp, err := s.Create(entryPath(GroupPack, 1, 2), 10)
+		sp, err := s.Create(entryPath(GroupPack, 1, 2), 10, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -281,6 +281,10 @@ func TestDiskStoreSymlinksCannotEscape(t *testing.T) {
 		if len(names) != 1 {
 			t.Fatalf("outside directory now holds %d files", len(names))
 		}
+		// A failed commit leaves the spool discarded and readable; Release
+		// frees it.
+		assertUsage(t, s, 0, 10, 0)
+		sp.Release()
 		assertUsage(t, s, 0, 0, 0)
 	})
 
@@ -363,8 +367,8 @@ func TestDiskStoreRoundTripAndReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if e.Size() != 12 || !e.ModTime().Equal(clock.Now()) {
-		t.Fatalf("Size() = %d, ModTime() = %v", e.Size(), e.ModTime())
+	if e.Size() != 12 || !e.state.modTime.Equal(clock.Now()) {
+		t.Fatalf("Size() = %d, indexed modTime = %v", e.Size(), e.state.modTime)
 	}
 	if _, err := e.Seek(7, io.SeekStart); err != nil {
 		t.Fatal(err)
@@ -389,25 +393,25 @@ func TestDiskStoreRoundTripAndReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer mustClose(t, e)
-	if !e.ModTime().Equal(clock.Now()) {
-		t.Fatalf("reopened ModTime() = %v, want %v", e.ModTime(), clock.Now())
+	if !e.state.modTime.Equal(clock.Now()) {
+		t.Fatalf("reopened indexed modTime = %v, want %v", e.state.modTime, clock.Now())
 	}
 }
 
 func TestDiskStoreReservation(t *testing.T) {
 	s := openStore(t, cacheDir(t), 1000, nil)
-	a, err := s.Create(entryPath(GroupPack, 1, 1), 600)
+	a, err := s.Create(entryPath(GroupPack, 1, 1), 600, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertUsage(t, s, 0, 600, 0)
-	if _, err := s.Create(entryPath(GroupPack, 1, 2), 600); !errors.Is(err, errBudget) {
+	if _, err := s.Create(entryPath(GroupPack, 1, 2), 600, true); !errors.Is(err, errBudget) {
 		t.Fatalf("over-budget Create: err = %v, want errBudget", err)
 	}
-	if _, err := s.Create(entryPath(GroupPack, 1, 2), 2000); !errors.Is(err, errBudget) {
+	if _, err := s.Create(entryPath(GroupPack, 1, 2), 2000, true); !errors.Is(err, errBudget) {
 		t.Fatalf("Create larger than the budget: err = %v, want errBudget", err)
 	}
-	if _, err := s.Create(entryPath(GroupPack, 1, 2), -1); err == nil {
+	if _, err := s.Create(entryPath(GroupPack, 1, 2), -1, true); err == nil {
 		t.Fatal("negative reservation accepted")
 	}
 	if _, err := a.Write(make([]byte, 601)); !errors.Is(err, errOverReservation) {
@@ -416,10 +420,10 @@ func TestDiskStoreReservation(t *testing.T) {
 	if _, err := a.Write(make([]byte, 600)); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Reserve(500); !errors.Is(err, errBudget) {
+	if err := a.Reserve(500, true); !errors.Is(err, errBudget) {
 		t.Fatalf("Reserve past the budget: err = %v, want errBudget", err)
 	}
-	if err := a.Reserve(400); err != nil {
+	if err := a.Reserve(400, true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := a.Write(make([]byte, 400)); err != nil {
@@ -429,7 +433,7 @@ func TestDiskStoreReservation(t *testing.T) {
 	a.Abort()
 	assertUsage(t, s, 0, 0, 0)
 
-	b, err := s.Create(entryPath(GroupPack, 1, 3), 900)
+	b, err := s.Create(entryPath(GroupPack, 1, 3), 900, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +444,7 @@ func TestDiskStoreReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertUsage(t, s, 100, 0, 0)
-	if err := b.Reserve(1); !errors.Is(err, errSpoolCommitted) {
+	if err := b.Reserve(1, true); !errors.Is(err, errSpoolCommitted) {
 		t.Fatalf("Reserve after Commit: err = %v", err)
 	}
 }
@@ -474,7 +478,7 @@ func TestDiskStoreLRUEviction(t *testing.T) {
 	if _, err := s.Open(a); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected a to be evicted: err = %v", err)
 	}
-	if _, err := s.Create(entryPath(GroupPack, 1, 6), 250); !errors.Is(err, errBudget) {
+	if _, err := s.Create(entryPath(GroupPack, 1, 6), 250, true); !errors.Is(err, errBudget) {
 		t.Fatalf("Create needing the open entry's space: err = %v, want errBudget", err)
 	}
 	// A failed reservation evicts nothing.
@@ -541,7 +545,7 @@ func assertBlocked(t *testing.T, ch <-chan readResult) {
 func TestSpoolReaderFollowsGrowthUntilCommit(t *testing.T) {
 	s := openStore(t, cacheDir(t), 1<<20, nil)
 	p := entryPath(GroupPack, 1, 1)
-	sp, err := s.Create(p, 100)
+	sp, err := s.Create(p, 100, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -583,7 +587,7 @@ func TestSpoolReaderFollowsGrowthUntilCommit(t *testing.T) {
 
 func TestSpoolTwoReadersAtDifferentOffsets(t *testing.T) {
 	s := openStore(t, cacheDir(t), 1<<20, nil)
-	sp, err := s.Create(entryPath(GroupPack, 1, 1), 1<<16)
+	sp, err := s.Create(entryPath(GroupPack, 1, 1), 1<<16, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -641,7 +645,7 @@ func TestSpoolAbortAndFailReachReaders(t *testing.T) {
 			dir := cacheDir(t)
 			s := openStore(t, dir, 1<<20, nil)
 			p := entryPath(GroupPack, 1, 1)
-			sp, err := s.Create(p, 100)
+			sp, err := s.Create(p, 100, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -698,7 +702,7 @@ func TestSpoolAbortAndFailReachReaders(t *testing.T) {
 
 func TestSpoolReaderCloseUnblocksRead(t *testing.T) {
 	s := openStore(t, cacheDir(t), 1<<20, nil)
-	sp, err := s.Create(entryPath(GroupPack, 1, 1), 10)
+	sp, err := s.Create(entryPath(GroupPack, 1, 1), 10, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -734,7 +738,7 @@ func TestPinnedBytesReleasedOnLastClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertUsage(t, s, 0, 0, 400)
-	if _, err := s.Create(entryPath(GroupPack, 1, 2), 700); !errors.Is(err, errBudget) {
+	if _, err := s.Create(entryPath(GroupPack, 1, 2), 700, true); !errors.Is(err, errBudget) {
 		t.Fatalf("pinned bytes not counted against the budget: err = %v", err)
 	}
 	if data, err := io.ReadAll(e1); err != nil || len(data) != 400 {
@@ -760,7 +764,7 @@ func TestPinnedBytesReleasedOnLastClose(t *testing.T) {
 func TestSpoolReadersPinCommittedEntry(t *testing.T) {
 	s := openStore(t, cacheDir(t), 1000, nil)
 	p := entryPath(GroupPack, 1, 1)
-	sp, err := s.Create(p, 300)
+	sp, err := s.Create(p, 300, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -777,7 +781,7 @@ func TestSpoolReadersPinCommittedEntry(t *testing.T) {
 	assertUsage(t, s, 300, 0, 0)
 	// The spool reader holds the committed entry open, so it is not
 	// evictable.
-	if _, err := s.Create(entryPath(GroupPack, 1, 2), 800); !errors.Is(err, errBudget) {
+	if _, err := s.Create(entryPath(GroupPack, 1, 2), 800, true); !errors.Is(err, errBudget) {
 		t.Fatalf("entry held by a spool reader was evicted: err = %v", err)
 	}
 	if err := s.Delete(p); err != nil {
@@ -849,7 +853,7 @@ func TestDiskStoreDeletePrefix(t *testing.T) {
 
 func TestDiskStoreCloseFailsLiveSpools(t *testing.T) {
 	s := openStore(t, cacheDir(t), 1<<20, nil)
-	sp, err := s.Create(entryPath(GroupPack, 1, 1), 10)
+	sp, err := s.Create(entryPath(GroupPack, 1, 1), 10, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -868,7 +872,7 @@ func TestDiskStoreCloseFailsLiveSpools(t *testing.T) {
 	if _, err := s.Open(entryPath(GroupPack, 1, 1)); !errors.Is(err, errStoreClosed) {
 		t.Fatalf("Open after Close: err = %v", err)
 	}
-	if _, err := s.Create(entryPath(GroupPack, 1, 1), 1); !errors.Is(err, errStoreClosed) {
+	if _, err := s.Create(entryPath(GroupPack, 1, 1), 1, true); !errors.Is(err, errStoreClosed) {
 		t.Fatalf("Create after Close: err = %v", err)
 	}
 }
@@ -964,7 +968,7 @@ func TestDiskStoreConcurrentStress(t *testing.T) {
 }
 
 func stressWrite(s *diskStore, p string, value byte, n int, abort bool) (err error) {
-	sp, err := s.Create(p, int64(n))
+	sp, err := s.Create(p, int64(n), true)
 	if errors.Is(err, errBudget) {
 		return nil
 	}
@@ -1025,7 +1029,7 @@ func TestSpoolDiscardDrainsReaders(t *testing.T) {
 	dir := cacheDir(t)
 	s := openStore(t, dir, 1<<20, nil)
 	p := entryPath(GroupPack, 1, 1)
-	sp, err := s.Create(p, 100)
+	sp, err := s.Create(p, 100, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1053,18 +1057,31 @@ func TestSpoolDiscardDrainsReaders(t *testing.T) {
 	if got, err := io.ReadAll(behind); err != nil || string(got) != "complete response" {
 		t.Fatalf("lagging reader after Discard: %q, %v", got, err)
 	}
-	assertUsage(t, s, 0, 0, 17)
+	// The file and reservation stay until Release, and a reader opened
+	// after the discard still drains every byte.
+	assertUsage(t, s, 0, 100, 0)
 	if _, err := sp.Write([]byte("x")); !errors.Is(err, errSpoolDiscarded) {
 		t.Fatalf("Write after Discard: err = %v", err)
-	}
-	if _, err := sp.NewReader(); !errors.Is(err, errSpoolDiscarded) {
-		t.Fatalf("NewReader after Discard: err = %v", err)
 	}
 	if err := sp.Commit(); !errors.Is(err, errSpoolDiscarded) {
 		t.Fatalf("Commit after Discard: err = %v", err)
 	}
+	late, err := sp.NewReader()
+	if err != nil {
+		t.Fatalf("NewReader after Discard: err = %v", err)
+	}
+	if got, err := io.ReadAll(late); err != nil || string(got) != "complete response" {
+		t.Fatalf("reader opened after Discard: %q, %v", got, err)
+	}
+	sp.Release()
+	assertUsage(t, s, 0, 0, 17)
+	if _, err := sp.NewReader(); !errors.Is(err, errSpoolDiscarded) {
+		t.Fatalf("NewReader after Release: err = %v", err)
+	}
+	sp.Release()
 	mustClose(t, ahead)
 	mustClose(t, behind)
+	mustClose(t, late)
 	assertUsage(t, s, 0, 0, 0)
 	if _, err := s.Open(p); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("discarded entry is visible: err = %v", err)
@@ -1085,7 +1102,7 @@ func TestSealedEntryThroughSpool(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := openStore(t, cacheDir(t), 1<<24, nil)
-			sp, err := s.Create(entryPath(GroupPack, 1, 1), sealedSize(int64(len(body)))+segmentOverhead)
+			sp, err := s.Create(entryPath(GroupPack, 1, 1), sealedSize(int64(len(body)))+segmentOverhead, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1140,7 +1157,7 @@ func TestPurgeDiskPrefixLeavesLiveServerAlone(t *testing.T) {
 		commitEntry(t, s, entryPath(GroupRefs, 1, k), []byte("refs"))
 	}
 	commitEntry(t, s, entryPath(GroupPack, 1, 1), []byte("pack"))
-	live, err := s.Create(entryPath(GroupRefs, 1, 3), 10)
+	live, err := s.Create(entryPath(GroupRefs, 1, 3), 10, true)
 	if err != nil {
 		t.Fatal(err)
 	}

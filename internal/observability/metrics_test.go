@@ -141,8 +141,8 @@ func TestRecordMintAndCacheLookup(t *testing.T) {
 	t.Parallel()
 	m, reader := newTestMetrics(t)
 	m.RecordMint(context.Background(), "github.com", "read")
-	m.RecordCacheLookup(context.Background(), "github.com", "read", ResultHit)
-	m.RecordCacheLookup(context.Background(), "github.com", "read", ResultMiss)
+	m.RecordTokenCacheLookup(context.Background(), "github.com", "read", ResultHit)
+	m.RecordTokenCacheLookup(context.Background(), "github.com", "read", ResultMiss)
 
 	mints := collectSum(t, reader, "haybale.tokens.minted.total")
 	if len(mints) != 1 || mints[0].Value != 1 {
@@ -191,7 +191,7 @@ func TestNewNoopMetricsRecordsWithoutPanicOrProvider(t *testing.T) {
 	m.RecordProxied(ctx, "h", "read", 200, time.Second, 1, 2)
 	m.InFlightAdd(ctx, "h", "read", 1)
 	m.RecordMint(ctx, "h", "read")
-	m.RecordCacheLookup(ctx, "h", "read", ResultHit)
+	m.RecordTokenCacheLookup(ctx, "h", "read", ResultHit)
 	if err := m.shutdown(ctx); err != nil {
 		t.Errorf("noop shutdown() error = %v, want nil", err)
 	}

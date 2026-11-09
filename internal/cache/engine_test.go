@@ -469,9 +469,13 @@ func TestNon200ResponseIsSharedByEverySubscriber(t *testing.T) {
 			outs[i], _, _ = serve(c, recs[i], fetchRequest(t), fetch)
 		}()
 	}
-	waitFor(t, "three subscribers", func() bool {
+	// All three requests share one key, so exactly one fill exists.
+	waitFor(t, "three subscribers on the one fill", func() bool {
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		if len(c.fills) != 1 {
+			return false
+		}
 		for _, f := range c.fills {
 			return f.subscribers == 3
 		}
@@ -515,49 +519,6 @@ func TestFetchErrorReleasesSubscribersToPassthrough(t *testing.T) {
 	}
 	if rec.Code != http.StatusOK || rec.Body.Len() != 0 || rec.Header().Get("Cache-Status") != "haybale; fwd=bypass" {
 		t.Errorf("response was touched: %d %q %v", rec.Code, rec.Body.String(), rec.Header())
-	}
-}
-
-func TestOversizeResponseIsServedNotStoredAndMarksTheKey(t *testing.T) {
-	c, clock := newTestCache(t, func(o *Options) { o.MaxEntrySize = 1 << 16; o.AccessRecheck = 0 })
-	want := fetchResultBody(t, 30, 5000)
-	fetch := &fixedFetcher{status: 200, contentType: contentTypeResult, body: want}
-	rec := httptest.NewRecorder()
-	out, handled, _ := serve(c, rec, fetchRequest(t), fetch)
-	// A known Content-Length over the limit releases before spooling.
-	if handled || out.Result != observability.ResultBypass {
-		t.Fatalf("known oversize = %+v handled %v, want a bypass", out, handled)
-	}
-
-	// Unknown length, under a second key so the first mark plays no part:
-	// the response is spooled, served and discarded.
-	other := func() *http.Request { return postV2(fetchBody(t, "want "+oidB+"\n", "done\n")) }
-	pr, pw := io.Pipe()
-	go func() {
-		_, _ = pw.Write(want)
-		_ = pw.Close()
-	}()
-	streaming := fetchFunc(func(context.Context, Request) (*http.Response, error) {
-		return streamingResponse(contentTypeResult, pr), nil
-	})
-	rec = httptest.NewRecorder()
-	out, handled, _ = serve(c, rec, other(), streaming)
-	if !handled || out.Result != observability.ResultMiss || out.Stored || !bytes.Equal(rec.Body.Bytes(), want) {
-		t.Fatalf("oversize stream = %+v handled %v, %d bytes; want a served, unstored miss", out, handled, rec.Body.Len())
-	}
-	if len(entryFiles(t, c.opts.Dir)) != 0 {
-		t.Error("oversize response left files behind")
-	}
-	if _, handled, _ := serve(c, httptest.NewRecorder(), other(), fetch); handled {
-		t.Error("key was not marked uncacheable after an oversize response")
-	}
-	clock.Advance(25 * time.Hour)
-	if _, handled, _ := serve(c, httptest.NewRecorder(), postV2(lsRefsBody(t)), &fixedFetcher{status: 200, contentType: contentTypeResult, body: lsRefsResultBody(t)}); !handled {
-		t.Fatal("ls-refs was not handled")
-	}
-	fetch = &fixedFetcher{status: 200, contentType: contentTypeResult, body: fetchResultBody(t, 1, 10)}
-	if out, handled, _ := serve(c, httptest.NewRecorder(), other(), fetch); !handled || out.Result != observability.ResultMiss {
-		t.Errorf("after retention the mark should have expired: %+v handled %v", out, handled)
 	}
 }
 
@@ -796,50 +757,6 @@ func TestPurgeCountsAndSelectsGroups(t *testing.T) {
 	}
 }
 
-func TestCorruptEntryIsDeletedAndRefetched(t *testing.T) {
-	c, _ := newTestCache(t, func(o *Options) { o.AccessRecheck = 0 })
-	fetch := &fixedFetcher{status: 200, contentType: contentTypeResult, body: fetchResultBody(t, 30, 5000)}
-	serve(c, httptest.NewRecorder(), fetchRequest(t), fetch)
-	files := entryFiles(t, c.opts.Dir)
-	if len(files) != 1 {
-		t.Fatalf("entries = %v, want one", files)
-	}
-	path := filepath.Join(c.opts.Dir, filepath.FromSlash(files[0]))
-	data, err := os.ReadFile(path) //nolint:gosec // test-owned path
-	if err != nil {
-		t.Fatal(err)
-	}
-	data[len(data)-30] ^= 0xff
-	writeEntry(t, path, data)
-
-	// The corruption is in the trailer, so earlier segments are served
-	// before verification fails: the response is aborted.
-	rec := httptest.NewRecorder()
-	if _, _, aborted := serve(c, rec, fetchRequest(t), fetch); !aborted {
-		t.Fatal("corrupt final segment did not abort the response")
-	}
-
-	// Corrupt the header: verification fails before any byte, so the
-	// entry is deleted and the request is refetched.
-	data, err = os.ReadFile(path) //nolint:gosec // test-owned path
-	if err != nil {
-		t.Fatal(err)
-	}
-	data[preambleLen+10] ^= 0xff
-	writeEntry(t, path, data)
-	rec = httptest.NewRecorder()
-	out, handled, aborted := serve(c, rec, fetchRequest(t), fetch)
-	if aborted || !handled || out.Result != observability.ResultMiss || !out.Stored {
-		t.Fatalf("after header corruption: %+v handled %v aborted %v, want a stored miss", out, handled, aborted)
-	}
-	if fetch.calls.Load() != 2 {
-		t.Errorf("fetched %d times, want 2", fetch.calls.Load())
-	}
-	if out, _, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), fetch); out.Result != observability.ResultHit {
-		t.Errorf("after refetch = %+v, want a hit", out)
-	}
-}
-
 // writeEntry overwrites an entry file under the test's cache directory.
 func writeEntry(t *testing.T, path string, data []byte) {
 	t.Helper()
@@ -1048,15 +965,28 @@ func TestRecordsPruneExpiredEntries(t *testing.T) {
 	if len(a.last) != 1 {
 		t.Errorf("access records after prune = %d, want 1", len(a.last))
 	}
+	// Pruning drops only marks that have expired: a live long mark and a
+	// live short mark both survive a prune triggered by a new mark.
 	var m uncacheableMarks
-	for i := range pruneThreshold {
-		m.mark(entryKey{KeyHash: [32]byte{byte(i), byte(i >> 8)}}, now.Add(-time.Minute))
+	long := entryKey{KeyHash: [32]byte{0xaa}}
+	short := entryKey{KeyHash: [32]byte{0xbb}}
+	m.mark(long, now, now.Add(24*time.Hour))
+	m.mark(short, now, now.Add(30*time.Second))
+	for i := range pruneThreshold - 2 {
+		m.mark(entryKey{KeyHash: [32]byte{byte(i), byte(i >> 8), 1}}, now, now.Add(-time.Minute))
 	}
-	m.mark(entryKey{KeyHash: [32]byte{0xff, 0xff, 0xff}}, now.Add(time.Minute))
-	if len(m.until) != 1 {
-		t.Errorf("marks after prune = %d, want 1", len(m.until))
+	// The map is at the threshold, so this mark prunes before inserting.
+	fresh := entryKey{KeyHash: [32]byte{0xff, 0xff, 0xff}}
+	m.mark(fresh, now, now.Add(time.Minute))
+	if len(m.until) != 3 {
+		t.Errorf("marks after prune = %d, want the two live marks and the new one", len(m.until))
 	}
-	if m.marked(entryKey{KeyHash: [32]byte{0xff, 0xff, 0xff}}, now.Add(2*time.Minute)) {
+	for _, k := range []entryKey{long, short, fresh} {
+		if !m.marked(k, now) {
+			t.Errorf("live mark %x was pruned", k.KeyHash[:2])
+		}
+	}
+	if m.marked(fresh, now.Add(2*time.Minute)) {
 		t.Error("expired mark reported as marked")
 	}
 }
