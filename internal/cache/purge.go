@@ -443,9 +443,10 @@ func (p *purgeRecords) beginCheck(repoHash [32]byte, now time.Time) (checkStart,
 	return checkLead, mc
 }
 
-// finishCheck ends the check mc a fill led for repoHash at now: a current
+// finishCheck ends the shared check mc for repoHash at now: a current
 // result is remembered for the interval, and failed starts the backoff.
-// A check that is neither, cut short by its fill's end, records nothing.
+// A check that is neither, cut short by the cache closing, records
+// nothing.
 func (p *purgeRecords) finishCheck(repoHash [32]byte, mc *markerCheck, current, failed bool, now time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

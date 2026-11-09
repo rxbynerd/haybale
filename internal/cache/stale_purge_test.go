@@ -335,6 +335,91 @@ func TestHeldStaleServiceWaitsAtMostTheMarkerTimeout(t *testing.T) {
 	}
 }
 
+// TestSharedMarkerReadOutlivesALeaderThatLeaves: a held request that
+// leads the purge marker read and then disconnects neither cuts the read
+// short nor fails it for a refs fill waiting on the same read, which still
+// learns the purge state is current and renews the access record.
+func TestSharedMarkerReadOutlivesALeaderThatLeaves(t *testing.T) {
+	store := newMemBlobStore()
+	c, clock, _ := newRemoteStaleReplica(t, store)
+	if out, handled, _ := serve(c, newCollectWriter(), otherFetchRequest(t), &failing{err: errDialRefused}); handled {
+		t.Fatalf("refused fetch without an entry = %+v, want a release", out)
+	}
+	if _, err := purgeRemote(store, c.keyring, bothGroups, clock.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	markerRead := make(chan struct{})
+	store.set(func(m *memBlobStore) {
+		m.wrapBody = func(ctx context.Context, key string, _ int64, body io.Reader) io.Reader {
+			if strings.HasPrefix(key, purgePrefix) {
+				select {
+				case <-markerRead:
+				case <-ctx.Done():
+				}
+			}
+			return body
+		}
+	})
+	joined := make(chan struct{}, 1)
+	c.hooks.markerCheckJoined = func() { joined <- struct{}{} }
+	clock.Advance(markerCheckInterval(c.opts.AccessRecheck))
+	repoHash := c.keyring.RepoHash(testBaseURL, testRepo)
+	if c.access.recent(repoHash, c.now()) {
+		t.Fatal("the access record is still recent before the refs fill")
+	}
+
+	before := store.count("get", purgePrefix)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	leader := fetchRequest(t).WithContext(ctx)
+	left := make(chan struct{})
+	go func() {
+		defer close(left)
+		serve(c, newCollectWriter(), leader, &failing{status: 503})
+	}()
+	waitFor(t, "the held request's marker read to start", func() bool { return store.count("get", purgePrefix)-before == 1 })
+
+	c.gates.report(testRepo.Host, classifyStatus(http.StatusOK), c.now(), c.now())
+	refsDone := make(chan Outcome, 1)
+	refsReq := postV2(lsRefsBody(t))
+	go func() {
+		out, _, _ := serve(c, newCollectWriter(), refsReq, refsFetcher(t))
+		refsDone <- out
+	}()
+	select {
+	case <-joined:
+	case <-time.After(shortly):
+		t.Fatal("the refs fill never joined the marker read")
+	}
+	cancel()
+	select {
+	case <-left:
+	case <-time.After(shortly):
+		t.Fatal("the leaving request was never answered")
+	}
+	close(markerRead)
+	select {
+	case out := <-refsDone:
+		if out.Result != observability.ResultMiss || out.Status != http.StatusOK {
+			t.Errorf("refs fill = %+v, want an upstream miss", out)
+		}
+	case <-time.After(shortly):
+		t.Fatal("the refs fill never finished")
+	}
+	if !c.access.recent(repoHash, c.now()) {
+		t.Error("the refs fill did not renew the access record")
+	}
+	if got := store.count("get", purgePrefix) - before; got != 1 {
+		t.Errorf("marker reads = %d, want the one shared read", got)
+	}
+	c.purges.mu.Lock()
+	_, backoff := c.purges.failed[repoHash]
+	c.purges.mu.Unlock()
+	if backoff {
+		t.Error("the leaving request started the marker backoff")
+	}
+}
+
 // gatedWriter blocks its first Write until open is closed, and closes
 // writing once that Write has begun.
 type gatedWriter struct {

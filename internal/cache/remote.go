@@ -715,9 +715,12 @@ func (c *Cache) remoteErrorUnlessClosed(operation string, err error) {
 
 // checkPurgeMarker applies repoHash's purge marker and reports whether
 // the repository's purge state is known current: read and verified, or
-// confirmed absent, now or within the check interval. Concurrent fills of
-// one repository share one read; a failed read or marker starts
-// purgeCheckBackoff, during which the state is not current.
+// confirmed absent, now or within the check interval. Concurrent callers
+// for one repository share one read, which runs under the cache's
+// lifetime; each waits for it only until its own ctx ends, so a caller
+// that gives up neither fails the check for the others nor starts the
+// backoff. A failed read or marker starts purgeCheckBackoff, during which
+// the state is not current.
 func (c *Cache) checkPurgeMarker(ctx context.Context, repo gitproto.Repo, repoHash [32]byte) bool {
 	now := c.now()
 	start, mc := c.purges.beginCheck(repoHash, now)
@@ -730,19 +733,41 @@ func (c *Cache) checkPurgeMarker(ctx context.Context, repo gitproto.Repo, repoHa
 		if h := c.hooks.markerCheckJoined; h != nil {
 			h()
 		}
-		select {
-		case <-mc.done:
-			return mc.current
-		case <-ctx.Done():
-			return false
-		}
+	case checkLead:
+		c.leadMarkerRead(mc, repo, repoHash, now)
 	}
-	// A read that panics finishes as failed, so the joiners wake and the
-	// backoff starts.
-	current, failed := false, true
-	defer func() { c.purges.finishCheck(repoHash, mc, current, failed, now) }()
-	current, failed = c.readMarker(ctx, repo, repoHash, now)
-	return current
+	select {
+	case <-mc.done:
+		return mc.current
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// leadMarkerRead reads repoHash's purge marker in the background and
+// finishes the shared check mc with the result. Once the cache is closed
+// the check finishes at once as neither current nor failed. A read that
+// panics finishes as failed, so the waiters wake and the backoff starts.
+func (c *Cache) leadMarkerRead(mc *markerCheck, repo gitproto.Repo, repoHash [32]byte, now time.Time) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		c.purges.finishCheck(repoHash, mc, false, false, now)
+		return
+	}
+	c.wg.Add(1)
+	c.mu.Unlock()
+	go func() {
+		defer c.wg.Done()
+		current, failed := false, true
+		defer func() { c.purges.finishCheck(repoHash, mc, current, failed, now) }()
+		defer func() {
+			if r := recover(); r != nil {
+				c.logger.Error("purge marker read panicked", "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+			}
+		}()
+		current, failed = c.readMarker(c.ctx, repo, repoHash, now)
+	}()
 }
 
 // purgeCurrent reports whether repoHash's purge state is known current
