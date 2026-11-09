@@ -215,8 +215,8 @@ func TestInvalidRequestMaps404(t *testing.T) {
 	}
 }
 
-// TestUpstreamUnreachableMaps502 confirms ReverseProxy maps an upstream dial
-// failure to 502.
+// TestUpstreamUnreachableMaps502 confirms an upstream dial failure maps to
+// 502 on both paths.
 func TestUpstreamUnreachableMaps502(t *testing.T) {
 	// Stand up a server and close it immediately: its URL is well-formed
 	// but nothing is listening, so any request against it fails to dial
@@ -228,17 +228,21 @@ func TestUpstreamUnreachableMaps502(t *testing.T) {
 	}
 	deadSrv.Close()
 
-	p := mustNew(t, map[string]*url.URL{"testhost": deadURL}, allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
-	srv := httptest.NewServer(p)
-	defer srv.Close()
+	for _, path := range proxyPaths() {
+		t.Run(path.name, func(t *testing.T) {
+			p := mustNew(t, map[string]*url.URL{"testhost": deadURL}, allowAllAuthenticator{}, allowAllPolicy{}, discardLogger(), path.options(t)...)
+			srv := httptest.NewServer(p)
+			defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Errorf("status = %d, want %d for an unreachable upstream", resp.StatusCode, http.StatusBadGateway)
+			resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
+			if err != nil {
+				t.Fatalf("GET: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusBadGateway {
+				t.Errorf("status = %d, want %d for an unreachable upstream", resp.StatusCode, http.StatusBadGateway)
+			}
+		})
 	}
 }
 
@@ -933,22 +937,26 @@ func TestCredentialSourceErrorMaps502(t *testing.T) {
 // ServeHTTP: a host present in upstreams but absent from
 // credentialSources (a caller-assembled pair that got out of sync — not
 // a path config.Validate() output should ever produce) must still map
-// to 502, never panic and never 401.
+// to 502, never panic and never 401, on both paths.
 func TestMissingCredentialSourceMaps502(t *testing.T) {
-	upstreams := newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"})
-	p := mustNewWithCredentials(t, upstreams, map[string]upstream.CredentialSource{}, allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
-	srv := httptest.NewServer(p)
-	defer srv.Close()
+	for _, path := range proxyPaths() {
+		t.Run(path.name, func(t *testing.T) {
+			upstreams := newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"})
+			p := mustNewWithCredentials(t, upstreams, map[string]upstream.CredentialSource{}, allowAllAuthenticator{}, allowAllPolicy{}, discardLogger(), path.options(t)...)
+			srv := httptest.NewServer(p)
+			defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, resp.Body)
+			resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
+			if err != nil {
+				t.Fatalf("GET: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			_, _ = io.Copy(io.Discard, resp.Body)
 
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadGateway)
+			if resp.StatusCode != http.StatusBadGateway {
+				t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadGateway)
+			}
+		})
 	}
 }
 

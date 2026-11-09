@@ -193,14 +193,14 @@ func New(upstreams map[string]*url.URL, credentialSources map[string]upstream.Cr
 	for _, opt := range opts {
 		opt(p)
 	}
-	// otelhttp.NewTransport wraps the upstream leg so each forwarded
-	// request produces a client span (parented to the inbound server
-	// span) and an http.client.* metric. It is given an EMPTY
-	// propagator deliberately: haybale must not inject its own
-	// traceparent/tracestate/baggage into the request it sends
-	// upstream, preserving the byte-for-byte passthrough invariant
-	// (the upstream leg carries only the headers the client sent plus
-	// the Authorization rewrite injects — see rewrite). Inbound trace
+	// otelhttp.NewTransport wraps the upstream leg, shared by the
+	// passthrough reverse proxy and the cache fetcher, so each upstream
+	// request produces a client span (parented to the inbound server span)
+	// and an http.client.* metric. It is given an EMPTY propagator
+	// deliberately: haybale must not inject its own
+	// traceparent/tracestate/baggage upstream, so the passthrough carries
+	// only the client's headers plus the injected Authorization (see
+	// rewrite) and the fetcher only its fixed header set. Inbound trace
 	// continuation still works: the server handler uses the global W3C
 	// propagator to extract a caller-supplied traceparent. When telemetry
 	// is disabled the global tracer is a no-op.
@@ -211,10 +211,10 @@ func New(upstreams map[string]*url.URL, credentialSources map[string]upstream.Cr
 			// needs.
 			DialContext:         (&net.Dialer{Timeout: upstreamConnectTimeout, KeepAlive: 30 * time.Second}).DialContext,
 			TLSHandshakeTimeout: upstreamConnectTimeout,
-			// Never let the transport request/decode its own gzip
-			// encoding — Content-Encoding and Accept-Encoding must pass
-			// through exactly as the client sent them, since this is a
-			// byte-for-byte passthrough, not a decoding proxy.
+			// The transport never adds or decodes gzip itself, so the
+			// passthrough forwards Accept-Encoding and Content-Encoding
+			// exactly as sent, and the cache fetcher's explicit
+			// Accept-Encoding: identity is what reaches upstream.
 			DisableCompression: true,
 			// ForceAttemptHTTP2 already defaults to false on a
 			// manually-constructed http.Transport (it is only true on
@@ -382,7 +382,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cacheAttrs = cacheLogAttrs(outcome)
 		span.SetAttributes(cacheSpanAttrs(outcome)...)
 		if handled {
-			p.finishProxied(r, span, id, repo, verb, rec.status, time.Since(start), bytesIn.Load(), bytesOut.Load(), cacheAttrs)
+			// The cache reports what it actually wrote; a zero status
+			// means the client left before any header went out.
+			p.finishProxied(r, span, id, repo, verb, outcome.Status, time.Since(start), bytesIn.Load(), outcome.BytesOut, cacheAttrs)
 			return
 		}
 	}
@@ -425,13 +427,27 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := context.WithValue(r.Context(), routeKey{}, base)
 	ctx = context.WithValue(ctx, credentialContextKey{}, credentialContext{credential: cred, repo: repo, verb: verb})
 
-	p.rp.ServeHTTP(rec, r.WithContext(ctx))
-
 	// A push changes the repository's refs whatever its status (a rejected
 	// push still returns 200), so the cached refs entries go either way.
+	// It runs as soon as the response has been copied and, via defer, when
+	// ReverseProxy panics with http.ErrAbortHandler because the client
+	// disconnected mid-response. The request context may already be
+	// cancelled then, so the call does not use it.
+	invalidate := func() {}
 	if p.cache != nil && verb == gitproto.Write && r.Method == http.MethodPost {
-		p.cache.Invalidate(r.Context(), repo, base)
+		invalidated := false
+		invalidate = func() {
+			if !invalidated {
+				invalidated = true
+				p.cache.Invalidate(context.WithoutCancel(r.Context()), repo, base)
+			}
+		}
 	}
+
+	defer invalidate()
+
+	p.rp.ServeHTTP(rec, r.WithContext(ctx))
+	invalidate()
 	p.finishProxied(r, span, id, repo, verb, rec.status, time.Since(start), bytesIn.Load(), bytesOut.Load(), cacheAttrs)
 }
 
@@ -440,22 +456,26 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // proxied-request metrics and the request log line. extra holds the cache
 // log fields, when a cache is configured and the request was a read.
 //
+// A status of zero means the client left before any response header was
+// written; there is no status to report, so the status attribute, the
+// proxied-request metrics and the log status field are omitted.
+//
 // The log record uses InfoContext (not Info) so it carries r.Context():
 // when telemetry is on, the SpanContextHandler stamps the line with the
 // same trace_id/span_id as the request span and the otelslog bridge ships
 // it correlated. With telemetry off there is no active span and the
 // context is simply ignored.
 func (p *Proxy) finishProxied(r *http.Request, span trace.Span, id *identity.Identity, repo gitproto.Repo, verb gitproto.Verb, status int, duration time.Duration, bytesIn, bytesOut int64, extra []any) {
-	span.SetAttributes(
-		attribute.String("haybale.outcome", observability.OutcomeProxied),
-		attribute.Int("http.response.status_code", status),
-	)
-	p.metrics.RecordProxied(r.Context(), repo.Host, verb.String(), status, duration, bytesIn, bytesOut)
-
+	span.SetAttributes(attribute.String("haybale.outcome", observability.OutcomeProxied))
 	attrs := []any{
-		"identity", id.ID, "issuer", id.Issuer, "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "verb", verb.String(), "status", status,
-		"bytesIn", bytesIn, "bytesOut", bytesOut, "durationMs", duration.Milliseconds(),
+		"identity", id.ID, "issuer", id.Issuer, "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "verb", verb.String(),
 	}
+	if status != 0 {
+		span.SetAttributes(attribute.Int("http.response.status_code", status))
+		p.metrics.RecordProxied(r.Context(), repo.Host, verb.String(), status, duration, bytesIn, bytesOut)
+		attrs = append(attrs, "status", status)
+	}
+	attrs = append(attrs, "bytesIn", bytesIn, "bytesOut", bytesOut, "durationMs", duration.Milliseconds())
 	p.logger.InfoContext(r.Context(), "proxied request", append(attrs, extra...)...)
 }
 
