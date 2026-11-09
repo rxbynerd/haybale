@@ -444,7 +444,7 @@ for the same repo/verb collapsed into a single mint call.
 ```yaml
 cache:
   enabled: false                   # optional, default shown
-  dir: /var/cache/haybale          # required when enabled
+  dir: /var/cache/haybale/data     # required when enabled; created if missing, its parent must exist
   keyEnv: HAYBALE_CACHE_KEY        # optional, env var holding the cache key
   maxDiskSize: 10GiB               # optional, default shown
   maxEntrySize: 1GiB               # optional, default shown
@@ -459,27 +459,31 @@ cache:
 ```
 
 The `cache` block turns on a response cache for Git smart HTTP reads
-(clones and fetches), so repeated identical reads are served from local disk
-instead of contacting the upstream. **The cache is off by default**: leaving
-the block out, or leaving `enabled` false, serves every request straight from
-the upstream, and a disabled block is inert (it is neither defaulted nor
-checked beyond its syntax). Writes (pushes) are never served from the cache.
-The [caching guide](caching.md) explains what the cache stores and how to
-operate it; [`observability.md`](observability.md) describes what it emits.
+(clones and fetches). It serves the pack transfer of repeated identical clones
+and fetches from local disk, so the upstream is not asked for it again. Ref
+lookups still reach the upstream unless `refsMaxAge` is set. **The cache is off
+by default**: leaving the block out, or leaving `enabled` false, serves every
+request straight from the upstream. A disabled block is inert: it is not
+defaulted or validated, although an unknown key in it is still rejected. Writes
+(pushes) are never served from the cache. The [caching guide](caching.md)
+explains what the cache stores and how to operate it;
+[`observability.md`](observability.md) describes what it emits.
 
 Unlike the rest of the file, the `cache` block is decoded strictly: an unknown
 key fails startup with `cache: unknown field ...`, so a mistyped or renamed
-field can never silently fall back to its default.
+field can never silently fall back to its default. Aliases are followed, so a
+typo inside an aliased block is also rejected. A YAML merge key (`<<`) inside
+the block is rejected as an unknown field.
 
 | Field                   | Default  | Notes                                                                                                   |
 |-------------------------|----------|---------------------------------------------------------------------------------------------------------|
 | `enabled`               | `false`  | Turns the cache on.                                                                                     |
 | `dir`                   | (unset)  | Directory holding cached entries. Required when `enabled`. See "Cache directory" below.                 |
 | `keyEnv`                | (unset)  | Name of an env var holding the 32-byte, base64-encoded key entries are sealed under. See "Cache key".    |
-| `maxDiskSize`           | `10GiB`  | Disk budget for the cache: stored entries plus space reserved for fills in progress. Least recently used entries are evicted past it. See "Sizing". |
-| `maxEntrySize`          | `1GiB`   | Largest response that is stored. A larger response is streamed to the client without being stored. Must not exceed `maxDiskSize`. |
-| `maxConcurrentFills`    | `4`      | Maximum number of pack responses being fetched into the cache at once. A request that finds no free slot is proxied without the cache. Must be at least `1`. Ref advertisements and `ls-refs` responses do not count: they have a fixed separate cap of 64 concurrent fills and reserve 1 MiB each. |
-| `maxRequestBody`        | `1MiB`   | Largest decoded request body the cache will inspect. A read with a larger body bypasses the cache. Must be greater than zero. |
+| `maxDiskSize`           | `10GiB`  | Disk budget for the cache: stored entries plus space reserved for fills in progress. Least recently used entries are evicted past it. An explicit `0` selects the default. Negative and malformed values fail startup. See "Sizing". |
+| `maxEntrySize`          | `1GiB`   | Largest response that is stored. A larger response is delivered to the clients waiting on it without being stored. Must not exceed half of `maxDiskSize`, because a fill reserves its sealed size before it starts. An explicit `0` selects the default. Negative and malformed values fail startup. |
+| `maxConcurrentFills`    | `4`      | Maximum number of pack responses being fetched into the cache at once. A request that finds no free slot is proxied without the cache. An explicit `0` selects the default. Negative and malformed values fail startup. Ref advertisements and `ls-refs` responses do not count: they have a fixed separate cap of 64 concurrent fills and reserve 1 MiB each. |
+| `maxRequestBody`        | `1MiB`   | Largest decoded request body the cache will inspect. A read with a larger body bypasses the cache. An explicit `0` selects the default. Negative and malformed values fail startup. |
 | `retention`             | `24h`    | Go duration string: the maximum age of any entry, after which it is not served. Must be greater than zero. See "Retention". |
 | `refsMaxAge`            | `0s`     | Go duration string: how long a stored ref advertisement is reused without asking the upstream. `0s` always revalidates. When both are non-zero it must be less than `accessRecheck`. |
 | `accessRecheck`         | `5m`     | Go duration string: how long a cached pack is served after the last successful upstream refs response before the upstream is asked again. `0s` disables the check. See "Validation" for its relation to `refsMaxAge`. |
@@ -507,24 +511,32 @@ or `24h` and must not be negative.
 
 Validation of the `cache` block is structural: it checks that no key is
 unknown, the syntax of every size and duration, that `dir` is set, that
-`retention` is greater than zero, that `maxEntrySize` does not exceed
-`maxDiskSize`, that `maxConcurrentFills` is at least `1`, that
-`maxRequestBody` is greater than zero, and that `refsMaxAge` is less than
-`accessRecheck` when both are non-zero. The last rule exists because a refs
+`retention` is greater than zero, that `maxEntrySize` does not exceed half of
+`maxDiskSize`, and that `refsMaxAge` is less than `accessRecheck` when both are
+non-zero. An explicit `0` for `maxDiskSize`, `maxEntrySize`,
+`maxConcurrentFills` or `maxRequestBody` is replaced by the default before
+validation. Negative and malformed values fail startup.
+
+A `maxEntrySize` above half of `maxDiskSize` fails with `cache: maxEntrySize
+<size> must not exceed half of maxDiskSize <size>`, because a fill reserves its
+sealed size before it starts. The `refsMaxAge` rule exists because a refs
 response served from the cache does not renew the upstream access check that
 cached packs depend on; with `refsMaxAge` at or above `accessRecheck`, packs
-would stop being served while refs were still cached. Validation does not touch the filesystem, the
-network or the environment, so `haybale policy check` stays offline when a
-cache block is present, with or without the cache key or directory. The
-directory and key are checked when `haybale serve` starts.
+would stop being served while refs were still cached.
+
+Validation does not touch the filesystem, the network or the environment, so
+`haybale policy check` stays offline when a cache block is present, with or
+without the cache key or directory. The directory and key are checked when
+`haybale serve` starts.
 
 ### Cache directory
 
 `dir` holds repository contents. The final path element is created with mode
 `0700` when it is missing, but its parent must exist. An existing directory must
 be owned by the haybale process user and be inaccessible to group and other
-(mode `0700`); `haybale serve` refuses to start otherwise. Mount the volume only into the haybale container;
-any sidecar sharing it runs with the same UID and can read every entry.
+(mode `0700`); `haybale serve` refuses to start otherwise. Mount the volume
+only into the haybale container; any sidecar sharing it runs with the same UID
+and can read every entry.
 
 Each `haybale serve` process needs its own cache directory. At startup the
 process deletes the temporary files of other processes in the directory, so
@@ -543,19 +555,27 @@ example.
 
 ### Sizing
 
-`maxDiskSize` is a budget shared by stored entries and by fills in progress.
-A fill reserves space before it starts: the upstream's `Content-Length` when
+`maxDiskSize` is a budget shared by stored entries and by fills in progress. A
+fill is one upstream fetch whose response is being written to the cache. It
+reserves its sealed size before it starts: the upstream's `Content-Length` when
 the upstream sends one, and `maxEntrySize` otherwise, which is the usual case
-for a pack. `maxConcurrentFills` times `maxEntrySize` is therefore the space
-that concurrent fills can hold at once, and `maxDiskSize` should exceed it by
-the space wanted for stored entries. With the defaults, fills reserve at most 4GiB of the
-10GiB budget. For a fleet that clones repositories well below the default
-`maxEntrySize`, lowering `maxEntrySize` to a small multiple of the largest
-repository reduces the reservation further.
+for a pack, plus a small allowance for the sealing overhead. Ref advertisement
+and `ls-refs` fills are reserved separately: up to 64 at a time, 1MiB each.
+`maxConcurrentFills` times `maxEntrySize`, plus 64MiB for the refs fills, is
+therefore the space that concurrent fills can hold at once, and `maxDiskSize`
+should exceed it by the space wanted for stored entries. `maxEntrySize` must
+not exceed half of `maxDiskSize`. With the defaults, fills reserve at most 4GiB
+plus 64MiB of the 10GiB budget. For a fleet that clones repositories well below
+the default `maxEntrySize`, lowering `maxEntrySize` to a small multiple of the
+largest repository reduces the reservation further.
 
 A fill that cannot reserve space after evicting stored entries is proxied
-without the cache and is not stored. An entry larger than `maxEntrySize` is
-streamed to the client but never stored.
+without the cache and is not stored. A response larger than `maxEntrySize` is
+delivered to the clients waiting on it but never stored. A response of unknown
+length that is larger than `maxEntrySize` and larger than the free disk closes
+those clients' connections once, and the key then goes to the upstream for
+`retention`. The [caching guide](caching.md#sizing-and-volumes) has the formula
+and the effects on clients.
 
 ### Cache key
 
@@ -566,24 +586,26 @@ Protect it like a credential; the [security model](security.md#sealed-entries)
 describes what it protects.
 
 `keyEnv` is optional while only the local disk tier exists. When it is left
-empty, haybale generates a key at startup and discards it on exit, so the cache
-is empty again after every restart and `haybale cache purge` cannot address
-its entries. Set `keyEnv` to keep the cache across restarts and to use the purge
-command.
+empty, haybale generates a key at startup and discards it on exit. At the next
+start it deletes every entry in the directory, because none can be read, so the
+cache is empty after every restart. `haybale cache purge` cannot address
+entries sealed under an ephemeral key. Set `keyEnv` to keep the cache across
+restarts and to use the purge command.
 
-Rotating the key is a cold cache: entries sealed under the previous key are
-never served again and are removed as they expire or are evicted.
+Rotating the key is a cold cache. At the next start haybale deletes the entries
+sealed under the previous key. The [caching guide](caching.md#purging-a-repository)
+describes how to purge a repository before then.
 
 ### Retention
 
-Cache entries are shared by every identity the policy allows to read a
-repository; the policy, not the cache, decides who may read what. A cache hit
-does not contact the upstream, so haybale's own access to a repository being
-revoked becomes visible at the next `accessRecheck` boundary. Content removed
-upstream, for example after a history rewrite that deleted a secret, can still
-be served until its entry reaches `retention`; lower `retention` to shorten
-that window, or run `haybale cache purge` (see the [caching
-guide](caching.md#purging-a-repository)).
+`retention` is the maximum age of any entry. Content removed upstream, for
+example after a history rewrite that deleted a secret, can still be served until
+its entry reaches `retention`. Lower `retention` to shorten that window, or
+purge the repository: see the [caching guide](caching.md#purging-a-repository)
+for the procedure. The [security model](security.md#retention-and-purging)
+states what retention and purging do and do not guarantee, and
+[Access recheck](security.md#access-recheck) states how revoked upstream access
+becomes visible.
 
 ### Reserved fields
 
@@ -591,12 +613,14 @@ Two fields are reserved for later releases and **fail startup if set** in this
 release:
 
 - `remote`: an optional shared remote tier in object storage. Any non-empty
-  value under `cache.remote` is rejected with `cache.remote is not supported in
-  this release`. The planned fields are `type`, `bucket`, `prefix`, `region`,
-  `endpoint`, `forcePathStyle`, `headerTimeout`, `sse` and `kmsKeyID`.
+  value under `cache.remote` is rejected with `cache: remote is not supported in
+  this release; remove the remote block`. The planned fields are `type`,
+  `bucket`, `prefix`, `region`, `endpoint`, `forcePathStyle`, `headerTimeout`,
+  `sse` and `kmsKeyID`.
 - `staleIfErrorFor`: serving an older entry when the upstream is unavailable.
-  Only an empty value or `0s` is accepted; any other value is rejected with
-  `cache.staleIfErrorFor is not supported in this release`.
+  Only an empty value or a zero duration such as `0s` is accepted; any other
+  value is rejected with `cache: staleIfErrorFor is not supported in this
+  release (got "..."); leave it empty or "0s"`.
 
 ## Worked example
 
