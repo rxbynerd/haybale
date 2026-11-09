@@ -752,21 +752,24 @@ func (c *Cache) writeShared(w http.ResponseWriter, out *fillOutcome, host, class
 
 // serveHeld answers a request whose host's health gate holds it from the
 // key's qualifying tier-1 stale entry, before any fill slot, spool or
-// upstream request is taken, and releases the classification slot first.
-// With a remote tier the repository's purge state must be known current
-// first. ok is false, with nothing written, when stale service is
-// disabled, the gate does not hold the host, the purge state is not
-// current, or no tier-1 entry qualifies; the request then proceeds as it
-// would otherwise.
+// upstream request is taken. With a remote tier the repository's purge
+// state must be known current first; the classification slot is released
+// before that check, since the body is already buffered. ok is false,
+// with nothing written, when stale service is disabled, the gate does not
+// hold the host, the purge state is not current, or no tier-1 entry
+// qualifies; the request then proceeds as it would otherwise.
 func (c *Cache) serveHeld(w http.ResponseWriter, r *http.Request, key entryKey, repo gitproto.Repo, class, identity string, release func()) (Outcome, bool) {
-	if !c.staleEnabled() || !c.gates.held(repo.Host, c.now()) || !c.purgeCurrent(r.Context(), repo, key.RepoHash) {
+	if !c.staleEnabled() || !c.gates.held(repo.Host, c.now()) {
+		return Outcome{}, false
+	}
+	release()
+	if !c.purgeCurrent(r.Context(), repo, key.RepoHash) {
 		return Outcome{}, false
 	}
 	e := c.openStaleEntry(key, repo, class)
 	if e == nil {
 		return Outcome{}, false
 	}
-	release()
 	return c.serveStaleOpened(w, e, repo, class, false, identity, &staleService{reason: staleReasonHealthGate})
 }
 

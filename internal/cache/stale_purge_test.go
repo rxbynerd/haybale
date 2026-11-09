@@ -334,3 +334,79 @@ func TestHeldStaleServiceWaitsAtMostTheMarkerTimeout(t *testing.T) {
 		t.Errorf("held request with a hung marker read = %+v handled %v, want a release", out, handled)
 	}
 }
+
+// gatedWriter blocks its first Write until open is closed, and closes
+// writing once that Write has begun.
+type gatedWriter struct {
+	*collectWriter
+	writing chan struct{}
+	open    chan struct{}
+	once    sync.Once
+}
+
+func newGatedWriter() *gatedWriter {
+	return &gatedWriter{collectWriter: newCollectWriter(), writing: make(chan struct{}), open: make(chan struct{})}
+}
+
+func (w *gatedWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.writing) })
+	<-w.open
+	return w.collectWriter.Write(p)
+}
+
+// TestHeldRequestsFreeTheirClassificationSlot: a held request gives up
+// its classification slot before it waits on the purge marker read, and
+// holds none while its stale answer streams.
+func TestHeldRequestsFreeTheirClassificationSlot(t *testing.T) {
+	store := newMemBlobStore()
+	c, clock, _ := newRemoteStaleReplica(t, store)
+	if out, handled, _ := serve(c, newCollectWriter(), otherFetchRequest(t), &failing{err: errDialRefused}); handled {
+		t.Fatalf("refused fetch without an entry = %+v, want a release", out)
+	}
+	if _, err := purgeRemote(store, c.keyring, bothGroups, clock.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	markerRead := make(chan struct{})
+	store.set(func(m *memBlobStore) {
+		m.wrapBody = func(ctx context.Context, key string, _ int64, body io.Reader) io.Reader {
+			if strings.HasPrefix(key, purgePrefix) {
+				select {
+				case <-markerRead:
+				case <-ctx.Done():
+				}
+			}
+			return body
+		}
+	})
+	clock.Advance(markerCheckInterval(c.opts.AccessRecheck))
+	before := store.count("get", purgePrefix)
+	w := newGatedWriter()
+	r := fetchRequest(t)
+	done := make(chan Outcome, 1)
+	go func() {
+		out, _, _ := serve(c, w, r, &failing{err: errDialRefused})
+		done <- out
+	}()
+	waitFor(t, "the marker read to start", func() bool { return store.count("get", purgePrefix)-before == 1 })
+	if n := len(c.classifySlots); n != 0 {
+		t.Errorf("classification slots held during the marker read = %d, want 0", n)
+	}
+	close(markerRead)
+	select {
+	case <-w.writing:
+	case <-time.After(shortly):
+		t.Fatal("the held answer never started streaming")
+	}
+	if n := len(c.classifySlots); n != 0 {
+		t.Errorf("classification slots held while streaming = %d, want 0", n)
+	}
+	close(w.open)
+	select {
+	case out := <-done:
+		if out.Result != observability.ResultStale {
+			t.Errorf("held request = %+v, want stale", out)
+		}
+	case <-time.After(shortly):
+		t.Fatal("the held request never finished")
+	}
+}
