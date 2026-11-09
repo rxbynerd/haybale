@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -715,5 +716,46 @@ func TestNewValidatesConfig(t *testing.T) {
 				t.Errorf("error %q echoes endpoint credentials", err)
 			}
 		})
+	}
+}
+
+func TestErrorWhenTheCredentialChainIsEmpty(t *testing.T) {
+	isolateAWSEnv(t)
+	for _, name := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"} {
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake := s3fake.New(t)
+	s := newStore(t, testConfig(fake.URL()))
+
+	_, _, err := s.Get(context.Background(), testKey, 0)
+	var e *Error
+	if !errors.As(err, &e) || e.Code != codeNoCredentials || e.Status != 0 {
+		t.Fatalf("Get with no credentials: err = %v, want %s with no status", err, codeNoCredentials)
+	}
+	if got, want := err.Error(), "s3store: get "+testKey+": NoCredentials"; got != want {
+		t.Errorf("error = %q, want %q", got, want)
+	}
+	if n := len(fake.Requests()); n != 0 {
+		t.Errorf("the fake received %d requests without credentials", n)
+	}
+}
+
+func TestErrorWhenTheServerCertificateIsUntrusted(t *testing.T) {
+	isolateAWSEnv(t)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	s := newStore(t, testConfig(srv.URL))
+
+	_, _, err := s.Get(context.Background(), testKey, 0)
+	var e *Error
+	if !errors.As(err, &e) || e.Code != codeTLSFailed || e.Status != 0 {
+		t.Fatalf("Get against an untrusted certificate: err = %v, want %s with no status", err, codeTLSFailed)
+	}
+	if strings.Contains(err.Error(), "x509") || strings.Contains(err.Error(), "127.0.0.1") {
+		t.Errorf("error %q carries TLS detail", err)
 	}
 }

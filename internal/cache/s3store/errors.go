@@ -2,6 +2,8 @@ package s3store
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 
@@ -29,6 +31,8 @@ const (
 	codeSendFailed    = "RequestSendFailed"
 	codeRequestFailed = "RequestFailed"
 	codeBadResponse   = "InvalidResponse"
+	codeNoCredentials = "NoCredentials"
+	codeTLSFailed     = "TLSVerificationFailed"
 )
 
 // Error is the error a Store operation returns when a request fails. It
@@ -47,8 +51,11 @@ type Error struct {
 	Key string
 	// Code is the S3 error code, such as "NoSuchKey" or "AccessDenied",
 	// or one of "HeaderTimeout", "Canceled", "DeadlineExceeded",
-	// "RequestSendFailed", "RequestFailed" or "InvalidResponse" when the
-	// service sent no code.
+	// "NoCredentials", "TLSVerificationFailed", "RequestSendFailed",
+	// "RequestFailed" or "InvalidResponse" when the service sent no code.
+	// NoCredentials means the SDK's credential chain produced none; a
+	// TLSVerificationFailed request never reached the service because its
+	// certificate did not verify.
 	Code string
 	// Status is the HTTP status of the response, or 0 when none arrived.
 	Status int
@@ -86,6 +93,10 @@ func wrapError(ctx context.Context, op, key string, err error) error {
 		e.Code, e.sentinel = codeDeadline, context.DeadlineExceeded
 	case errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled):
 		e.Code, e.sentinel = codeCanceled, context.Canceled
+	case isCredentialsError(err):
+		e.Code, e.Status = codeNoCredentials, 0
+	case isTLSVerificationError(err):
+		e.Code, e.Status = codeTLSFailed, 0
 	case errors.As(err, &apiErr) && apiErr.ErrorCode() != "":
 		e.Code = apiErr.ErrorCode()
 	case errors.As(err, &sendErr):
@@ -98,6 +109,34 @@ func wrapError(ctx context.Context, op, key string, err error) error {
 	}
 	return e
 }
+
+// isCredentialsError reports whether err is a failure to obtain
+// credentials, which credentialsProvider marks.
+func isCredentialsError(err error) bool {
+	var ce *credentialsError
+	return errors.As(err, &ce)
+}
+
+// isTLSVerificationError reports whether err is a server certificate that
+// failed verification.
+func isTLSVerificationError(err error) bool {
+	var (
+		verifyErr    *tls.CertificateVerificationError
+		authorityErr x509.UnknownAuthorityError
+		hostnameErr  x509.HostnameError
+		invalidErr   x509.CertificateInvalidError
+	)
+	return errors.As(err, &verifyErr) || errors.As(err, &authorityErr) ||
+		errors.As(err, &hostnameErr) || errors.As(err, &invalidErr)
+}
+
+// credentialsError marks an error from the SDK's credential chain, which
+// the SDK otherwise reports as untyped text.
+type credentialsError struct{ err error }
+
+func (e *credentialsError) Error() string { return e.err.Error() }
+
+func (e *credentialsError) Unwrap() error { return e.err }
 
 // isNotFound reports whether e is the service saying the object does not
 // exist. A 404 for a missing bucket is not.

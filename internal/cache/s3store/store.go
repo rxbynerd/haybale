@@ -74,6 +74,9 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("s3store: loading AWS configuration: %w", err)
 	}
+	if awsCfg.Credentials != nil {
+		awsCfg.Credentials = credentialsProvider{awsCfg.Credentials}
+	}
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
 		// Options functions run after the SDK resolves environment and
 		// shared-config endpoints, so this assignment always wins.
@@ -94,6 +97,19 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 		s.kmsKeyID = aws.String(cfg.KMSKeyID)
 	}
 	return s, nil
+}
+
+// credentialsProvider marks every error of the provider it wraps as a
+// credentialsError, so wrapError can tell a missing credential from a
+// service failure.
+type credentialsProvider struct{ aws.CredentialsProvider }
+
+func (p credentialsProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
+	creds, err := p.CredentialsProvider.Retrieve(ctx)
+	if err != nil {
+		return creds, &credentialsError{err: err}
+	}
+	return creds, nil
 }
 
 // newHTTPClient returns the client every SDK request uses: no
