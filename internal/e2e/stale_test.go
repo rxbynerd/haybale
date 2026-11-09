@@ -30,14 +30,38 @@ const (
 	// staleHeaderTimeout is the cache's response-header timeout in the
 	// stale tests: the time a request to a hanging upstream would wait.
 	staleHeaderTimeout = 30 * time.Second
+	// probeInterval is the cache's health gate probe interval.
+	probeInterval = 5 * time.Second
+	// pastAccessRecheck moves the clock past the cache's accessRecheck,
+	// so a stored pack is no longer a hit.
+	pastAccessRecheck = 6 * time.Minute
 )
+
+// manualClock is a clock that moves only when the test advances it.
+type manualClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *manualClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *manualClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
 
 // outageUpstream serves the fake git upstream on an address a test can
 // take down: stop closes the server so connections are refused, and hang
 // listens on the same address again but never answers.
 type outageUpstream struct {
-	srv  *httptest.Server
-	addr string
+	srv     *httptest.Server
+	addr    string
+	handler http.Handler
 
 	mu       sync.Mutex
 	hangLn   net.Listener
@@ -47,7 +71,7 @@ type outageUpstream struct {
 
 func newOutageUpstream(t *testing.T, handler http.Handler) *outageUpstream {
 	t.Helper()
-	o := &outageUpstream{srv: httptest.NewServer(handler)}
+	o := &outageUpstream{srv: httptest.NewServer(handler), handler: handler}
 	o.addr = o.srv.Listener.Addr().String()
 	t.Cleanup(o.srv.Close)
 	t.Cleanup(o.closeHang)
@@ -83,6 +107,18 @@ func (o *outageUpstream) hang(t *testing.T) {
 			o.mu.Unlock()
 		}
 	}()
+}
+
+// restart serves the upstream on its address again.
+func (o *outageUpstream) restart(t *testing.T) {
+	t.Helper()
+	ln, err := net.Listen("tcp", o.addr)
+	if err != nil {
+		t.Fatalf("listen again on %s: %v", o.addr, err)
+	}
+	srv := &http.Server{Handler: o.handler, ReadHeaderTimeout: 10 * time.Second}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
 }
 
 // closeHang stops hanging, so connecting is refused again.
@@ -134,7 +170,9 @@ func (s *cacheStatuses) count() int {
 }
 
 // staleHarness is a haybale proxy with a stale-if-error cache in front of
-// an upstream the test can take down.
+// an upstream the test can take down. The cache runs on clock, which
+// moves only when the test advances it, so entry ages and the health
+// gate's probe interval do not depend on how fast the test runs.
 type staleHarness struct {
 	gitPath  string
 	headSHA  string
@@ -142,6 +180,7 @@ type staleHarness struct {
 	faults   *upstreamFaults
 	logs     *syncBuffer
 	statuses *cacheStatuses
+	clock    *manualClock
 	baseURL  string
 	token    string
 }
@@ -173,6 +212,7 @@ func newStaleHarness(t *testing.T) *staleHarness {
 	if err != nil {
 		t.Fatal(err)
 	}
+	clock := &manualClock{t: time.Now()}
 	c, err := cache.New(cache.Options{
 		Dir:                   filepath.Join(t.TempDir(), "cache"),
 		Keyring:               kr,
@@ -188,6 +228,7 @@ func newStaleHarness(t *testing.T) *staleHarness {
 		StaleIfErrorFor:       time.Hour,
 		Logger:                logger,
 		Metrics:               observability.NewNoopMetrics(),
+		Now:                   clock.Now,
 	})
 	if err != nil {
 		t.Fatalf("cache.New(): %v", err)
@@ -209,7 +250,7 @@ func newStaleHarness(t *testing.T) *staleHarness {
 	t.Cleanup(srv.Close)
 	return &staleHarness{
 		gitPath: gitPath, headSHA: headSHA, upstream: up, faults: faults,
-		logs: logs, statuses: statuses, baseURL: srv.URL, token: token,
+		logs: logs, statuses: statuses, clock: clock, baseURL: srv.URL, token: token,
 	}
 }
 
@@ -244,16 +285,19 @@ func (h *staleHarness) wantStatuses(t *testing.T, mark int, want ...string) {
 }
 
 // TestStaleIfErrorServesClonesDuringAnOutage: once the upstream is down, a
-// repeat of a clone that went through haybale still succeeds, its refs
-// requests answered stale and logged as security events, and the health
+// repeat of a clone that went through haybale still succeeds, every
+// response answered stale and logged as a security event, and the health
 // gate keeps a later clone from waiting on an upstream that accepts
 // connections but never answers. A push and a clone of a repository
-// haybale never saw still fail.
+// haybale never saw still fail. Once the upstream is back and the probe
+// interval has passed, the next request probes it, the gate closes and
+// clones are served from the upstream again.
 func TestStaleIfErrorServesClonesDuringAnOutage(t *testing.T) {
 	h := newStaleHarness(t)
 	h.clone(t, repoName)
 
 	h.upstream.stop()
+	h.clock.Advance(pastAccessRecheck)
 	mark := h.statuses.count()
 	dir, env := h.clone(t, repoName)
 	if sha := headOf(t, h.gitPath, dir, env); sha != h.headSHA {
@@ -262,7 +306,7 @@ func TestStaleIfErrorServesClonesDuringAnOutage(t *testing.T) {
 	h.wantStatuses(t, mark,
 		"GET refs haybale; hit; fwd=stale",
 		"POST git-upload-pack haybale; hit; fwd=stale",
-		"POST git-upload-pack haybale; hit",
+		"POST git-upload-pack haybale; hit; fwd=stale",
 	)
 	logs := waitForLogSubstring(h.logs, `"cache":"stale"`)
 	for _, want := range []string{
@@ -275,13 +319,13 @@ func TestStaleIfErrorServesClonesDuringAnOutage(t *testing.T) {
 			t.Errorf("logs do not contain %s", want)
 		}
 	}
-	if n := strings.Count(logs, `"event":"cache_stale_served"`); n != 2 {
+	if n := strings.Count(logs, `"event":"cache_stale_served"`); n != 3 {
 		t.Errorf("cache_stale_served events = %d, want one per stale response", n)
 	}
 
-	// The gate is open, so a clone against an upstream that would hang
-	// every request for the header timeout is answered without
-	// connecting at all.
+	// The gate is open and the clock has not moved, so no probe is due: a
+	// clone against an upstream that would hang every request for the
+	// header timeout is answered without connecting at all.
 	h.upstream.hang(t)
 	start := time.Now()
 	h.clone(t, repoName)
@@ -301,6 +345,47 @@ func TestStaleIfErrorServesClonesDuringAnOutage(t *testing.T) {
 	runGitExpectError(t, h.gitPath, dir, env, "push", "--quiet", "origin", "HEAD:main")
 
 	h.cloneFails(t, unseenRepoName)
+
+	h.upstream.restart(t)
+	h.clock.Advance(probeInterval)
+	mark = h.statuses.count()
+	dir, env = h.clone(t, repoName)
+	if sha := headOf(t, h.gitPath, dir, env); sha != h.headSHA {
+		t.Errorf("clone after the outage HEAD = %s, want %s", sha, h.headSHA)
+	}
+	h.wantStatuses(t, mark,
+		"GET refs haybale; fwd=miss",
+		"POST git-upload-pack haybale; fwd=miss",
+		"POST git-upload-pack haybale; hit",
+	)
+	if logs := waitForLogSubstring(h.logs, `"msg":"upstream health gate closed"`); !strings.Contains(logs, `"msg":"upstream health gate closed"`) {
+		t.Error("the gate did not close once the upstream answered")
+	}
+}
+
+// TestStaleIfErrorAnswersAnUpstream5xx: an upstream answering 503 is
+// reachable, so the gate stays closed, but every response of a repeat
+// clone is answered stale with the upstream's status.
+func TestStaleIfErrorAnswersAnUpstream5xx(t *testing.T) {
+	h := newStaleHarness(t)
+	h.clone(t, repoName)
+
+	h.faults.unavailable.Store(true)
+	h.clock.Advance(pastAccessRecheck)
+	mark := h.statuses.count()
+	dir, env := h.clone(t, repoName)
+	if sha := headOf(t, h.gitPath, dir, env); sha != h.headSHA {
+		t.Errorf("clone during the 503s HEAD = %s, want %s", sha, h.headSHA)
+	}
+	h.wantStatuses(t, mark,
+		"GET refs haybale; hit; fwd=stale; fwd-status=503",
+		"POST git-upload-pack haybale; hit; fwd=stale; fwd-status=503",
+		"POST git-upload-pack haybale; hit; fwd=stale; fwd-status=503",
+	)
+	logs := waitForLogSubstring(h.logs, `"cache":"stale"`)
+	if strings.Contains(logs, "upstream health gate opened") {
+		t.Error("an upstream 503 opened the health gate")
+	}
 }
 
 // TestStaleIfErrorNeverAnswersARejectedCredential: an upstream that

@@ -173,6 +173,8 @@ type upstreamFaults struct {
 	// rejectCredentials answers every request 401, as an upstream does
 	// when haybale's credential has been revoked.
 	rejectCredentials atomic.Bool
+	// unavailable answers every authenticated request 503.
+	unavailable atomic.Bool
 
 	mu   sync.Mutex
 	held *heldFetch
@@ -251,6 +253,10 @@ func newUpstreamHandler(httpBackendPath, projectRoot string) (http.Handler, *req
 		if !ok || username != upstreamBasicAuthUsername || password != upstreamBasicAuthToken || faults.rejectCredentials.Load() {
 			w.Header().Set("WWW-Authenticate", `Basic realm="e2e-upstream"`)
 			http.Error(w, "401 Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if faults.unavailable.Load() {
+			http.Error(w, "503 Service Unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		ep := rec.observe(r)
