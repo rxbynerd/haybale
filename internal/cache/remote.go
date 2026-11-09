@@ -159,9 +159,10 @@ func (f *fill) checkRemoteHeader(h entryHeader) error {
 	return nil
 }
 
-// remoteFresh applies the hit freshness rules to a remote entry. An entry
-// past retention or older than the repository's last purge is deleted
-// from the remote tier.
+// remoteFresh applies the hit freshness rules to a remote entry, and
+// misses a refs entry created before this process's last push to the
+// repository. An entry past retention or older than the repository's last
+// purge is deleted from the remote tier.
 func (f *fill) remoteFresh(h entryHeader) bool {
 	c := f.c
 	age := c.now().Sub(h.CreatedAt)
@@ -170,6 +171,12 @@ func (f *fill) remoteFresh(h entryHeader) bool {
 		c.deleteRemote(f.key.Path())
 		return false
 	case f.key.Group == GroupRefs && age > c.opts.RefsMaxAge:
+		return false
+	case f.key.Group == GroupRefs && !h.CreatedAt.After(c.gens.pushedAt(f.key.RepoHash)):
+		// Created no later than this process's last push to the
+		// repository, so it may hold the pre-push tips. A peer may still
+		// serve it until refsMaxAge; it is left for the push's own
+		// deletion.
 		return false
 	}
 	return true
@@ -534,6 +541,12 @@ func (c *Cache) upload(ctx context.Context, job uploadJob) string {
 		c.remoteError(observability.OperationPut, err)
 		return observability.UploadResultFailed
 	}
+	if job.key.Group == GroupRefs && c.gens.current(job.key.RepoHash) != job.gen {
+		// A push landed during the Put, and its deletion may have run
+		// before the object existed.
+		c.deleteRemote(path)
+		return observability.UploadResultSkipped
+	}
 	return observability.UploadResultUploaded
 }
 
@@ -561,19 +574,33 @@ func (c *Cache) goRemote(fn func(ctx context.Context)) {
 	}()
 }
 
-// deleteRemote deletes the remote object at path before returning, so the
-// upload that follows an upstream fill never finds it still present.
+// deleteRemote deletes the remote object at path within remoteBound
+// before returning, so the upload that follows an upstream fill never
+// finds it still present.
 func (c *Cache) deleteRemote(path string) {
-	ctx, cancel := context.WithTimeout(c.remoteCtx, remoteMaintenanceTimeout)
+	ctx, cancel := context.WithTimeout(c.remoteCtx, c.remoteBound())
 	defer cancel()
 	if err := c.remote.Delete(ctx, path); err != nil {
 		c.remoteError(observability.OperationDelete, err)
 	}
 }
 
-// invalidateRemote deletes repoHash's refs entries from the remote tier.
-// It is best effort: a failure is logged and counted, never returned.
-func (c *Cache) invalidateRemote(ctx context.Context, repo gitproto.Repo, repoHash [32]byte) {
+// remoteBound bounds remote-tier work a request waits on beyond a single
+// Stat or Get: RemoteHeaderTimeout, or remoteMaintenanceTimeout when that
+// is unbounded.
+func (c *Cache) remoteBound() time.Duration {
+	if t := c.opts.RemoteHeaderTimeout; t > 0 {
+		return t
+	}
+	return remoteMaintenanceTimeout
+}
+
+// invalidateRemote deletes repoHash's refs entries from the remote tier
+// within remoteBound, under the remote tier's context so shutdown cancels
+// it. It is best effort: a failure is logged and counted, never returned.
+func (c *Cache) invalidateRemote(repo gitproto.Repo, repoHash [32]byte) {
+	ctx, cancel := context.WithTimeout(c.remoteCtx, c.remoteBound())
+	defer cancel()
 	n, err := deleteRemotePrefix(ctx, c.remote, RepoPrefix(GroupRefs, repoHash))
 	var opErr *remoteOpError
 	if errors.As(err, &opErr) {

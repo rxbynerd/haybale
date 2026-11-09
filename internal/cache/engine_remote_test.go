@@ -46,9 +46,10 @@ type memBlobStore struct {
 	calls   []blobCall
 	puts    int64 // advances the modification time of every Put
 
-	getHook  func(key string, offset int64) error
-	statHook func(ctx context.Context, key string) error
-	putHook  func(ctx context.Context, key string) error
+	getHook    func(key string, offset int64) error
+	statHook   func(ctx context.Context, key string) error
+	putHook    func(ctx context.Context, key string) error
+	deleteHook func(ctx context.Context, key string) error
 	listErr  error
 	// etags makes the store report an ETag for every object and honour
 	// GetIfMatch.
@@ -161,8 +162,16 @@ func (m *memBlobStore) Put(ctx context.Context, key string, body io.ReadSeeker, 
 	return nil
 }
 
-func (m *memBlobStore) Delete(_ context.Context, key string) error {
+func (m *memBlobStore) Delete(ctx context.Context, key string) error {
 	m.record("delete", key, 0)
+	m.mu.Lock()
+	hook := m.deleteHook
+	m.mu.Unlock()
+	if hook != nil {
+		if err := hook(ctx, key); err != nil {
+			return err
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.objects, key)
@@ -930,8 +939,13 @@ func TestRefsAreNotUploadedWhileRefsMaxAgeIsZero(t *testing.T) {
 	})
 	c, _, reader := newRemoteTestCache(t, store, nil)
 	refs := refsFetcher(t)
-	for range uploadWorkers + uploadQueueSize {
+	// Were refs queued, these would hold every worker on the blocked refs
+	// Put and leave queued jobs behind.
+	for range 2 * uploadWorkers {
 		lsRefs(t, c, refs)
+	}
+	if n := len(c.uploads); n != 0 {
+		t.Errorf("queued uploads after ls-refs = %d, want none", n)
 	}
 	if out, _, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), packFetcher(remotePack(t))); !out.Stored {
 		t.Fatalf("fetch = %+v, want a stored miss", out)
@@ -981,7 +995,7 @@ func TestUploadOfARefsEntryAfterAPushIsSkipped(t *testing.T) {
 	c, _, _ := newRemoteTestCache(t, store, nil)
 	key := entryKey{Group: GroupRefs, RepoHash: c.keyring.RepoHash(testBaseURL, testRepo)}
 	job := uploadJob{key: key, repo: testRepo, gen: c.gens.current(key.RepoHash)}
-	c.gens.bump(key.RepoHash)
+	c.gens.bump(key.RepoHash, c.now())
 	if got := c.upload(context.Background(), job); got != observability.UploadResultSkipped {
 		t.Errorf("upload = %s, want skipped", got)
 	}

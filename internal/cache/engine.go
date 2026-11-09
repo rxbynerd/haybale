@@ -714,21 +714,23 @@ func (c *Cache) stream(w http.ResponseWriter, src io.Reader, contentType, result
 
 // Invalidate records a push to repo: it bumps the repository's generation
 // so an in-flight refs fill is discarded at commit and a queued refs
-// upload is skipped, and deletes the repository's stored refs entries.
-// With a remote tier, the remote refs entries are deleted in the
-// background, best effort.
+// upload is skipped, records the push time so a remote refs entry
+// created before it is not served, and deletes the repository's stored
+// refs entries. With a remote tier it then deletes the remote refs
+// entries before returning, within remoteBound and best effort: failures
+// are logged, never returned.
 func (c *Cache) Invalidate(ctx context.Context, repo gitproto.Repo, baseURL *url.URL) {
 	repoHash := c.keyring.RepoHash(baseURL, repo)
-	c.gens.bump(repoHash)
-	if c.remote != nil {
-		c.goRemote(func(ctx context.Context) { c.invalidateRemote(ctx, repo, repoHash) })
-	}
+	c.gens.bump(repoHash, c.now())
 	n, err := c.store.DeletePrefix(RepoPrefix(GroupRefs, repoHash))
 	if err != nil {
 		c.logger.WarnContext(ctx, "invalidating refs entries after a push failed", "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "error", err)
-		return
+	} else {
+		c.logger.DebugContext(ctx, "invalidated refs entries after a push", "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "entries", n)
 	}
-	c.logger.DebugContext(ctx, "invalidated refs entries after a push", "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "entries", n)
+	if c.remote != nil {
+		c.invalidateRemote(repo, repoHash)
+	}
 }
 
 // Purge deletes the stored entries of repo in group, or in both groups
