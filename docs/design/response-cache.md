@@ -529,13 +529,13 @@ upstream fill. A tier-2 failure before the first byte falls through to
 upstream inside the same fill; a failure mid-stream resumes with a ranged
 `Get` from the current offset a bounded number of times, since the object
 is immutable and its length is known from the header, and only then
-aborts. Bucket lifecycle expiry is day-granular on every cloud, so expiry
-is decided from the header's creation time and lifecycle rules are
-garbage collection only. Objects are stored as `application/octet-stream`
-with no user metadata (limits and encoding rules differ per vendor; the
-in-object header is the only metadata). Entries over 5 GiB are not
-uploaded (single-request PUT limit), which the default `maxEntrySize`
-already guarantees.
+aborts. Bucket lifecycle expiry is day-granular on AWS S3, and other
+stores were not checked, so expiry is decided from the header's creation
+time and lifecycle rules are garbage collection only. Objects are stored
+as `application/octet-stream` with no user metadata (limits and encoding
+rules differ per vendor; the in-object header is the only metadata).
+Entries over 5 GiB are not uploaded (single-request PUT limit), which the
+default `maxEntrySize` already guarantees.
 
 ```go
 // BlobStore is the remote tier. Implementations are safe for concurrent
@@ -571,7 +571,8 @@ redirect the cache; the SDK's HTTP client uses an explicit transport with
 no environment proxy; request and response checksums are set to `WhenRequired`
 (the SDK's default CRC32 checksums break several non-AWS stores);
 `prefix` is empty (the bucket root, one trust domain for the whole bucket) or
-ends with `/` (directory buckets require it); optional `sse` and `kmsKeyID`
+ends with `/` (so one prefix cannot also match another in IAM conditions and
+lifecycle filters); optional `sse` and `kmsKeyID`
 fields request server-side encryption where the store supports it (R2
 has none); errors are logged by operation,
 error code and status only; and the log scrubber gains AWS access-key-id
@@ -598,11 +599,13 @@ archived and is not recommended for new deployments.
 > Implemented as: "Before the first byte" is the point where the fill
 > publishes its outcome to subscribers: after the `Get` returns and the
 > 4 KiB sealed header has been read and verified, within `headerTimeout` of
-> the `Get` returning, with no resume. A failure up to that point falls
+> the `Get` returning (within `idleTimeout` when `headerTimeout` is `0s`),
+> with no resume. A failure up to that point falls
 > through to upstream. After it, a failed or idle body resumes with a ranged
 > `Get` from the current offset, up to three times, with a backoff from
-> 100 ms that doubles; a resume is conditional on the ETag (`If-Match`)
-> when the store reports one, and on size and modification time otherwise.
+> 100 ms that doubles; a resume always checks that size, modification time
+> and ETag are unchanged, and is conditional on the ETag (`If-Match`) when
+> the store reports one.
 > A stall inside the first sealed segment therefore resumes rather than
 > falls through, and if the read cannot continue the fill aborts and
 > subscribers that received nothing are released to the passthrough path.
@@ -611,13 +614,14 @@ archived and is not recommended for new deployments.
 > and `List` keep the SDK's default retryer.
 
 > Implemented as: A read that cannot continue after its resumes, or whose
-> object changed, ends the fill with `fetch_error` and leaves the object;
-> it is not an integrity failure. A failure of the sealed reader itself
-> (header or segment authentication, a missing final segment, bytes after
-> it) is an integrity failure: the object is deleted from tier 2 within
-> `headerTimeout` (one minute when it is `0s`) before the fill moves on. A tier-2 entry past `retention`
-> or older than a purge is deleted in the background, at most eight such
-> tasks at a time, and the fill falls through to upstream.
+> object changed or was deleted, ends the fill with `fetch_error` and
+> leaves the object; it is not an integrity failure. A failure of the
+> sealed reader itself (header or segment authentication, a missing final
+> segment, bytes after it) is an integrity failure: the object is deleted
+> from tier 2 within `headerTimeout` (one minute when it is `0s`) before
+> the fill moves on. A tier-2 entry past `retention` or older than a purge
+> is deleted in the background, each deletion bounded at one minute and at
+> most eight such tasks at a time, and the fill falls through to upstream.
 
 > Implemented as: Push invalidation deletes the repository's tier-2 refs
 > entries before `Invalidate` returns, after the tier-1 deletion, with one
@@ -840,7 +844,7 @@ cache:
     region: us-east-1
     endpoint: ""                   # https; set for R2, Ceph, GCS interop
     forcePathStyle: false
-    headerTimeout: 10s             # each remote Stat, Get, List page and Delete, and the sealed-header read; 0s = unbounded
+    headerTimeout: 10s             # each remote Stat, Get, List page and Delete, and the sealed-header read; 0s = no per-request bound
     sse: ""                        # "AES256" or "aws:kms"
     kmsKeyID: ""
   staleIfErrorFor: 0s              # 0s = disabled; must not exceed retention
@@ -876,6 +880,13 @@ continues, so a bucket outage cannot stop haybale from starting.
 > startup probe is a `Get` of a random key under `v1/.probe/`, new at every
 > start so a bucket writer cannot plant it, rather than a `Stat`, because a
 > HEAD response has no body to tell a missing bucket from a missing object.
+> A not-found 404 passes, a 307, 308, 408 or 429 warns, and any other 3xx
+> or 4xx fails startup. A credential-chain failure that can pass (a
+> timeout, a send failure, or a provider answering 5xx or 429) warns, while
+> a chain that finds no provider or is refused fails startup. With
+> `headerTimeout: 0s` the sealed-header read is bounded by `idleTimeout`,
+> and the deletions after a push, after a failed verification and after a
+> refs upload that a push superseded by one minute.
 
 ## Operational notes
 

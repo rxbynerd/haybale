@@ -246,7 +246,7 @@ Only the `read` verb is ever offered to the cache. A push, including the
 served from the cache and never has its body read. A completed
 `git-receive-pack` request, whatever its status and even if the client
 disconnects before the response ends, deletes that repository's cached ref
-entries on this instance.
+entries on this instance and, with a remote tier, in the bucket.
 
 ### What is cached
 
@@ -390,17 +390,28 @@ web identity, make their own requests and may follow `AWS_ENDPOINT_URL_STS` and
 similar settings. A failed bucket request is logged as its operation, object key
 (a hashed path), S3 error code and HTTP status only: never the SDK's error
 text, request ids or credentials. A read whose body fails mid-stream is logged
-with the network error, which can name the local and remote addresses.
+with the network error, which can name the local and remote addresses. An
+endpoint that carries userinfo, a query or a fragment is refused, and the error
+shows only its scheme and host.
+
+At startup, `haybale serve` checks the bucket by reading a random key under
+`v1/.probe/`, new at every start, and refuses to start if the read succeeds.
+A bucket writer cannot plant that key in advance, so it cannot stop replicas
+from starting.
 
 A purge with `--remote` writes a purge marker, an object sealed under the cache
 key that records when each group of the repository was purged. Replicas check
 it alongside an upstream refs request for the repository, reuse a successful
-check for up to a minute, and drop local entries created before it. A marker sealed under another key or for another repository is rejected
-with a `cache_integrity_failed` event, so a bucket writer cannot purge a
-repository. A replica renews the access record that pack hits depend on only
-after a successful check, so while the marker cannot be read or fails
-verification, its pack hits for the repository lapse within `accessRecheck`
-and go to the upstream instead of outliving a purge.
+check for up to a minute, and drop local entries created before it. After a
+failed check a replica does not read the marker again for a minute, so a
+replica whose checks are failing honours a purge up to that minute later. A
+marker sealed under another key or for another repository is rejected with a
+`cache_integrity_failed` event, so a bucket writer cannot purge a repository.
+A replica renews the access record that pack hits depend on only after a
+successful check, so while the marker cannot be read or fails verification,
+its pack hits for the repository lapse within `accessRecheck` and go to the
+upstream instead of outliving a purge. Setting `accessRecheck` to `0s`
+disables that rule, and pack hits then continue while marker checks fail.
 
 The host that runs `haybale cache purge --remote` holds the cache key and write
 access to the bucket. Together they are enough to seal entries that every
@@ -419,13 +430,38 @@ a failure on the replicas' side:
   which case their older local entries stay servable until `retention`, as
   they would without the marker, or replace it with an invalid object, which
   stops pack hits for the repository on every replica until `purge --remote`
-  replaces it; and
+  replaces it. The replacement records only the groups purged then, so the
+  other group's earlier purge time is lost for replicas that had not read it.
+  When the purge that printed `notice: the repository's purge marker failed
+  verification and was replaced` used `--group`, run it again for both
+  groups; and
 - after a push, the replica that handled it deletes the repository's refs
   entries from the bucket, best effort, and never serves an older refs entry
   from the bucket itself. When that deletion fails, other replicas, and the
   same replica after a restart, can serve the pre-push refs from the bucket
-  for up to `refsMaxAge`. With the default `refsMaxAge` of `0s`, refs entries
-  are never read from the bucket.
+  for up to `refsMaxAge`.
+
+Pre-push refs can reach clients from the bucket in three more ways, none of
+which needs write access to the bucket:
+
+- another replica's refs upload that was queued before the push still runs,
+  because that replica did not see the push. It can land after the pushing
+  replica's successful deletion, and every replica except the pushing one can
+  then serve it until it is older than `refsMaxAge`;
+- the push time is the pushing replica's local wall-clock time, and an entry's
+  creation time comes from the clock of the replica that sealed it. A replica
+  whose clock runs a few seconds ahead, within the 5-minute tolerance, can seal
+  an entry fetched before the push with a creation time after the push time,
+  and the pushing replica then serves it as well; and
+- a refs upload that a push superseded deletes its object again. That deletion
+  can remove another replica's newer object at the same key, which costs a
+  miss. If shutdown cancels the deletion and the replica restarts, the
+  pre-push object survives, and the restarted replica, which has forgotten the
+  push time, can serve it until it is older than `refsMaxAge`.
+
+With the default `refsMaxAge` of `0s`, refs entries are never uploaded to or
+read from the bucket, so none of the push cases apply. The marker replacement
+case applies at any `refsMaxAge`.
 
 ### Entries are shared across identities
 

@@ -132,11 +132,13 @@ cache does not renew the upstream access check that cached packs depend on;
 ## Sizing and volumes
 
 The cache holds up to `maxDiskSize` of stored entries and in-progress fills. A
-fill reserves its sealed size before it starts: the upstream `Content-Length`
-when sent, otherwise `maxEntrySize`, plus a small allowance. Most Git hosts send
-packs without a length, so the reservation is usually `maxEntrySize`. Ref
-advertisement and `ls-refs` fills do not take a fill slot. They are capped at 64
-at a time and reserve 1MiB each. Size the values together:
+fill reserves its sealed size before it starts. A fill from the bucket reserves
+the object's size. A fill from the upstream reserves the upstream
+`Content-Length` when sent, otherwise `maxEntrySize`, plus a small allowance.
+Most Git hosts send packs without a length, so the reservation is usually
+`maxEntrySize`. Ref advertisement and `ls-refs` fills do not take a fill slot.
+They are capped at 64 at a time and reserve 1MiB each. Size the values
+together:
 
 ```text
 maxDiskSize  >=  maxConcurrentFills x maxEntrySize  +  64MiB  +  space for stored entries
@@ -169,9 +171,10 @@ tier](#remote-tier), never through a shared volume.
 haybale creates the last element of `cache.dir` with mode `0700` when it is
 missing; the parent must exist. An existing directory must be owned by the
 haybale user (where the platform reports ownership) and have no group or other
-permission bits, and `haybale serve` refuses to start otherwise. A freshly mounted volume is usually owned by root with open
-permissions, so do not use its mount point as `cache.dir`: mount the volume at a
-parent and point `cache.dir` at a subdirectory.
+permission bits, and `haybale serve` refuses to start otherwise. A freshly
+mounted volume is usually owned by root with open permissions, so do not use
+its mount point as `cache.dir`: mount the volume at a parent and point
+`cache.dir` at a subdirectory.
 
 ### Kubernetes
 
@@ -289,51 +292,57 @@ How the two tiers interact:
   serving it, the same fill asks the upstream at once, with no retry. That
   phase covers the read's response headers, bounded by `headerTimeout`, and
   the entry's 4KiB sealed header, which must arrive within `headerTimeout` of
-  the response headers. Stat and read requests make a single attempt, without
-  the AWS SDK's retries, so `headerTimeout` is the only bound on them; uploads,
-  deletions and listings keep the SDK's default retries.
+  the response headers, or within `idleTimeout` when `headerTimeout` is `0s`.
+  Stat and read requests make a single attempt, without the AWS SDK's
+  retries, so `headerTimeout` is the only bound on them; uploads, deletions
+  and listings keep the SDK's default retries.
 - Once the fill has started serving the entry, a read that fails, or stalls for
   `idleTimeout`, resumes from where it stopped with a ranged read, up to three
-  times, after a pause of 100ms that doubles each time. A resume is conditional
-  on the object's ETag when the store reports one, and otherwise on its size
-  and modification time; an object replaced in the meantime is not resumed. A
-  read that cannot continue ends the fill with `reason=fetch_error`: requests
-  that had received bytes lose the connection, and requests that had received
-  nothing go to the upstream directly. This is a transport failure, so the
-  object is left in the bucket and no security event is logged. A stall inside
-  the entry's first segment, after its header arrived, is also handled this
-  way rather than by falling through.
+  times, after a pause of 100ms that doubles each time. Each resume checks
+  that the object's size, modification time and ETag are unchanged, and when
+  the store reports an ETag the ranged read is also conditional on it
+  (`If-Match`). An object replaced or deleted in the meantime ends the read at
+  once, without further resumes. A read that cannot continue ends the fill
+  with `reason=fetch_error`: requests that had received bytes lose the
+  connection, and requests that had received nothing go to the upstream
+  directly. This is a transport failure, so the object is left in the bucket
+  and no security event is logged. A stall inside the entry's first segment,
+  after its header arrived, is also handled this way rather than by falling
+  through.
 - An entry read from the bucket is verified segment by segment with the cache
   key, and each segment is verified before any of its bytes reach a client. A
   failed authentication of the header or of a segment, a missing final
   segment, or bytes after it, is an integrity failure: the entry is deleted
-  from the bucket, within `headerTimeout` (one minute when it is `0s`),
-  before the fill moves on, and a `cache_integrity_failed` security event is
-  logged with `tier=remote`. When
-  the header fails, the same fill asks the upstream. When a segment fails, the
-  fill ends with `reason=store_error`: requests that had received bytes lose
-  the connection, and requests that had received nothing go to the upstream
-  directly. An object truncated in the bucket fails this way, because its
-  final segment is missing.
+  from the bucket, within `headerTimeout` (one minute when it is `0s`), before
+  the fill moves on, and a `cache_integrity_failed` security event is logged
+  with `tier=remote`. When the header fails, the same fill asks the upstream.
+  When a segment fails, the fill ends with `reason=store_error`: requests that
+  had received bytes lose the connection, and requests that had received
+  nothing go to the upstream directly. An object truncated in the bucket fails
+  this way, because its final segment is missing.
 - A remote object whose size cannot be a valid entry, or one past `retention`
   or older than the repository's last purge, is not used, and the fill asks
   the upstream. An expired or purged object is deleted from the bucket in the
-  background, at most eight such deletions at a time; the rest are dropped
-  with a Debug line. Such a deletion can race the upload that follows the
-  fill, which then finds the old object and is skipped, so the key can stay
-  absent from the bucket until a later miss uploads it again.
+  background, each deletion bounded at one minute and at most eight at a
+  time; the rest are dropped with a Debug line. Such a deletion can race the
+  upload that follows the fill, which then finds the old object and is
+  skipped, so the key can stay absent from the bucket until a later miss
+  uploads it again.
 - A push deletes the repository's refs entries from the bucket before the push
   handler returns, after the local deletion, within one `headerTimeout` (one
   minute when `headerTimeout` is `0s`) across the listing and the deletions.
   It is best effort: a failure is logged as `remote cache tier operation
   failed` with `operation=list` or `operation=delete`, and the push itself is
-  unaffected. The replica also records the push time in memory, and does not
-  serve a refs entry from the bucket created no later than that time. A refs
-  upload that was in flight when the push arrived deletes its object again and
-  counts as `skipped`.
+  unaffected. The Debug line `cache: invalidated remote refs entries after a
+  push` is logged only when the listing and every deletion succeeded. The
+  replica also records the push time in memory, and does not serve a refs
+  entry from the bucket created no later than that time. A refs upload that
+  was in flight when the push arrived deletes its object again and counts as
+  `skipped`.
 - At shutdown, `haybale serve` waits for queued uploads within the same bound it
   gives fills in progress, then abandons the rest and counts them as
-  `dropped`.
+  `dropped`. Background deletions and push invalidation that shutdown cuts
+  short log no warning and count no store error.
 
 Behind a load balancer without client affinity, a clone's `ls-refs` and `fetch`
 can reach different replicas. The `fetch` then misses on the second replica's
@@ -345,7 +354,7 @@ refs success for the repository, or from the upstream otherwise.
 | Store | Settings |
 |-------|----------|
 | AWS S3, general-purpose bucket | `region`; no `endpoint`, except in the China partitions (`https://s3.<region>.amazonaws.com.cn`). |
-| AWS S3 Express One Zone directory bucket | `endpoint` set to the zonal endpoint (`https://s3express-<zone id>.<region>.amazonaws.com`); a `prefix` ending with `/`. Suits replicas in that Availability Zone. |
+| AWS S3 Express One Zone directory bucket | `endpoint` set to the zonal endpoint (`https://s3express-<zone id>.<region>.amazonaws.com`); an empty `prefix` or one ending with `/`. Suits replicas in that Availability Zone. |
 | Cloudflare R2 | `endpoint: https://<account id>.r2.cloudflarestorage.com`, `region: auto`, no `sse`. R2 charges no egress, which suits replicas spread across clouds. |
 | Ceph RGW | `endpoint` set to the gateway URL, `forcePathStyle: true` unless the gateway serves bucket host names, and `region` set to the zonegroup's API name. |
 | Google Cloud Storage | The interoperability endpoint, `endpoint: https://storage.googleapis.com`, with an HMAC key supplied as `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; `region` set to the bucket's location or `auto`; no `sse`. |
@@ -363,10 +372,11 @@ rule removes it. Its size is roughly the distinct pack entries the fleet creates
 within `retention` plus the lifecycle margin; refs entries are kilobytes.
 Entries over 5GiB are never uploaded, which the default `maxEntrySize` of 1GiB
 already guarantees. Request volume is one read per eligible disk miss, at most
-one small read of each repository's purge marker per minute (on an upstream
-refs request), and one upload per stored pack entry, plus an existence check
-first, and per stored refs entry when `refsMaxAge` is above `0s`. A push costs
-a listing of the repository's refs entries and a deletion for each one found.
+one small read of each repository's purge marker per minute, or per
+`accessRecheck` when that is shorter (on an upstream refs request), and one
+upload per stored pack entry, plus an existence check first, and per stored
+refs entry when `refsMaxAge` is above `0s`. A push costs a listing of the
+repository's refs entries and a deletion for each one found.
 Every read of the bucket leaves the store's network, so egress pricing matters
 when replicas run outside the bucket's region or cloud.
 
@@ -392,26 +402,30 @@ catch up or `purge --remote` is run again from a host with a correct clock
 
 ### When the bucket is unavailable
 
-haybale does not track the bucket's health; every operation tries the bucket
-afresh. During an outage:
+haybale does not track the bucket's health, apart from the marker read backoff
+below; every other operation tries the bucket afresh. During an outage:
 
 - each eligible disk miss waits for the bucket before it goes upstream: up to
   `headerTimeout` for the read's response headers, and up to `headerTimeout`
-  again for the entry's sealed header when the headers arrived;
+  again (`idleTimeout` when `headerTimeout` is `0s`) for the entry's sealed
+  header when the headers arrived;
 - an upstream refs fill waits for the repository's purge marker read, at most
   30 seconds, and after a failed read the replica does not read that
   repository's marker again for a minute;
 - while marker reads fail, upstream refs responses do not renew the access
   record that pack hits depend on, so pack requests stop hitting, on disk as
-  well, within `accessRecheck` and go to the upstream instead;
+  well, within `accessRecheck` and go to the upstream instead, unless
+  `accessRecheck` is `0s`, which disables the rule;
 - a push's result is unaffected, but the push handler can take up to
   `headerTimeout` (one minute when it is `0s`) longer to return while it tries
   to delete the bucket's refs entries; and
 - uploads fail and are counted as `result=failed`.
 
 To shorten the wait on each request, lower `headerTimeout`. `0s` removes the
-per-request bound and leaves each request waiting until the bucket answers or
-the connection fails, so use it only with a store that fails fast.
+per-request bound: a disk miss then waits for the read's response headers
+until the bucket answers or the connection fails, the entry's sealed header is
+bounded by `idleTimeout`, and the deletions a request waits on are bounded at
+one minute. Use `0s` only with a store that fails fast.
 
 ## Observing the cache
 
@@ -457,10 +471,11 @@ Log lines to alert on, all at Warn unless noted:
   entry read from the bucket, is logged at Debug, so alert on the event. An
   entry that fails is deleted. A purge marker that fails (`class=purge`,
   `tier=remote`) is not deleted: pack hits for that repository stop on every
-  replica within `accessRecheck`, and each replica logs the event again about
-  every minute while it receives refs requests for the repository, until
-  `haybale cache purge --remote` replaces the marker. A single event can
-  be disk corruption or a host clock running more than 5 minutes ahead.
+  replica within `accessRecheck` (unless `accessRecheck` is `0s`, which
+  disables the rule), and each replica logs the event again about every
+  minute while it receives refs requests for the repository, until `haybale
+  cache purge --remote` replaces the marker. A single event can be disk
+  corruption or a host clock running more than 5 minutes ahead.
   Repeated events, or events after nobody changed the key, suggest someone is
   writing to the cache directory or the bucket.
 - `entry failed mid-stream; aborting the response`: a stored entry failed while
@@ -605,14 +620,23 @@ The command then works in this order, printing a line as each step finishes:
    Other directory errors, such as the wrong owner, still fail the command.
 
 It needs the bucket credentials as well, and the whole run is bounded at five
-minutes. If the marker cannot be written, the command exits non-zero with
-`--remote: write the purge marker (nothing was deleted): ...` and deletes
-nothing. If a deletion from the bucket fails, the command still runs the local
-step, then exits non-zero with `--remote: the purge marker was written, but
-purging the remote tier failed (N entries deleted so far): ...`. Running the command again is safe in both cases. An
-existing marker that fails verification, for example one sealed under another
-key or by a host whose clock ran ahead, is replaced, with `notice: the
-repository's purge marker failed verification and was replaced` on stderr.
+minutes. If the marker cannot be written, the command deletes nothing and exits
+with status 1, printing `Error: --remote: write the purge marker (nothing was
+deleted): ...`. If a deletion from the bucket fails, the command still runs the
+local step, then exits with status 1, printing `Error: --remote: the purge
+marker was written, but purging the remote tier failed (N entries deleted so
+far): ...`. If deleting the local entries fails, with or without `--remote`,
+the command exits with status 1, printing `Error: purge <group> entries (N
+entries purged so far): ...`, where `<group>` is `refs` or `pack`. Running the
+command again is safe in every case.
+
+An existing marker that fails verification, for example one sealed under
+another key or by a host whose clock ran ahead, is replaced, with `notice: the
+repository's purge marker failed verification and was replaced` on stderr. The
+replacement records only the groups purged now, so the other group's earlier
+purge time is lost for every replica that had not already read it. When the
+purge that printed the notice used `--group`, run it again without `--group`,
+so both groups are purged. This applies at any `refsMaxAge`.
 
 The marker is sealed under the cache key and records the purge time of each
 group. A replica checks it alongside an upstream refs request for the
@@ -625,17 +649,20 @@ shorter), and concurrent refs requests for the repository share one read. A
 replica therefore honours a purge within about a minute plus its next upstream
 refs request for the repository. A check that fails, because the read fails,
 times out after 30 seconds, or finds a marker that fails verification, is not
-retried for a minute, and does not renew the access record that pack hits
-depend on, so the replica's pack hits for the repository lapse within
-`accessRecheck` and go to the upstream until a check succeeds. With
-`refsMaxAge` above `0s`, a refs hit does not read the marker, so cached refs
-entries can be served for up to `refsMaxAge` after the purge.
+retried for a minute, so a replica whose checks are failing honours a purge
+up to that minute later. A failed check does not renew the access record that
+pack hits depend on, so the replica's pack hits for the repository lapse
+within `accessRecheck` and go to the upstream until a check succeeds, unless
+`accessRecheck` is `0s`, which disables the rule. With `refsMaxAge` above
+`0s`, a refs hit does not read the marker, so cached refs entries can be
+served for up to `refsMaxAge` after the purge.
 
 Without `--remote`, the command reaches only this host's directory. When
 `cache.remote` is configured, it then prints `warning: cache.remote is
 configured but --remote was not given: replicas will refill the purged entries
-from the bucket; use --remote to purge the shared tier` on stderr and exits
-with status 0, because the bucket still holds the entries.
+from the bucket; use --remote to purge the shared tier` on stderr. The bucket
+still holds the entries, but the command exits with status 0 when the local
+purge succeeds.
 
 Without a remote tier each replica has its own directory, so purge on every
 replica. On Kubernetes, run the command inside each pod, where the container
@@ -722,10 +749,10 @@ The `reason` on `fills.total` says why, and what clients see depends on it:
   upstream if it was over 64KiB.
 - `fetch_error`: a transport failure, a timeout, a failure to obtain a
   credential, a failure reading an error body, or a read from the remote tier
-  that could not continue after three resumes or whose object was replaced
-  during the read. Requests that had not yet received bytes go to the upstream
-  directly. If the failure comes mid-response, clients that had received bytes
-  lose the connection.
+  that could not continue after three resumes or whose object was replaced or
+  deleted during the read. Requests that had not yet received bytes go to the
+  upstream directly. If the failure comes mid-response, clients that had
+  received bytes lose the connection.
 - `encoding`: the upstream answered with a content encoding. The waiting
   requests go to the upstream directly.
 - `store_error`: the disk failed, the fill panicked, or an entry read from the
@@ -753,12 +780,12 @@ The connection is closed without a clean ending only after bytes were sent: the
 upstream failed or went silent mid-response, the disk failed or its budget ran
 out mid-response (including a response that outgrew `maxEntrySize` with no free
 budget left), a stored entry failed its integrity check while it was being
-read, or a read from the remote tier failed after three resumes or failed its
-integrity check. If the upstream does not send response headers within
-`responseHeaderTimeout`, waiting requests are instead sent to the upstream
-directly, and clients see only the delay. After a failed fill, requests for the
-same key go straight to the upstream for one minute, or for `retention` after an
-oversize response.
+read, or a read from the remote tier failed after three resumes, found its
+object replaced or deleted, or failed its integrity check. If the upstream does
+not send response headers within `responseHeaderTimeout`, waiting requests are
+instead sent to the upstream directly, and clients see only the delay. After a
+failed fill, requests for the same key go straight to the upstream for one
+minute, or for `retention` after an oversize response.
 
 ### `haybale serve` refuses to start
 
@@ -770,8 +797,9 @@ startup probe of the remote tier failed in a way that will not resolve itself,
 such as missing credentials, a certificate that does not verify, a redirect or
 an authorization or bucket error; or `AWS_CA_BUNDLE`, a profile `ca_bundle` or
 an `AWS_PROFILE` naming a missing profile stopped the S3 client from being
-built. The error names which, and [Remote tier](configuration.md#remote-tier)
-in the configuration reference lists the messages.
+built. The error names which; for the remote tier it is printed on stderr after
+`Error: build cache: `, and [Remote tier](configuration.md#remote-tier) in the
+configuration reference lists the messages.
 
 ### A replica serves ref tips from before a push
 
@@ -784,6 +812,27 @@ stay in the bucket for up to `refsMaxAge`. The replica that handled the push
 never serves them, because it remembers the push time, but other replicas can
 read them from the bucket, and so can the same replica after a restart, which
 forgets the push time.
+
+Pre-push refs entries can also reach the bucket, or be served from it, when
+the deletion succeeds:
+
+- Another replica's refs upload that was queued before the push still runs,
+  because that replica did not see the push. It can land after the pushing
+  replica's deletion, and every replica except the pushing one can then serve
+  it from the bucket until it is older than `refsMaxAge`.
+- The push time is the pushing replica's wall-clock time, and an entry's
+  creation time is the clock of the replica that sealed it. A replica whose
+  clock runs a few seconds ahead, within the 5-minute tolerance, can seal an
+  entry fetched before the push with a creation time after the push time, and
+  the pushing replica then serves it from the bucket too.
+- A refs upload that a push superseded deletes its object again. That
+  deletion can remove another replica's newer object at the same key, which
+  costs only a miss. If shutdown cuts the deletion short and the replica
+  restarts, the pre-push object stays, and the restarted replica, which has
+  forgotten the push time, can serve it until it is older than `refsMaxAge`.
+
+None of these cases arise at the default `refsMaxAge` of `0s`, because refs
+entries are then neither uploaded nor read from the bucket.
 
 ## Limits and roadmap
 

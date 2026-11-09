@@ -101,7 +101,7 @@ carry a repository owner or name.
 | `haybale.response_cache.fill_bytes.total`     | counter         | `host`, `class`, `tier`            | Response body bytes fills read from their source, including fills that were discarded or aborted and refs fills. `tier` is `upstream` for a fill from the upstream and `remote` for a fill from the remote tier, which counts the verified bytes read from the bucket. |
 | `haybale.response_cache.served_bytes.total`   | counter         | `host`, `class`, `tier`            | Response bytes served to clients through the cache path.                |
 | `haybale.response_cache.collapsed.total`      | counter         | `host`                             | Requests that joined a fill already in flight instead of fetching upstream. |
-| `haybale.response_cache.store_errors.total`   | counter         | `tier`, `operation`                | Cache storage failures. With `tier=remote` it counts failed requests to the bucket, every remote read that failed or stalled, including one a fill then resumed or fell through on, and remote entries and purge markers that failed verification (`operation=get`). |
+| `haybale.response_cache.store_errors.total`   | counter         | `tier`, `operation`                | Cache storage failures. With `tier=remote` it counts failed requests to the bucket, every remote read that failed or stalled, including one a fill then resumed or fell through on, and remote entries and purge markers that failed verification (`operation=get`). Uploads, background deletions and push invalidation that shutdown cuts short are not counted. |
 | `haybale.response_cache.evictions.total`      | counter         | (none)                             | Entries evicted to stay within the disk budget or retention.            |
 | `haybale.response_cache.uploads.total`        | counter         | `result`                           | Entries offered to the remote tier after they were stored on disk, by result. Recorded only when `cache.remote` is set. |
 | `haybale.response_cache.disk_bytes`           | up/down counter | (none)                             | Bytes currently held by the disk tier: committed entries plus bytes pinned by readers of removed entries. Space reserved for fills in progress is not counted, so the gauge can sit below the `maxDiskSize` budget the cache enforces. |
@@ -182,8 +182,9 @@ The per-request `proxied request` log line and the security events
 key material or entry path. A failed entry is deleted. A purge marker that
 fails verification has `class=purge`; it is not deleted, so each replica logs
 the event again about every minute while it receives refs requests for the
-repository, and its pack hits for the repository lapse within
-`accessRecheck`, until `haybale cache purge --remote` replaces the marker (see [Purging a
+repository, and its pack hits for the repository lapse within `accessRecheck`
+(unless `accessRecheck` is `0s`, which disables the rule), until `haybale cache
+purge --remote` replaces the marker (see [Purging a
 repository](caching.md#purging-a-repository)).
 
 Operational cache log lines worth alerting on are listed in the caching guide
