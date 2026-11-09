@@ -430,17 +430,29 @@ func TestCacheConfigValidate(t *testing.T) {
 			mutate:  withRemote(func(r *RemoteCacheConfig) { r.HeaderTimeout = "-1s" }),
 			wantErr: "cache.remote: headerTimeout \"-1s\" must not be negative",
 		},
+		{name: "staleIfErrorFor enabled", mutate: func(c *CacheConfig) { c.StaleIfErrorFor = "1h" }},
+		{name: "staleIfErrorFor equal to retention", mutate: func(c *CacheConfig) { c.StaleIfErrorFor = "24h" }},
 		{
-			name:    "staleIfErrorFor enabled",
-			mutate:  func(c *CacheConfig) { c.StaleIfErrorFor = "1h" },
-			wantErr: "cache: staleIfErrorFor is not supported in this release",
+			name:    "staleIfErrorFor above retention",
+			mutate:  func(c *CacheConfig) { c.StaleIfErrorFor = "24h1s" },
+			wantErr: `cache: staleIfErrorFor "24h1s" must not exceed retention "24h"`,
+		},
+		{
+			name:    "staleIfErrorFor above a shorter retention",
+			mutate:  func(c *CacheConfig) { c.Retention = "30m"; c.StaleIfErrorFor = "1h" },
+			wantErr: `cache: staleIfErrorFor "1h" must not exceed retention "30m"`,
 		},
 		{name: "staleIfErrorFor zero spelled 0", mutate: func(c *CacheConfig) { c.StaleIfErrorFor = "0" }},
 		{name: "staleIfErrorFor zero spelled 0m", mutate: func(c *CacheConfig) { c.StaleIfErrorFor = "0m" }},
 		{
 			name:    "staleIfErrorFor unparseable",
 			mutate:  func(c *CacheConfig) { c.StaleIfErrorFor = "soon" },
-			wantErr: "cache: staleIfErrorFor is not supported in this release",
+			wantErr: `cache: staleIfErrorFor "soon" is not a valid duration`,
+		},
+		{
+			name:    "staleIfErrorFor negative",
+			mutate:  func(c *CacheConfig) { c.StaleIfErrorFor = "-1h" },
+			wantErr: `cache: staleIfErrorFor "-1h" must not be negative`,
 		},
 	}
 	for _, tt := range tests {
@@ -534,7 +546,7 @@ cache:
   responseHeaderTimeout: 60s
   idleTimeout: 45s
   exposeStatus: true
-  staleIfErrorFor: 0s
+  staleIfErrorFor: 6h
 `)
 	if err != nil {
 		t.Fatalf("Load() error = %v, want nil", err)
@@ -551,9 +563,9 @@ cache:
 	}
 	if c.ParsedRetention() != 48*time.Hour || c.ParsedRefsMaxAge() != 15*time.Second ||
 		c.ParsedAccessRecheck() != 10*time.Minute || c.ParsedResponseHeaderTimeout() != time.Minute ||
-		c.ParsedIdleTimeout() != 45*time.Second {
-		t.Errorf("parsed durations = %v/%v/%v/%v/%v, want 48h/15s/10m/1m/45s",
-			c.ParsedRetention(), c.ParsedRefsMaxAge(), c.ParsedAccessRecheck(), c.ParsedResponseHeaderTimeout(), c.ParsedIdleTimeout())
+		c.ParsedIdleTimeout() != 45*time.Second || c.ParsedStaleIfErrorFor() != 6*time.Hour {
+		t.Errorf("parsed durations = %v/%v/%v/%v/%v/%v, want 48h/15s/10m/1m/45s/6h",
+			c.ParsedRetention(), c.ParsedRefsMaxAge(), c.ParsedAccessRecheck(), c.ParsedResponseHeaderTimeout(), c.ParsedIdleTimeout(), c.ParsedStaleIfErrorFor())
 	}
 }
 
@@ -642,7 +654,7 @@ func TestLoadCacheRejections(t *testing.T) {
 		{"missing dir", "cache:\n  enabled: true\n", "cache: dir is required"},
 		{"remote block without a region", "cache:\n  enabled: true\n  dir: /c\n  keyEnv: K\n  remote:\n    type: s3\n    bucket: b\n", "cache.remote: region is required"},
 		{"remote block without keyEnv", "cache:\n  enabled: true\n  dir: /c\n  remote:\n    type: s3\n    bucket: b\n    region: us-east-1\n", "cache: keyEnv is required when cache.remote is set"},
-		{"staleIfErrorFor", "cache:\n  enabled: true\n  dir: /c\n  staleIfErrorFor: 1h\n", "cache: staleIfErrorFor is not supported in this release"},
+		{"staleIfErrorFor above the default retention", "cache:\n  enabled: true\n  dir: /c\n  staleIfErrorFor: 25h\n", `cache: staleIfErrorFor "25h" must not exceed retention "24h"`},
 		{"entry above disk", "cache:\n  enabled: true\n  dir: /c\n  maxDiskSize: 1GiB\n  maxEntrySize: 2GiB\n", "cache: maxEntrySize"},
 		{"entry above half of disk", "cache:\n  enabled: true\n  dir: /c\n  maxDiskSize: 2GiB\n  maxEntrySize: 1.5GiB\n", "cache: maxEntrySize 1536MiB must not exceed half of maxDiskSize 2GiB"},
 		{"negative retention", "cache:\n  enabled: true\n  dir: /c\n  retention: -1h\n", "cache: retention"},

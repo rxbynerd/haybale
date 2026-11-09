@@ -214,8 +214,9 @@ type CacheConfig struct {
 	// the same key.
 	Remote RemoteCacheConfig `yaml:"remote"`
 	// StaleIfErrorFor is a Go duration string: the maximum age of an
-	// entry served when upstream cannot answer. Only a zero duration is
-	// accepted.
+	// entry served when upstream cannot answer a read (stale-if-error).
+	// "0s" or empty (the default) disables it; a set value must not exceed
+	// Retention.
 	StaleIfErrorFor string `yaml:"staleIfErrorFor"`
 
 	// The parsed* fields cache the durations validate parsed, for the
@@ -225,6 +226,7 @@ type CacheConfig struct {
 	parsedAccessRecheck         time.Duration
 	parsedResponseHeaderTimeout time.Duration
 	parsedIdleTimeout           time.Duration
+	parsedStaleIfErrorFor       time.Duration
 }
 
 // RemoteCacheConfig configures the optional remote cache tier, a prefix
@@ -370,6 +372,11 @@ func (c CacheConfig) ParsedResponseHeaderTimeout() time.Duration {
 // Validate has not run).
 func (c CacheConfig) ParsedIdleTimeout() time.Duration { return c.parsedIdleTimeout }
 
+// ParsedStaleIfErrorFor returns the time.Duration a prior successful call
+// to Config.Validate parsed from StaleIfErrorFor. Zero means stale-if-error
+// is disabled (or that Validate has not run).
+func (c CacheConfig) ParsedStaleIfErrorFor() time.Duration { return c.parsedStaleIfErrorFor }
+
 // applyDefaults selects the default for every field of an enabled block
 // that is unset: a size or count of zero and an empty duration string
 // both mean unset. A disabled block is left untouched so it stays inert.
@@ -412,7 +419,7 @@ func (c *CacheConfig) applyDefaults() {
 // validate fail-fasts on an enabled block that is structurally unusable:
 // a missing dir, a duration that does not parse or is negative, sizes or
 // limits out of range, an invalid remote block or one without keyEnv, or
-// a stale-if-error setting. It does
+// a staleIfErrorFor above retention. It does
 // no filesystem, network or environment access, so `haybale policy check`
 // stays offline; the directory and key are checked when the cache is
 // built. A disabled block is always valid. An empty duration is accepted
@@ -435,6 +442,7 @@ func (c *CacheConfig) validate() error {
 		{"accessRecheck", c.AccessRecheck, &c.parsedAccessRecheck},
 		{"responseHeaderTimeout", c.ResponseHeaderTimeout, &c.parsedResponseHeaderTimeout},
 		{"idleTimeout", c.IdleTimeout, &c.parsedIdleTimeout},
+		{"staleIfErrorFor", c.StaleIfErrorFor, &c.parsedStaleIfErrorFor},
 	}
 	for _, d := range durations {
 		if d.raw == "" {
@@ -477,11 +485,8 @@ func (c *CacheConfig) validate() error {
 			return errors.New("cache: keyEnv is required when cache.remote is set, so that every replica seals and addresses entries under the same key")
 		}
 	}
-	if c.StaleIfErrorFor != "" {
-		d, err := time.ParseDuration(c.StaleIfErrorFor)
-		if err != nil || d != 0 {
-			return fmt.Errorf("cache: staleIfErrorFor is not supported in this release (got %q); leave it empty or \"0s\"", c.StaleIfErrorFor)
-		}
+	if c.parsedRetention > 0 && c.parsedStaleIfErrorFor > c.parsedRetention {
+		return fmt.Errorf("cache: staleIfErrorFor %q must not exceed retention %q: no entry is kept longer than retention", c.StaleIfErrorFor, c.Retention)
 	}
 	return nil
 }
@@ -704,6 +709,7 @@ func (c CacheConfig) BuildCache(ctx context.Context, logger *slog.Logger, metric
 		ResponseHeaderTimeout: c.parsedResponseHeaderTimeout,
 		IdleTimeout:           c.parsedIdleTimeout,
 		ExposeStatus:          c.ExposeStatus,
+		StaleIfErrorFor:       c.parsedStaleIfErrorFor,
 		Remote:                remote,
 		RemoteHeaderTimeout:   c.Remote.parsedHeaderTimeout,
 		Logger:                logger,
@@ -723,7 +729,8 @@ func (c CacheConfig) BuildCache(ctx context.Context, logger *slog.Logger, metric
 		"keyMode", keyMode,
 		"maxDiskSize", c.MaxDiskSize.String(),
 		"maxEntrySize", c.MaxEntrySize.String(),
-		"maxConcurrentFills", c.MaxConcurrentFills)
+		"maxConcurrentFills", c.MaxConcurrentFills,
+		"staleIfErrorFor", c.parsedStaleIfErrorFor.String())
 	if remote != nil {
 		logger.Info("response cache remote tier enabled",
 			"type", c.Remote.Type,

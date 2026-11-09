@@ -133,6 +133,7 @@ func TestBuildCacheLogsTheEffectiveConfiguration(t *testing.T) {
 				"maxDiskSize=10GiB",
 				"maxEntrySize=1GiB",
 				"maxConcurrentFills=4",
+				"staleIfErrorFor=0s",
 			} {
 				if !strings.Contains(line, want) {
 					t.Errorf("line = %q, want it to contain %q", line, want)
@@ -144,6 +145,25 @@ func TestBuildCacheLogsTheEffectiveConfiguration(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestBuildCacheAnnouncesStaleIfError confirms an enabled stale-if-error
+// age reaches the built cache's startup line.
+func TestBuildCacheAnnouncesStaleIfError(t *testing.T) {
+	c := enabledCacheConfig(t)
+	c.StaleIfErrorFor = "2h"
+	if err := c.validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	var buf bytes.Buffer
+	got, err := c.BuildCache(context.Background(), slog.New(slog.NewTextHandler(&buf, nil)), observability.NewNoopMetrics())
+	if err != nil {
+		t.Fatalf("BuildCache: %v", err)
+	}
+	defer closeCache(t, got)
+	if line := logLine(t, buf.String(), "response cache enabled"); !strings.Contains(line, "staleIfErrorFor=2h0m0s") {
+		t.Errorf("line = %q, want staleIfErrorFor=2h0m0s", line)
 	}
 }
 
