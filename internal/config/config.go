@@ -93,6 +93,11 @@ type Config struct {
 	// disables telemetry entirely: haybale emits nothing over OTLP and the
 	// metric instruments become no-ops.
 	Telemetry TelemetryConfig `yaml:"telemetry"`
+	// Cache optionally configures the response cache for Git smart HTTP
+	// reads. It is off by default: leaving the block out (or leaving
+	// enabled false) serves every request straight from upstream, as if
+	// the block did not exist.
+	Cache CacheConfig `yaml:"cache"`
 
 	// parsedDrainTimeout caches the time.Duration Validate() parsed from
 	// DrainTimeout, for the same reuse-not-reparse reason
@@ -686,7 +691,7 @@ func Load(path string, opts ...LoadOption) (*Config, error) {
 }
 
 // applyDefaults fills in Listen, LogLevel, and DrainTimeout when left
-// empty.
+// empty, and the Cache defaults when the cache is enabled.
 func (c *Config) applyDefaults() {
 	if c.Listen == "" {
 		c.Listen = defaultListen
@@ -697,6 +702,7 @@ func (c *Config) applyDefaults() {
 	if c.DrainTimeout == "" {
 		c.DrainTimeout = defaultDrainTimeout
 	}
+	c.Cache.applyDefaults()
 }
 
 // Validate fail-fasts on anything that would make Config unusable at
@@ -804,6 +810,10 @@ func (c *Config) Validate() error {
 	c.Policy.engine = engine
 
 	if err := c.Telemetry.validate(); err != nil {
+		return err
+	}
+
+	if err := c.Cache.validate(); err != nil {
 		return err
 	}
 
