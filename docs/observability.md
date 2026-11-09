@@ -92,7 +92,7 @@ carry a repository owner or name.
 | `haybale.response_cache.store_errors.total`   | counter         | `tier`, `operation`                | Cache storage failures.                                                 |
 | `haybale.response_cache.evictions.total`      | counter         | (none)                             | Entries evicted to stay within the disk budget or retention.            |
 | `haybale.response_cache.uploads.total`        | counter         | `result`                           | Uploads of entries to the remote cache tier.                            |
-| `haybale.response_cache.disk_bytes`           | up/down counter | (none)                             | Bytes currently held by the disk tier; a live size gauge.               |
+| `haybale.response_cache.disk_bytes`           | up/down counter | (none)                             | Bytes currently held by the disk tier: committed entries plus bytes pinned by readers of removed entries. Space reserved for fills in progress is not counted, so the gauge can sit below the `maxDiskSize` budget the cache enforces. |
 
 The `class` attribute is the request class the cache recognised
 (`advertisement`, `ls-refs`, `fetch`, or `bypass`). The other closed sets are:
@@ -102,24 +102,30 @@ The `class` attribute is the request class the cache recognised
 | `result` on `lookups.total` | `hit`, `miss`, `stale`, `bypass` |
 | `result` on `fills.total` | `stored`, `discarded` |
 | `reason` on `fills.total` | `error_packet`, `sideband_error`, `framing`, `truncated`, `too_large`, `disk_budget`, `store_error`, `generation`, `upstream_status`, `fetch_error` |
-| `tier` | `disk`, `remote`, `upstream` (the origin of the bytes; `fill_bytes.total` never has `disk`) |
+| `tier` | `disk`, `remote`, `upstream` (the origin of the bytes; `fill_bytes.total` never has `disk`). On `store_errors.total` it names the tier that failed. |
+| `operation` on `store_errors.total` | `open`, `create`, `write`, `commit`, `abort`, `delete`, `evict`, `expire`, `sweep` |
 
 A cache hit keeps `outcome=proxied` on `haybale.requests.total` and
 `haybale.request.duration`, so existing dashboards and SLOs include hits.
+Because `proxied` no longer implies an upstream transfer, panels that track
+load on the upstream host should use `fills.total` and `fill_bytes.total` (one
+fill is one upstream fetch, however many clients it served) together with the
+`bypass` results of `lookups.total`, which are proxied straight to the
+upstream.
 
 The `haybale.outcome` values, spanning every terminal path a request can
 take, so `sum by (haybale.outcome)` accounts for all traffic:
 
 | Outcome               | HTTP status | Meaning                                                                       |
 |-----------------------|-------------|-------------------------------------------------------------------------------|
-| `proxied`             | (upstream's)| Authenticated, authorized, and streamed to the upstream.                      |
+| `proxied`             | (upstream's)| Authenticated, authorized, and answered on the client's behalf: streamed from the upstream or served from the response cache. |
 | `rejected`            | 404         | Malformed request or unknown upstream host — before any auth check.           |
 | `authn_failed`        | 401         | The authenticator rejected the credential.                                    |
 | `policy_denied`       | 404         | The policy engine denied the request (indistinguishable from a missing repo). |
 | `upstream_auth_failed`| 502         | A credential source was unavailable or failed before forwarding.              |
 
 An upstream `401` or `403` rewritten by haybale to `502` has outcome `proxied`
-and status `502`, because the request reached the upstream. It also emits an
+and status `502`, because the request was answered on the client's behalf. It also emits an
 `upstream_auth_failed` security event.
 
 A `rejected` outcome deliberately carries **no `host` label**: an
@@ -169,5 +175,8 @@ handled it:
 A `miss` line also carries two boolean fields. `cacheCollapsed` is `true` when
 the request joined a fill already in flight rather than starting its own, and
 `cacheStored` is `true` when that fill committed an entry. The field is absent
-when the cache is disabled and on writes. The same values are what
-`cache.exposeStatus` puts in the `Cache-Status` response header.
+when the cache is disabled and on writes. With `cache.exposeStatus` the
+`Cache-Status` response header carries the same `hit`, `miss` and `bypass`
+values in RFC 9211 form (`hit`, `fwd=miss`, `fwd=bypass`) and adds `collapsed`
+for a request that joined an in-flight fill. The header is written before a fill
+ends, so it never says whether the entry was stored; only the log does.

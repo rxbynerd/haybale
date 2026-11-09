@@ -14,7 +14,8 @@ is missing, malformed, or otherwise invalid, rather than
 starting up and failing unpredictably on the first request.
 
 This document describes every supported configuration field. Unknown fields
-are not part of haybale's configuration contract and should not be used.
+are not part of haybale's configuration contract and should not be used, with
+one exception: the `cache` block rejects unknown fields (see "Cache").
 
 ## Top-level fields
 
@@ -447,12 +448,13 @@ cache:
   keyEnv: HAYBALE_CACHE_KEY        # optional, env var holding the cache key
   maxDiskSize: 10GiB               # optional, default shown
   maxEntrySize: 1GiB               # optional, default shown
-  maxConcurrentFills: 32           # optional, default shown
+  maxConcurrentFills: 8            # optional, default shown
   maxRequestBody: 1MiB             # optional, default shown
   retention: 24h                   # optional, default shown
   refsMaxAge: 0s                   # optional, default shown
   accessRecheck: 5m                # optional, default shown
-  responseHeaderTimeout: 0s        # optional, default shown
+  responseHeaderTimeout: 60s       # optional, default shown
+  idleTimeout: 2m                  # optional, default shown
   exposeStatus: false              # optional, default shown
 ```
 
@@ -462,22 +464,30 @@ instead of contacting the upstream. **The cache is off by default**: leaving
 the block out, or leaving `enabled` false, serves every request straight from
 the upstream, and a disabled block is inert (it is neither defaulted nor
 checked beyond its syntax). Writes (pushes) are never served from the cache.
-What the cache emits is described in [`observability.md`](observability.md).
+The [caching guide](caching.md) explains what the cache stores and how to
+operate it; [`observability.md`](observability.md) describes what it emits.
+
+Unlike the rest of the file, the `cache` block is decoded strictly: an unknown
+key fails startup with `cache: unknown field ...`, so a mistyped or renamed
+field can never silently fall back to its default.
 
 | Field                   | Default  | Notes                                                                                                   |
 |-------------------------|----------|---------------------------------------------------------------------------------------------------------|
 | `enabled`               | `false`  | Turns the cache on.                                                                                     |
 | `dir`                   | (unset)  | Directory holding cached entries. Required when `enabled`. See "Cache directory" below.                 |
 | `keyEnv`                | (unset)  | Name of an env var holding the 32-byte, base64-encoded key entries are sealed under. See "Cache key".    |
-| `maxDiskSize`           | `10GiB`  | Disk budget for the cache: stored entries plus fills in progress. Least recently used entries are evicted past it. |
+| `maxDiskSize`           | `10GiB`  | Disk budget for the cache: stored entries plus space reserved for fills in progress. Least recently used entries are evicted past it. See "Sizing". |
 | `maxEntrySize`          | `1GiB`   | Largest response that is stored. A larger response is streamed to the client without being stored. Must not exceed `maxDiskSize`. |
-| `maxConcurrentFills`    | `32`     | Maximum number of responses being fetched into the cache at once. Must be at least `1`.                  |
+| `maxConcurrentFills`    | `8`      | Maximum number of responses being fetched into the cache at once. A request that finds no free slot is proxied without the cache. Must be at least `1`. |
 | `maxRequestBody`        | `1MiB`   | Largest decoded request body the cache will inspect. A read with a larger body bypasses the cache. Must be greater than zero. |
-| `retention`             | `24h`    | Go duration string: the maximum age of any entry, after which it is not served. See "Retention".         |
+| `retention`             | `24h`    | Go duration string: the maximum age of any entry, after which it is not served. Must be greater than zero. See "Retention". |
 | `refsMaxAge`            | `0s`     | Go duration string: how long a stored ref advertisement is reused without asking the upstream. `0s` always revalidates. |
-| `accessRecheck`         | `5m`     | Go duration string: how long a cached pack is served after the last successful upstream refs response before the upstream is asked again. |
-| `responseHeaderTimeout` | `0s`     | Go duration string bounding how long haybale waits for the upstream's response headers on cache fetches. `0s` applies no bound. |
-| `exposeStatus`          | `false`  | Emits a `Cache-Status` response header describing how the cache handled the request.                     |
+| `accessRecheck`         | `5m`     | Go duration string: how long a cached pack is served after the last successful upstream refs response before the upstream is asked again. `0s` disables the check. |
+| `responseHeaderTimeout` | `60s`    | Go duration string bounding how long haybale waits for the upstream's response headers on a cache fill. `0s` applies no bound. Does not affect requests that bypass the cache. |
+| `idleTimeout`           | `2m`     | Go duration string bounding the gap between body bytes from the upstream during a cache fill. `0s` applies no bound. Does not affect requests that bypass the cache. |
+| `exposeStatus`          | `false`  | Emits a `Cache-Status` response header describing how the cache handled the request. See [Cache-Status](security.md#cache-status-disclosure). |
+| `remote`                | (unset)  | Reserved for a later release; fails startup if set. See "Reserved fields".                               |
+| `staleIfErrorFor`       | (unset)  | Reserved for a later release; fails startup unless empty or `0s`. See "Reserved fields".                 |
 
 ### Sizes and durations
 
@@ -490,39 +500,73 @@ whole number of bytes. A bare integer (`1073741824`), an SI unit (`KB`, `MB`,
 misread by a factor of 1024.
 
 Durations (`retention`, `refsMaxAge`, `accessRecheck`,
-`responseHeaderTimeout`) are Go duration strings such as `30s` or `24h` and
-must not be negative.
+`responseHeaderTimeout`, `idleTimeout`) are Go duration strings such as `30s`
+or `24h` and must not be negative.
 
 ### Validation
 
-Validation of the `cache` block is structural: it checks the syntax of every
-size and duration, that `dir` is set, that `maxEntrySize` does not exceed
+Validation of the `cache` block is structural: it checks that no key is
+unknown, the syntax of every size and duration, that `dir` is set, that
+`retention` is greater than zero, that `maxEntrySize` does not exceed
 `maxDiskSize`, that `maxConcurrentFills` is at least `1` and that
 `maxRequestBody` is greater than zero. It does not touch the filesystem, the
-network or the environment, so `haybale policy check` works with a cache block
-present and without the cache key or directory. The directory and key are
-checked when `haybale serve` starts.
+network or the environment, so `haybale policy check` stays offline when a
+cache block is present, with or without the cache key or directory. The
+directory and key are checked when `haybale serve` starts.
 
 ### Cache directory
 
-`dir` holds repository contents. It must be owned by the haybale process user
-and inaccessible to group and other (mode `0700`). Mount the volume only into
-the haybale container; any sidecar sharing it runs with the same UID and can
-read every entry.
+`dir` holds repository contents. It must exist, be owned by the haybale process
+user and be inaccessible to group and other (mode `0700`); `haybale serve`
+refuses to start otherwise. Mount the volume only into the haybale container;
+any sidecar sharing it runs with the same UID and can read every entry.
+
+Each `haybale serve` process needs its own cache directory. At startup the
+process deletes the temporary files of other processes in the directory, so
+replicas must not share a volume, whether the volume is a network filesystem or
+a `ReadWriteMany` claim.
 
 On Kubernetes, back `dir` with an `emptyDir` volume whose `sizeLimit` is above
 `maxDiskSize`, so a full cache can never evict unrelated pods from the node. An
 `emptyDir` is wiped when the pod is rescheduled, which is acceptable because
-the cache holds nothing that cannot be fetched again.
+the cache holds nothing that cannot be fetched again. A freshly mounted
+`emptyDir` is owned by root with open permissions, which fails the ownership
+and mode check, so an init container must `chown` and `chmod 0700` it first;
+the [caching guide](caching.md#kubernetes) has a complete example.
+
+### Sizing
+
+`maxDiskSize` is a budget shared by stored entries and by fills in progress.
+A fill reserves space before it starts: the upstream's `Content-Length` when
+the upstream sends one, and `maxEntrySize` otherwise, which is the usual case
+for a pack. `maxConcurrentFills` times `maxEntrySize` is therefore the space
+that concurrent fills can hold at once, and `maxDiskSize` should exceed it by
+the space wanted for stored entries. The defaults reserve up to 8GiB for fills
+out of a 10GiB budget, which leaves little room for stored entries while eight
+fills are running. For a fleet that clones repositories well below the default
+`maxEntrySize`, lowering `maxEntrySize` to a small multiple of the largest
+repository is the simplest way to leave room.
+
+A fill that cannot reserve space after evicting stored entries is proxied
+without the cache and is not stored. An entry larger than `maxEntrySize` is
+streamed to the client but never stored.
 
 ### Cache key
 
 Entries are encrypted and authenticated under a key read from the environment
 variable named by `keyEnv` (32 random bytes, base64-encoded). As with a
 credential's `tokenEnv`, the key is never written inline in the config file.
-Protect it like a credential. When `keyEnv` is left empty, haybale generates a
-key at startup and discards it on exit, so the cache does not survive a
-restart.
+Protect it like a credential; the [security model](security.md#sealed-entries)
+describes what it protects.
+
+`keyEnv` is optional while only the local disk tier exists. When it is left
+empty, haybale generates a key at startup and discards it on exit, so the cache
+is empty again after every restart and `haybale cache purge` cannot address
+its entries. Set `keyEnv` to keep the cache across restarts and to use the purge
+command.
+
+Rotating the key is a cold cache: entries sealed under the previous key are
+never served again and are removed as they expire or are evicted.
 
 ### Retention
 
@@ -532,7 +576,8 @@ does not contact the upstream, so haybale's own access to a repository being
 revoked becomes visible at the next `accessRecheck` boundary. Content removed
 upstream, for example after a history rewrite that deleted a secret, can still
 be served until its entry reaches `retention`; lower `retention` to shorten
-that window.
+that window, or run `haybale cache purge` (see the [caching
+guide](caching.md#purging-a-repository)).
 
 ### Reserved fields
 
@@ -541,7 +586,8 @@ release:
 
 - `remote`: an optional shared remote tier in object storage. Any non-empty
   value under `cache.remote` is rejected with `cache.remote is not supported in
-  this release`.
+  this release`. The planned fields are `type`, `bucket`, `prefix`, `region`,
+  `endpoint`, `forcePathStyle`, `headerTimeout`, `sse` and `kmsKeyID`.
 - `staleIfErrorFor`: serving an older entry when the upstream is unavailable.
   Only an empty value or `0s` is accepted; any other value is rejected with
   `cache.staleIfErrorFor is not supported in this release`.

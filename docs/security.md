@@ -25,9 +25,12 @@ haybale is designed to limit:
 - exposure of the client's JWT to an upstream; and
 - the blast radius of a minted GitHub App token.
 
-haybale does **not** inspect pack or pkt-line content, enforce ref-level push
-rules, support SSH or dumb HTTP, defend against a compromised upstream, or
-correct an over-broad policy. It also does not provide connection rate limits or
+haybale does **not** interpret pack content, read push bodies, enforce ref-level
+push rules, support SSH or dumb HTTP, defend against a compromised upstream, or
+correct an over-broad policy. With the optional [response cache](#response-cache)
+enabled, it also reads the body of each read request (bounded by
+`cache.maxRequestBody`) and scans the pkt-line framing of cacheable responses;
+it never inspects pack data. It also does not provide connection rate limits or
 a concurrent-connection cap; deploy an ingress or load balancer with those
 controls when untrusted clients can reach the listener.
 
@@ -175,13 +178,19 @@ through an equivalently trusted private transport.
 
 ### Streaming and timeouts
 
-haybale does not buffer request or response bodies. Pack data is streamed
+haybale does not buffer response bodies in memory. Pack data is streamed
 through Go's reverse proxy and flushed on each write. Request and response byte
-counts are observed while streaming.
+counts are observed while streaming. Request bodies are streamed as well, except
+that with the response cache enabled the body of a read request is read in full,
+up to `cache.maxRequestBody`, before the request is forwarded (see [Response
+cache](#response-cache)). Push bodies are never read.
 
 The server applies a 10-second request-header timeout but no read, write, or
-idle timeout. This permits long-running, multi-gigabyte transfers, but an
-authenticated slow client can retain resources indefinitely. Use ingress-level
+idle timeout, and upstream connections use 30-second dial and TLS handshake
+timeouts. This permits long-running, multi-gigabyte transfers, but an
+authenticated slow client can retain resources indefinitely. The only
+response-wait bounds are the response cache's fill timeouts, which apply to
+fills and not to proxied requests. Use ingress-level
 connection, rate, and idle controls where that risk matters, taking care not to
 terminate legitimate large transfers.
 
@@ -190,8 +199,10 @@ default is `0s`, which waits indefinitely for active transfers.
 
 ### Forwarded headers
 
-Smart-HTTP headers and content encodings pass through unchanged. haybale does
-not generate `Forwarded` or `X-Forwarded-*` headers, and inbound values for
+For requests proxied without the cache, smart-HTTP headers and content
+encodings pass through unchanged. Requests the response cache handles carry only
+the allowlisted headers described under [The upstream
+request](#the-upstream-request). haybale does not generate `Forwarded` or `X-Forwarded-*` headers, and inbound values for
 those headers are suppressed. The upstream therefore does not receive the
 client's network address or haybale listener details through those fields.
 
@@ -199,10 +210,173 @@ haybale does not inject its own OpenTelemetry `traceparent`, `tracestate`, or
 `baggage` on upstream Git or GitHub API requests. Ordinary client-supplied
 end-to-end headers continue to follow reverse-proxy forwarding rules.
 
+## Response cache
+
+The optional [response cache](caching.md) serves repeated identical clones and
+fetches from local disk. It is off by default. This section describes what it
+changes about haybale's security properties; the properties above hold for
+every request, cached or not. Stale-if-error is reserved for a later release
+and is not available.
+
+### Authentication and policy before any lookup
+
+Authentication and policy run before the cache is consulted, before the request
+body is read and before anything is looked up. A request that fails
+authentication or is denied by policy is answered exactly as it is without the
+cache, including the `404 Not Found` that is indistinguishable from a missing
+repository, and never touches the cache. The cache therefore cannot be used to
+test whether a repository exists or has been fetched recently by a caller policy
+does not allow to read it.
+
+Only the `read` verb is ever offered to the cache. A push, including the
+`GET .../info/refs?service=git-receive-pack` handshake, is never cached, never
+served from the cache and never has its body read. A completed
+`git-receive-pack` request, whatever its status, deletes that repository's
+cached ref entries on this instance.
+
+### What is cached
+
+A read is cached only when haybale can classify it with certainty. The request
+body is read in full, bounded by `cache.maxRequestBody` after decompression, and
+parsed strictly as Git pkt-lines. Three request classes are cacheable: the ref
+advertisement (`GET info/refs?service=git-upload-pack`), the protocol v2
+`ls-refs` command, and a `fetch` whose arguments all come from an allowlist of
+content-addressed ones. Everything else is a bypass: it takes the ordinary
+passthrough path and stores nothing. That includes a body over the limit, a
+`Content-Encoding` other than gzip or identity, a framing error, more than one
+command, any capability or argument outside the allowlists, and every request
+that carries `have` lines (incremental fetches), `want-ref`, `deepen-not`,
+`packfile-uris`, a filter other than the allowlisted forms, or an unknown
+command. Doubt always means bypass.
+
+A response is stored only when all of the following hold: the request passed
+authentication and policy, the upstream answered `200` with the expected
+`Content-Type`, the body ended cleanly within `cache.maxEntrySize`, and a scan
+of the pkt-line framing found no in-band `ERR` packet or sideband error and a
+terminating flush at the end of the body. The scan reads packet lengths and the
+sideband channel byte only. It never interprets pack content. A response that
+does not qualify is still delivered to the client and is not stored. If the
+upstream fails part-way through a response, haybale closes the client
+connection without a clean ending so the client cannot mistake a truncated
+response for a complete one.
+
+### The upstream request
+
+For a cacheable request, haybale builds the upstream request itself from the
+parsed, canonical form instead of forwarding the client's. The upstream request
+carries the method and rewritten path, the canonical body (without the `agent`
+and `session-id` lines), the `Content-Type` and `Accept` of a Git upload-pack
+exchange, the validated `Git-Protocol` header, `Accept-Encoding: identity`, a
+fixed `User-Agent` beginning `git/`, and the injected upstream `Authorization`.
+No other client header reaches the upstream. The cache key is computed over
+exactly these inputs, so no input the key does not cover can influence the
+response that later readers receive. Inbound `Cache-Control`, `Pragma` and
+`Cache-Status` request headers have no effect.
+
+The upstream credential is minted only when a request needs the upstream. A
+cache hit contacts neither the Git host nor the GitHub API, so token mint
+events and metrics fall as the hit rate rises.
+
+### Sealed entries
+
+Every cached entry is sealed under the cache key (`cache.keyEnv`). The body is
+encrypted and authenticated with AES-256-GCM in segments, and the entry header,
+which names the repository and its upstream, is encrypted as well. Each segment
+is authenticated against the header, and haybale verifies every segment before
+releasing its bytes to a client. Modification, truncation, reordering and
+copying an entry to a different path or key all fail verification. A failed
+entry is treated as a miss and deleted, or, when bytes have already been sent,
+the connection is closed without a clean ending.
+
+Entry names on disk are a keyed hash of the upstream base URL, owner and
+repository name, followed by a hash of the request, so a directory listing does
+not reveal which repositories are cached. The key protects a cache directory (or,
+in a later release, a bucket) against someone who can read or write it but does
+not hold the key: such a party cannot read repository contents or names and
+cannot forge, alter or move an entry. It does not protect against a party that
+can read the haybale process's environment or memory, and it does not hide the
+number, sizes and timestamps of entries.
+
+Handle the key as a credential:
+
+- generate it from a secure random source, for example
+  `openssl rand -base64 32`, and deliver it through the same secret mechanism as
+  other haybale secrets;
+- keep it distinct from every other credential, and never write it in the
+  config file;
+- mount the cache directory only into the haybale container, with mode `0700`;
+  and
+- treat rotating it as a cold cache. Entries sealed under the previous key are
+  never served again, and `haybale cache purge` can address them only while the
+  previous key is supplied.
+
+When `keyEnv` is unset, haybale generates a key at startup and discards it on
+exit. Nothing on disk is readable after the process ends, and the cache is empty
+after every restart.
+
+### Entries are shared across identities
+
+An entry is keyed by repository and request, not by caller. Every identity that
+policy allows to read a repository is served the same entries, and policy, not
+the cache, decides who may read what. Sideband progress text from the upstream
+is stored with the response and replayed to later readers; for GitHub this
+carries nothing specific to the original caller, but an upstream that put
+per-session text in progress output would replay it.
+
+### Access recheck
+
+A cache hit does not contact the upstream, so a retained pack could outlive
+haybale's own access to the repository. A cached `fetch` response is therefore
+served only if this haybale process saw a successful upstream refs response (a
+ref advertisement or `ls-refs`) for the repository within `cache.accessRecheck`
+(default `5m`). A normal clone makes that request first, so the rule costs
+nothing for ordinary traffic. It stops a client that posts `want` lines directly
+from reading retained packs after access has ended, and it bounds how long
+revoked or removed access stays invisible. The record is held in memory per
+process, so after a restart the first refs request for each repository
+repopulates it. Setting `accessRecheck` to `0s` disables the rule, and cached
+packs are then served until `retention` regardless of upstream access.
+
+### Retention and purging
+
+Cached content outlives upstream state for up to `cache.retention` (default
+`24h`). After a history rewrite that removed a leaked secret, or after a
+repository is deleted or transferred, a cached pack may still be served until
+its entry expires. Retention is therefore the exposure window after a history
+rewrite; lower it where that window is too long.
+
+To end the exposure immediately, run `haybale cache purge` for the repository
+(see [Purging a repository](caching.md#purging-a-repository)). The command
+works on one cache directory. In this release every replica has its own
+directory, so run the purge on every replica, or restart every replica that has
+no `keyEnv`, which empties its cache. Rewrite the history upstream first and
+purge afterwards, so no entry is refilled with the old content.
+
+### Cache-Status disclosure
+
+With `cache.exposeStatus` set to `true`, responses carry an RFC 9211
+`Cache-Status` header. It is off by default because, within a repository that
+several tenants may read, `hit` tells a client that another identity made the
+identical request recently. Response timing can also differ between a hit and a
+miss, so enable the header only where that disclosure is acceptable. The `cache`
+field of the request log carries the same information for operators.
+
+### Fill timeouts
+
+A response being fetched into the cache has two bounds that passthrough requests
+do not have: `cache.responseHeaderTimeout` (default `60s`) for the upstream's
+response headers and `cache.idleTimeout` (default `2m`) for the gap between body
+bytes. A single fetch can serve many waiting clients, so a wedged upstream
+connection would otherwise hold all of them. Expiry is treated as an upstream
+failure: the waiting clients' connections are closed without a clean ending and
+requests for the same key go straight to the upstream for a short time. The number of
+fetches in flight is bounded by `cache.maxConcurrentFills`; a request that finds
+no free slot is proxied directly.
+
 ## Secrets at rest
 
-Static upstream tokens and OTLP headers are read from environment variables;
-they cannot be configured inline in YAML. Listener and GitHub App private keys
+Static upstream tokens, OTLP headers and the response cache key are read from
+environment variables; they cannot be configured inline in YAML. Listener and GitHub App private keys
 are read from files at startup. A private key file with any group or other
 permission bit set is rejected; use mode `0600` or `0400`.
 
