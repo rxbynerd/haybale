@@ -116,35 +116,23 @@ func TestScannerDoesNotAllocateOnWrite(t *testing.T) {
 }
 
 // FuzzScanner checks that a verdict does not depend on how the stream is
-// split across writes, and that a storable stream is a well-formed
-// pkt-line stream ending in a flush.
+// split across writes, that a stream the reference parser finds an ERR
+// packet or sideband channel 3 frame in is never storable, and that a
+// storable stream is well-formed and ends in a flush.
 func FuzzScanner(f *testing.F) {
+	modes := []Mode{ModeAdvertisement, ModeV2Result, ModeV2Fetch, ModeV0UploadPack}
 	for _, fx := range scanFixtures(f) {
-		for _, mode := range []Mode{ModeAdvertisement, ModeV2Result, ModeV2Fetch, ModeV0UploadPack} {
+		for _, mode := range modes {
 			f.Add(fx.body, uint8(mode), len(fx.body)/2)
 		}
 	}
+	for _, c := range oracleCases(f) {
+		f.Add(c.body, uint8(c.mode), len(c.body)/2)
+	}
 	f.Fuzz(func(t *testing.T, body []byte, mode uint8, split int) {
 		m := Mode(mode % 5)
-		whole := scan(m, body)
-		at := split % (len(body) + 1)
-		if at < 0 {
-			at = -at
-		}
-		if got := scan(m, body, at); got != whole {
-			t.Fatalf("split at %d: Verdict() = %+v, whole write = %+v", at, got, whole)
-		}
-		bytewise := make([]int, len(body))
-		for i := range bytewise {
-			bytewise[i] = i
-		}
-		if got := scan(m, body, bytewise...); got != whole {
-			t.Fatalf("byte by byte: Verdict() = %+v, whole write = %+v", got, whole)
-		}
-		if whole.Storable != (whole.Reason == "") {
-			t.Fatalf("inconsistent verdict %+v", whole)
-		}
-		if !whole.Storable {
+		checkOracle(t, m, body, split)
+		if !scanVerdicts(m, body, nil).clean.Storable {
 			return
 		}
 		r := NewReader(bytes.NewReader(body), int64(len(body)))
