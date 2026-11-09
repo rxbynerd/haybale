@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"errors"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -106,5 +107,56 @@ func TestARefsUploadInFlightAcrossAPushLeavesNoObject(t *testing.T) {
 	})
 	if got := store.keys(refsPrefix); len(got) != 0 {
 		t.Errorf("remote refs objects = %v, want the superseded upload deleted", got)
+	}
+}
+
+func TestAFailedInvalidationIsNotLoggedAsDone(t *testing.T) {
+	store := newMemBlobStore()
+	logger, logs := newLogCapture()
+	c, _, reader := newRemoteTestCache(t, store, func(o *Options) { o.Logger = logger })
+	store.set(func(m *memBlobStore) { m.listErr = errors.New("memblob: 503 SlowDown") })
+	c.Invalidate(context.Background(), testRepo, testBaseURL)
+	if got := remoteStoreErrors(t, reader, observability.OperationList); got != 1 {
+		t.Errorf("store_errors{operation=list} = %d, want 1", got)
+	}
+	if got := logs.records(t, "cache: invalidated remote refs entries after a push"); len(got) != 0 {
+		t.Errorf("success records = %v, want none after a failed listing", got)
+	}
+}
+
+func TestBackgroundDeletesCutShortByCloseRecordNothing(t *testing.T) {
+	store := newMemBlobStore()
+	pack := remotePack(t)
+	seedPeer(t, store, pack)
+	var deleting atomic.Bool
+	store.set(func(m *memBlobStore) {
+		m.deleteHook = func(ctx context.Context, _ string) error {
+			deleting.Store(true)
+			<-ctx.Done()
+			return ctx.Err()
+		}
+	})
+	logger, logs := newLogCapture()
+	c, clock, reader := newRemoteTestCache(t, store, func(o *Options) { o.Logger = logger })
+	clock.Advance(25 * time.Hour)
+	lsRefs(t, c, refsFetcher(t))
+	serve(c, httptest.NewRecorder(), fetchRequest(t), packFetcher(pack))
+	waitFor(t, "the expiry delete to start", deleting.Load)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := c.Close(ctx); err == nil {
+		t.Fatal("Close returned nil with a delete blocked")
+	}
+	waitFor(t, "the delete to end", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return len(c.remoteTasks) == 0
+	})
+	if got := remoteStoreErrors(t, reader, observability.OperationDelete); got != 0 {
+		t.Errorf("store_errors{operation=delete} = %d, want none for a delete Close cancelled", got)
+	}
+	if got := logs.records(t, "remote cache tier operation failed"); len(got) != 0 {
+		t.Errorf("warnings = %v, want none", got)
 	}
 }

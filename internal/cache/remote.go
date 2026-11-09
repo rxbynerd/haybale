@@ -186,7 +186,7 @@ func (f *fill) remoteFresh(h entryHeader) bool {
 		path := f.key.Path()
 		c.goRemote(func(ctx context.Context) {
 			if err := c.remote.Delete(ctx, path); err != nil {
-				c.remoteError(observability.OperationDelete, err)
+				c.remoteErrorUnlessClosed(observability.OperationDelete, err)
 			}
 		})
 		return false
@@ -636,7 +636,7 @@ func (c *Cache) deleteRemote(path string) {
 	ctx, cancel := context.WithTimeout(c.remoteCtx, c.remoteBound())
 	defer cancel()
 	if err := c.remote.Delete(ctx, path); err != nil {
-		c.remoteError(observability.OperationDelete, err)
+		c.remoteErrorUnlessClosed(observability.OperationDelete, err)
 	}
 }
 
@@ -659,7 +659,8 @@ func (c *Cache) invalidateRemote(repo gitproto.Repo, repoHash [32]byte) {
 	n, err := deleteRemotePrefix(ctx, c.remote, RepoPrefix(GroupRefs, repoHash))
 	var opErr *remoteOpError
 	if errors.As(err, &opErr) {
-		c.remoteError(opErr.op, opErr.err)
+		c.remoteErrorUnlessClosed(opErr.op, opErr.err)
+		return
 	}
 	c.logger.Debug("cache: invalidated remote refs entries after a push", "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "entries", n)
 }
@@ -671,6 +672,16 @@ func (c *Cache) invalidateRemote(repo gitproto.Repo, repoHash [32]byte) {
 func (c *Cache) remoteError(operation string, err error) {
 	c.metrics.RecordResponseCacheStoreError(context.Background(), observability.TierRemote, operation)
 	c.logger.Warn("remote cache tier operation failed", "operation", operation, "error", err)
+}
+
+// remoteErrorUnlessClosed is remoteError for background remote work,
+// which records nothing once Close has cancelled the remote tier's
+// context: the failure is then the shutdown, not the store.
+func (c *Cache) remoteErrorUnlessClosed(operation string, err error) {
+	if c.remoteCtx.Err() != nil {
+		return
+	}
+	c.remoteError(operation, err)
 }
 
 // checkPurgeMarker brings repoHash's purge state up to date with its
