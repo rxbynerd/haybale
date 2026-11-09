@@ -76,6 +76,37 @@ spans.
 | `haybale.tokens.minted.total`       | counter           | `host`, `verb`                    | GitHub App installation tokens minted (one per real mint). |
 | `haybale.token_cache.lookups.total` | counter           | `host`, `verb`, `result`          | Token-cache lookups; `result` is `hit` or `miss`.          |
 
+The response-cache instruments below exist only when the [`cache`
+block](configuration.md#cache) is enabled. They all use the
+`haybale.response_cache.` prefix, which keeps them distinct from the token
+cache's `haybale.token_cache.` instruments. Like every other metric they never
+carry a repository owner or name.
+
+| Instrument                                    | Type            | Attributes                         | Meaning                                                                 |
+|-----------------------------------------------|-----------------|------------------------------------|-------------------------------------------------------------------------|
+| `haybale.response_cache.lookups.total`        | counter         | `host`, `class`, `result`          | Response-cache lookups; `result` is `hit`, `miss`, `stale` or `bypass`. |
+| `haybale.response_cache.fills.total`          | counter         | `host`, `class`, `result`, `reason`| Finished cache fills; `result` is `stored` or `discarded`. `reason` is present only on a discarded fill. |
+| `haybale.response_cache.fill_bytes.total`     | counter         | `host`, `class`, `tier`            | Bytes written into the cache by fills.                                  |
+| `haybale.response_cache.served_bytes.total`   | counter         | `host`, `class`, `tier`            | Response bytes served to clients through the cache path.                |
+| `haybale.response_cache.collapsed.total`      | counter         | `host`                             | Requests that joined a fill already in flight instead of fetching upstream. |
+| `haybale.response_cache.store_errors.total`   | counter         | `tier`, `operation`                | Cache storage failures.                                                 |
+| `haybale.response_cache.evictions.total`      | counter         | (none)                             | Entries evicted to stay within the disk budget or retention.            |
+| `haybale.response_cache.uploads.total`        | counter         | `result`                           | Uploads of entries to the remote cache tier.                            |
+| `haybale.response_cache.disk_bytes`           | up/down counter | (none)                             | Bytes currently held by the disk tier; a live size gauge.               |
+
+The `class` attribute is the request class the cache recognised
+(`advertisement`, `ls-refs`, `fetch`, or `bypass`). The other closed sets are:
+
+| Attribute | Values |
+|-----------|--------|
+| `result` on `lookups.total` | `hit`, `miss`, `stale`, `bypass` |
+| `result` on `fills.total` | `stored`, `discarded` |
+| `reason` on `fills.total` | `error_packet`, `sideband_error`, `framing`, `truncated`, `too_large`, `disk_budget`, `store_error`, `generation`, `upstream_status`, `fetch_error` |
+| `tier` | `disk`, `remote`, `upstream` (the origin of the bytes; `fill_bytes.total` never has `disk`) |
+
+A cache hit keeps `outcome=proxied` on `haybale.requests.total` and
+`haybale.request.duration`, so existing dashboards and SLOs include hits.
+
 The `haybale.outcome` values, spanning every terminal path a request can
 take, so `sum by (haybale.outcome)` accounts for all traffic:
 
@@ -121,3 +152,22 @@ so both sinks receive identical records that are:
 The per-request `proxied request` log line and the security events
 (`authn_failed`, `policy_denied`, `upstream_auth_failed`, `token_minted`)
 are emitted through this same chain.
+
+### Cache field on the request log
+
+When the [`cache` block](configuration.md#cache) is enabled, the `proxied
+request` line of a read gains a `cache` field recording how the response cache
+handled it:
+
+| `cache` value | Meaning                                                                                  |
+|---------------|------------------------------------------------------------------------------------------|
+| `hit`         | Served from a stored entry; the upstream was not contacted for the response body.        |
+| `miss`        | Not stored; fetched from the upstream, and stored when the fill completed.               |
+| `stale`       | A stale entry was served because the upstream could not answer. Reserved: it is not emitted while `staleIfErrorFor` is unsupported. |
+| `bypass`      | Not eligible for the cache; proxied straight to the upstream.                            |
+
+A `miss` line also carries two boolean fields. `cacheCollapsed` is `true` when
+the request joined a fill already in flight rather than starting its own, and
+`cacheStored` is `true` when that fill committed an entry. The field is absent
+when the cache is disabled and on writes. The same values are what
+`cache.exposeStatus` puts in the `Cache-Status` response header.
