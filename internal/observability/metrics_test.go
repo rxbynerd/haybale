@@ -340,13 +340,13 @@ func TestRecordResponseCacheEvictionsHasNoLabels(t *testing.T) {
 func TestRecordResponseCacheUpload(t *testing.T) {
 	t.Parallel()
 	m, reader := newTestMetrics(t)
-	m.RecordResponseCacheUpload(context.Background(), "ok")
+	m.RecordResponseCacheUpload(context.Background(), UploadResultUploaded)
 
 	dp := onlyPoint(t, reader, "haybale.response_cache.uploads.total")
 	if dp.Value != 1 {
 		t.Errorf("value = %d, want 1", dp.Value)
 	}
-	wantAttrs(t, "uploads", dp.Attributes, map[string]string{attrResult: "ok"})
+	wantAttrs(t, "uploads", dp.Attributes, map[string]string{attrResult: UploadResultUploaded})
 }
 
 func TestResponseCacheDiskBytesAddsAndSubtracts(t *testing.T) {
@@ -375,8 +375,8 @@ func TestResponseCacheNoopMetricsRecordWithoutPanic(t *testing.T) {
 	m.RecordResponseCacheFillBytes(ctx, "h", "fetch", TierUpstream, 1)
 	m.RecordResponseCacheServedBytes(ctx, "h", "fetch", TierDisk, 1)
 	m.RecordResponseCacheCollapsed(ctx, "h")
-	m.RecordResponseCacheStoreError(ctx, TierRemote, "get")
+	m.RecordResponseCacheStoreError(ctx, TierRemote, OperationGet)
 	m.RecordResponseCacheEvictions(ctx, 1)
-	m.RecordResponseCacheUpload(ctx, "ok")
+	m.RecordResponseCacheUpload(ctx, UploadResultDropped)
 	m.ResponseCacheDiskBytesAdd(ctx, 1)
 }

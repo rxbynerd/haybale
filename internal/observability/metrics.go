@@ -118,6 +118,31 @@ const (
 	OperationEvict  = "evict"
 	OperationExpire = "expire"
 	OperationSweep  = "sweep"
+	// The remote-tier operations, labelled with TierRemote.
+	OperationStat = "stat"
+	OperationGet  = "get"
+	OperationPut  = "put"
+	OperationList = "list"
+)
+
+// Response-cache upload result values for the attrResult label on
+// haybale.response_cache.uploads.total.
+const (
+	// UploadResultUploaded — the entry was stored in the remote tier.
+	UploadResultUploaded = "uploaded"
+	// UploadResultSkipped — the upload was unnecessary: a pack entry was
+	// already present remotely, the local entry was gone, or the entry
+	// was superseded by a push or a purge before its turn.
+	UploadResultSkipped = "skipped"
+	// UploadResultDropped — the upload queue was full, so the entry was
+	// not queued.
+	UploadResultDropped = "dropped"
+	// UploadResultTooLarge — the entry exceeds the remote store's
+	// single-request size limit.
+	UploadResultTooLarge = "too_large"
+	// UploadResultFailed — the remote store rejected or did not answer
+	// the upload.
+	UploadResultFailed = "failed"
 )
 
 // ClassBypass is the attrClass value for a response-cache lookup of a
