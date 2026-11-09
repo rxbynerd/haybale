@@ -295,7 +295,7 @@ no effect on cache behaviour.
   entries until they age out, which matters only when `refsMaxAge > 0`.
 
 > Implemented as: Refs entries are written and counted against the disk
-> budget. At the default `refsMaxAge` of `0s` they are never served;
+> budget. At the default `refsMaxAge` of `0s` they are never served as hits;
 > stale-if-error is their consumer.
 
 > Implemented as: Retention and `refsMaxAge` are decided from the creation
@@ -358,8 +358,12 @@ Lifecycle:
   complete one. After an oversize response the key is marked uncacheable
   in memory for `retention`, so the next burst for that key passes
   straight through instead of spooling to the limit again; after a
-  transient error the mark lasts a short cooldown.
-- Fills carry their own timeouts, independent of stale-if-error: no
+  transient error the mark lasts a short cooldown. While stale-if-error is
+  enabled, a fetch error marks nothing, so the key can still be answered
+  stale (Decision 8).
+- Fills carry their own timeouts, which stale-if-error does not change but
+  depends on: stale-if-error requires a non-zero
+  `cache.responseHeaderTimeout` (Decision 8). No
   response headers within `cache.responseHeaderTimeout` (default `60s`)
   or no body bytes for `cache.idleTimeout` (default `2m`; upload-pack
   sends a keepalive every 5 s while preparing a pack) is a transport
@@ -392,8 +396,9 @@ Lifecycle:
 > `SealedSize(maxEntrySize)` that free space cannot hold aborts the subscribers
 > (reason `too_large`) and marks the key for `retention`. Any other budget
 > exhaustion (reason `disk_budget`), a shared non-200 response and every other
-> discard or abort mark the key for one minute. A `generation` discard, and a
-> fill cancelled because its subscribers left, mark nothing. A commit failure
+> discard or abort mark the key for one minute. A `generation` discard, a
+> fill cancelled because its subscribers left, and, while `staleIfErrorFor` is
+> above zero, a `fetch_error` release or abort mark nothing. A commit failure
 > after a fully spooled body is a discard: subscribers are served to
 > completion, while a failure to write the trailer aborts them.
 
@@ -587,9 +592,12 @@ archived and is not recommended for new deployments.
 > counted as `dropped`. Entries filled from tier 2 are not uploaded again. A
 > refs upload is skipped once a push has bumped the repository's generation,
 > and any upload is skipped once a purge marker covers it. Tier 2 is consulted
-> only under the tier-1 hit rules: a pack needs a recent upstream refs success
-> (`accessRecheck`), and a refs entry needs a positive `refsMaxAge`. A tier-2
-> fill is reported to the client as `fwd=miss`, like any fill.
+> before upstream only under the tier-1 hit rules: a pack needs a recent
+> upstream refs success (`accessRecheck`), and a refs entry needs a positive
+> `refsMaxAge`. With stale-if-error enabled it is also read, after upstream
+> fails or the health gate holds the request, under the stale rules of
+> Decision 8. A tier-2 fill is reported to the client as `fwd=miss`, like any
+> fill.
 
 > Implemented as: There is no fill-source interface. Reading tier 2 is a
 > separate path at the start of the fill, which spools the sealed object as
@@ -668,7 +676,8 @@ installation removed, repository not in installation, rate limiting)
 remains opaque and is never treated as an outage.
 
 > Implemented as: A credential mint failure inside a fill releases the
-> request to passthrough, which re-mints and answers `502`. The cache path
+> request to passthrough, which re-mints and answers `502`, unless
+> stale-if-error answers it. The cache path
 > always requests `<base>/<owner>/<repo>.git/<endpoint>`, where passthrough
 > keeps the client's path form.
 
@@ -680,16 +689,19 @@ table-driven over both paths.
 
 `cache.staleIfErrorFor` (default `0s`, disabled) is the maximum age of an
 entry that may be served when upstream cannot answer. It must not exceed
-`retention`. The configuration reference and the security model describe
-the risk in plain terms: a stale clone can lack a security fix or still
+`retention`, and it requires a non-zero `cache.responseHeaderTimeout`,
+since an unbounded fill or probe against a hung upstream would hold
+requests indefinitely. The configuration reference and the security model
+describe the risk in plain terms: a stale clone can lack a security fix or still
 contain a reverted or scrubbed commit, and git shows no indication to the
 user.
 
 A read becomes eligible for stale service when, for that request:
 
 - the credential source returned `upstream.ErrUnavailable`;
-- the upstream connection failed (DNS, dial, TLS) or no response headers
-  arrived within `cache.responseHeaderTimeout`; or
+- the upstream connection failed (DNS, dial, TLS) before response headers
+  arrived, including a TLS alert on an established connection, or no
+  response headers arrived within `cache.responseHeaderTimeout`; or
 - upstream returned 500, 502, 503 or 504.
 
 A subscriber to a fill whose header outcome is eligible is served stale
@@ -697,7 +709,8 @@ when a qualifying entry exists, before the shared non-200 response is
 relayed. Not eligible: 401 and 403 (a credential problem, still mapped to 502),
 404 and other 4xx (passed through), 429 or rate-limit 403 (a policy
 signal, not an outage), and every write. An eligible request is answered
-from the newest entry for its key no older than `staleIfErrorFor`; the
+from an entry for its key no older than `staleIfErrorFor`: the tier-1
+entry when it qualifies, otherwise the tier-2 entry. The
 `accessRecheck` rule is waived for stale service; the response carries
 `Cache-Status` with `fwd=stale` when exposed; a `cache_stale_served`
 security event records identity, repository, class and entry age; and a
@@ -713,7 +726,16 @@ and `ErrUnavailable` from the credential source. Response-header timeouts
 and 5xx never open it. While open, requests that have a qualifying stale
 entry are served immediately; requests without one, and one probe request
 at a time, go upstream. A success closes the gate; an open gate re-probes
-every 5 s. The probe interval is a constant, not configuration.
+every 5 s. The probe interval is a constant, not configuration. A held
+request with a qualifying tier-1 entry is answered before it takes a fill
+slot, so fills stuck on upstream cannot crowd it out; a tier-2 answer is
+spooled through a fill and so needs a slot. A probe that holds a
+qualifying tier-1 entry waits at most the probe interval for upstream
+headers, is then answered stale with reason `health_gate`, and leaves the
+gate open; whichever of that deadline and `responseHeaderTimeout` expires
+first sets the reason. A hung upstream that accepts connections never
+opens the gate, so the deadline applies only while an earlier connect
+failure holds it open.
 
 A clone during an outage therefore succeeds only if the same clone (same
 tips, same options) happened recently through this instance or a peer
@@ -729,20 +751,32 @@ Both limits are stated in the documentation.
 > or an EOF, is not eligible. The proxy's fetcher rewrites an upstream 401 or
 > 403 into a 502 before the cache sees it, so it names the original status in
 > an internal `Haybale-Upstream-Status` header that the cache classifies by
-> and strips. The tier-1 entry is used whenever it qualifies, and tier 2 is
+> and strips. The fetcher and the passthrough path delete any copy the
+> upstream sends, and the cache honours the header only on a 502 and only
+> for 401 or 403. The tier-1 entry is used whenever it qualifies, and tier 2 is
 > read only when it does not, so a newer remote refs entry does not replace a
-> qualifying local one. Purge markers and retention still apply. A failure
+> qualifying local one. Purge markers and retention still apply. With a
+> remote tier, no entry is served stale until the repository's purge marker
+> check is current (a successful check within the marker interval, or a read
+> made now); a failed read, a marker that fails verification, or a check
+> skipped under the backoff fails closed. A failure
 > answered stale leaves the key cacheable, so later requests during the outage
-> are answered stale too. The proxy passes the verified identity to `Serve`
+> are answered stale too, and while stale-if-error is enabled a `fetch_error`
+> marks nothing, so a key marked for another reason is still answered stale
+> while the gate is open. The proxy passes the verified identity to `Serve`
 > as a parameter. The `cache_stale_served` event also carries `tier`,
 > `reason` (`connect`, `credential_unavailable`, `header_timeout`,
 > `upstream_status` or `health_gate`) and `entryAgeSeconds`. The gate exists
 > only while `staleIfErrorFor` is above zero. Any upstream answer other than
 > 500, 502, 503 or 504 counts as a success. Probes ride on client requests:
 > at most one at a time, admitted no sooner than 5 s after the previous probe
-> began or the gate opened. A request the gate holds back that has no
+> began or the gate opened, and a probe ends when its response headers or its
+> fetch error arrive. A connect failure of an attempt that began before the
+> latest success is ignored. A request the gate holds back that has no
 > qualifying entry goes upstream, and a held request answered stale records no
-> fill metric.
+> fill metric. Request-driven probing, the neutrality of 5xx and header
+> timeouts for the gate, and the `identity` parameter on `Serve` are the
+> accepted design.
 
 ## Decision 9: what the client sees
 
@@ -768,7 +802,9 @@ The request log's `cache` field carries the same values for operators.
 > `Content-Length` recomputed. The `fwd=bypass` `Cache-Status` is written by
 > the cache when it declines a request, not by the proxy. The stale form is
 > `haybale; hit; fwd=stale` also when the health gate kept the request from
-> upstream, with `fwd-status` only when an upstream status arrived.
+> upstream. `fwd-status` is present only when an upstream status arrived; it
+> is omitted after a connect failure, an unavailable credential source, a
+> header timeout, and a gate-held request.
 
 ## Operator controls
 
@@ -870,7 +906,7 @@ cache:
     headerTimeout: 10s             # each remote Stat, Get, List page and Delete, and the sealed-header read; 0s = no per-request bound
     sse: ""                        # "AES256" or "aws:kms"
     kmsKeyID: ""
-  staleIfErrorFor: 0s              # 0s = disabled; must not exceed retention
+  staleIfErrorFor: 0s              # 0s = disabled; must not exceed retention; needs responseHeaderTimeout > 0
 ```
 
 The `cache` block is decoded strictly (unknown keys are errors) even
@@ -882,8 +918,9 @@ misread by a factor of 1024. Durations use Go duration
 strings as elsewhere. `cache` follows the configuration package's
 pattern: a structural `validate()` at load time (parses sizes and
 durations, requires `retention > 0`, requires `refsMaxAge < accessRecheck`
-when both are set, checks `staleIfErrorFor <= retention`, requires
-`keyEnv` with `remote`, recognises the remote type) with no filesystem or network side
+when both are set, checks `staleIfErrorFor <= retention`, refuses a
+non-zero `staleIfErrorFor` with an explicit `responseHeaderTimeout: 0s`,
+requires `keyEnv` with `remote`, recognises the remote type) with no filesystem or network side
 effects, so `haybale policy check` stays offline; and a
 `BuildCache(ctx, logger, metrics)` step called from `serve` that opens
 the directory, loads or generates the key, constructs the remote client,

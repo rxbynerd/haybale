@@ -97,7 +97,7 @@ carry a repository owner or name.
 | Instrument                                    | Type            | Attributes                         | Meaning                                                                 |
 |-----------------------------------------------|-----------------|------------------------------------|-------------------------------------------------------------------------|
 | `haybale.response_cache.lookups.total`        | counter         | `host`, `class`, `result`          | Response-cache lookups; `result` is `hit`, `miss`, `stale` or `bypass`. `stale` is recorded only with `staleIfErrorFor` set. |
-| `haybale.response_cache.fills.total`          | counter         | `host`, `class`, `tier`, `result`, `reason`| Finished cache fills; `result` is `stored` or `discarded`. `reason` is present only on a discarded fill. `tier` is where the fill read the response: `upstream`, or `remote` for a fill from the remote tier. A fill that tried the remote tier and fell through to the upstream counts once, as `upstream`. |
+| `haybale.response_cache.fills.total`          | counter         | `host`, `class`, `tier`, `result`, `reason`| Finished cache fills; `result` is `stored` or `discarded`. `reason` is present only on a discarded fill. `tier` is where the fill read the response: `upstream`, or `remote` for a fill from the remote tier. A fill that tried the remote tier and fell through to the upstream counts once, as `upstream`. A disk entry answered stale after an upstream attempt records `discarded` with the failure's `reason`; a request the health gate held records no fill; a remote copy served stale records `stored` or `discarded` with `tier=remote`. |
 | `haybale.response_cache.fill_bytes.total`     | counter         | `host`, `class`, `tier`            | Response body bytes fills read from their source, including fills that were discarded or aborted and refs fills. `tier` is `upstream` for a fill from the upstream and `remote` for a fill from the remote tier, which counts the verified bytes read from the bucket. |
 | `haybale.response_cache.served_bytes.total`   | counter         | `host`, `class`, `tier`            | Response bytes served to clients through the cache path, stale responses included. |
 | `haybale.response_cache.collapsed.total`      | counter         | `host`                             | Requests that joined a fill already in flight instead of fetching upstream. |
@@ -197,7 +197,7 @@ upstream outage](caching.md#serving-through-an-upstream-outage)). It carries:
 | `host`, `owner`, `repo` | The repository. |
 | `class`           | The request class: `advertisement`, `ls-refs` or `fetch`. |
 | `tier`            | Where the entry came from: `disk` or `remote`. |
-| `reason`          | Why the request was eligible: `connect` (the upstream connection failed), `credential_unavailable` (the credential source could not reach its API), `header_timeout` (no response headers within `responseHeaderTimeout`), `upstream_status` (the upstream answered `500`, `502`, `503` or `504`), or `health_gate` (the host's health gate was open, so the upstream was not contacted). |
+| `reason`          | Why the request was eligible: `connect` (the upstream connection failed), `credential_unavailable` (the credential source could not reach its API), `header_timeout` (no response headers within `responseHeaderTimeout`), `upstream_status` (the upstream answered `500`, `502`, `503` or `504`), or `health_gate` (answered stale while the host's health gate was open, or when a probe's 5-second deadline for response headers expired). |
 | `entryAgeSeconds` | The entry's age in whole seconds, from the creation time sealed into it. |
 
 Operational cache log lines worth alerting on are listed in the caching guide
@@ -221,8 +221,9 @@ the request joined a fill already in flight rather than starting its own, and
 `cacheStored` is `true` when that fill committed an entry. The field is absent
 when the cache is disabled and on writes. With `cache.exposeStatus` the
 `Cache-Status` response header carries the same values in RFC 9211 form
-(`hit`, `fwd=miss`, `hit; fwd=stale`, `fwd=bypass`) and adds `collapsed` for a
-request that joined an in-flight fill. A stale response adds `fwd-status=<n>`
+(`hit`, `fwd=miss`, `hit; fwd=stale`, `fwd=bypass`) and, on a miss, adds
+`collapsed` for a request that joined an in-flight fill; the stale form never
+carries it. A stale response adds `fwd-status=<n>`
 with the upstream status that made it eligible, as in `haybale; hit; fwd=stale;
 fwd-status=503`, and leaves it out when no upstream response arrived. A read
 the cache passed through unserved carries `fwd=bypass`. The header is written

@@ -496,7 +496,7 @@ the block is rejected as an unknown field.
 | `idleTimeout`           | `2m`     | Go duration string bounding the gap between body bytes from the upstream during a cache fill. `0s` leaves the gap unbounded. Does not affect requests that bypass the cache. |
 | `exposeStatus`          | `false`  | Emits a `Cache-Status` response header describing how the cache handled the request. See [Cache-Status](security.md#cache-status-disclosure). |
 | `remote`                | (unset)  | Optional remote tier that replicas share, in an S3-compatible bucket. Requires `keyEnv`. See "Remote tier". |
-| `staleIfErrorFor`       | `0s`     | Go duration string: the maximum age of an entry served when the upstream cannot answer a read (stale-if-error). `0s` or empty disables it. Must not exceed `retention`. **Serves possibly outdated content; read "Stale-if-error" before setting it.** |
+| `staleIfErrorFor`       | `0s`     | Go duration string: the maximum age of an entry served when the upstream cannot answer a read (stale-if-error). `0s` or empty disables it. Must not exceed `retention`, and a non-zero value fails startup together with an explicit `responseHeaderTimeout: 0s`. **Serves possibly outdated content; read "Stale-if-error" before setting it.** |
 
 ### Sizes and durations
 
@@ -519,10 +519,12 @@ Validation of the `cache` block is structural: it checks that no key is
 unknown, the syntax of every size and duration, that `dir` is set, that
 `retention` is greater than zero, that `maxEntrySize` does not exceed half of
 `maxDiskSize`, that `refsMaxAge` is less than `accessRecheck` when both are
-non-zero, that `staleIfErrorFor` does not exceed `retention`, and, when `remote`
-is set, the remote fields and that `keyEnv` is set (see "Remote tier"). An
-explicit `0` for `maxDiskSize`, `maxEntrySize`, `maxConcurrentFills` or
-`maxRequestBody` is replaced by the default before validation. Negative and malformed values fail startup.
+non-zero, that `staleIfErrorFor` does not exceed `retention` and is not combined
+with an explicit `responseHeaderTimeout` of `0s`, and, when `remote` is set, the
+remote fields and that `keyEnv` is set (see "Remote tier"). An explicit `0` for
+`maxDiskSize`, `maxEntrySize`, `maxConcurrentFills` or `maxRequestBody` is
+replaced by the default before validation. Negative and malformed values fail
+startup.
 
 A `maxEntrySize` above half of `maxDiskSize` fails with `cache: maxEntrySize
 <size> must not exceed half of maxDiskSize <size>`, because a fill reserves its
@@ -531,7 +533,12 @@ response served from the cache does not renew the upstream access check that
 cached packs depend on; with `refsMaxAge` at or above `accessRecheck`, packs
 would stop being served while refs were still cached. A `staleIfErrorFor` above
 `retention` fails with `cache: staleIfErrorFor "<value>" must not exceed
-retention "<value>"`, because no entry is kept longer than `retention`.
+retention "<value>": no entry is kept longer than retention`. A non-zero
+`staleIfErrorFor` with `responseHeaderTimeout: 0s` fails with `cache:
+staleIfErrorFor requires a non-zero responseHeaderTimeout; with no header bound
+a hung upstream would hold requests indefinitely`. Leaving
+`responseHeaderTimeout` unset is accepted, since it then takes its `60s`
+default.
 
 Validation does not touch the filesystem, the network or the environment, so
 `haybale policy check` stays offline when a cache block is present, with or
@@ -864,9 +871,15 @@ guide](caching.md#serving-through-an-upstream-outage) describes what an outage
 clone can do and the health gate that keeps requests from waiting out a
 connection timeout.
 
+`staleIfErrorFor` requires a non-zero `responseHeaderTimeout`; see
+"Validation". For an upstream that hangs rather than refuses connections, lower
+`responseHeaderTimeout`, because each request waits that long before it is
+answered stale.
+
 Every stale response is logged as a `cache_stale_served` security event, and
 the `response cache enabled` startup line reports the configured
-`staleIfErrorFor`.
+`staleIfErrorFor` as a Go duration: `1h` appears as `1h0m0s`, and the default
+as `0s`.
 
 ## Worked example
 

@@ -118,8 +118,9 @@ to the upstream instead. After a discarded or aborted fill, requests for the
 same key go straight to the upstream for one minute. Two reasons differ: after
 an oversize response (`too_large`) the period is `retention`, and a `generation`
 discard, or a fill cancelled because every request waiting on it left, marks
-nothing. With `staleIfErrorFor` set, an outage-shaped failure is answered from a
-stored entry instead when one qualifies, and marks nothing either; see [Serving
+nothing. With `staleIfErrorFor` set, a failure that suggests the upstream
+cannot answer is answered from a stored entry instead when one qualifies, and
+marks nothing either, and a `fetch_error` failure marks nothing; see [Serving
 through an upstream outage](#serving-through-an-upstream-outage).
 
 With the default settings, fifty concurrent clones of one repository cost one
@@ -438,11 +439,13 @@ older than that duration. It is a trade of freshness for availability with a
 security cost, described in the [security model](security.md#stale-if-error): a
 client can receive content up to `staleIfErrorFor` old, and git gives no sign of
 it. Set it only for workloads that are better served by outdated content than
-by a failed clone.
+by a failed clone. It cannot exceed `retention`, and it requires a non-zero
+`responseHeaderTimeout`: an explicit `0s` fails startup.
 
 A read is answered stale when all of these hold:
 
-- the upstream request failed in a way that only an outage explains:
+- the upstream request failed in a way that suggests the upstream cannot
+  answer:
   - the connection to the upstream failed: name resolution, the TCP connection
     or the TLS handshake;
   - the credential source could not reach its API (for the GitHub App source, a
@@ -450,10 +453,14 @@ A read is answered stale when all of these hold:
   - no response headers arrived within `responseHeaderTimeout`; or
   - the upstream answered `500`, `502`, `503` or `504`;
 - an entry for the identical request is stored on this replica's disk or in the
-  remote tier, created no more than `staleIfErrorFor` ago and not purged; and
+  remote tier, created no more than `staleIfErrorFor` ago and not covered by a
+  purge (see [Purges and stale service](#purges-and-stale-service)); and
 - the request was offered to the cache: a read that the cache declines (see
   [Clones always miss](#clones-always-miss)) takes the passthrough path, which
-  never serves stale.
+  never serves stale. A key marked uncacheable is declined too, unless the
+  [health gate](#health-gate) is open. For example, a `401` or `403` discards
+  the fill and marks its key for a minute, so a `503` inside that minute is
+  relayed rather than answered stale while the gate is closed.
 
 The `accessRecheck` and `refsMaxAge` rules are waived for stale service, since
 both exist to make haybale ask the upstream, and the upstream cannot answer.
@@ -475,6 +482,15 @@ These are never answered stale and fail as they do without the setting:
 - every push; and
 - a request with no stored entry, or only one older than `staleIfErrorFor`.
 
+While `staleIfErrorFor` is set, a fill that fails with `fetch_error` (a reset,
+an EOF, or a failure stale service cannot answer) does not mark its key
+uncacheable, so the next request for the key can still be answered stale. The
+cost is that during a `5xx` or hung-upstream outage a key with no stored entry
+goes to the upstream on every request, where the mark would have sent its
+requests straight to the passthrough path for a minute. Connect failures are
+bounded by the health gate instead. Other marks (`too_large`, `truncated`, store
+errors, and a rejected credential) are unchanged.
+
 A stale response carries `Cache-Status: haybale; hit; fwd=stale;
 fwd-status=503` when `exposeStatus` is on, where `fwd-status` is the upstream's
 status and is left out when no response arrived. The request log records
@@ -482,6 +498,32 @@ status and is left out when no response arrived. The request log records
 `served_bytes.total` counts its bytes under the tier it came from. Every stale
 response also logs a `cache_stale_served` security event at warning level,
 described in [`observability.md`](observability.md#logs).
+
+On fill graphs during an outage, a disk entry answered after an upstream
+attempt records `fills.total` with `result=discarded` and the failure's
+`reason`; a request the health gate held records no fill; and a copy read
+from the remote tier records `stored` or `discarded` with `tier=remote`.
+
+### Purges and stale service
+
+Stale service never serves an entry that a purge covers. Without a remote
+tier, `haybale cache purge` deletes the entries from this replica's directory,
+so nothing remains to serve. With a remote tier, a replica learns of another
+host's `purge --remote` from the repository's purge marker, so every stale
+answer first needs the marker check to be current: a check that succeeded
+within the last minute (or `accessRecheck`, when that is shorter) is reused,
+and otherwise the replica reads the marker, waiting at most 30 seconds. If the
+read fails, the marker fails verification, or the check is skipped because a
+read failed within the last minute, nothing is served stale and the request
+fails as it would without the setting. As a result:
+
+- a bucket outage during an upstream outage turns stale service off for each
+  repository whose marker cannot be read, a minute at a time;
+- a corrupt marker, or one written by a host whose clock runs more than 5
+  minutes ahead, stops stale service for that repository on every replica until
+  `purge --remote` replaces it, as it already stops pack hits; and
+- a held request can wait up to the marker timeout once a minute per
+  repository while the bucket is slow.
 
 ### What an outage clone can do
 
@@ -497,8 +539,13 @@ options, went through this replica, or a replica sharing the remote tier, within
   and fails;
 - the stored ref advertisement and `ls-refs` response can name tips for which no
   pack is stored, for example after another replica's incremental fetch
-  refreshed the remote tier's `ls-refs` entry. That clone then fails at its
-  fetch step, as it would without the cache; and
+  refreshed the remote tier's `ls-refs` entry. This is usual after any push
+  followed by a clone with different options, because every clone refreshes
+  the stored refs. That clone then fails at its fetch step, as it would without
+  the cache;
+- a replica that did not handle a push can serve the refs it stored before the
+  push for up to `staleIfErrorFor` while the upstream is failing, whatever
+  `refsMaxAge` is; and
 - the stale tips are the ones stored, so the clone lacks every commit pushed
   since, including security fixes.
 
@@ -509,22 +556,39 @@ that an outage does not make every request wait out a connection timeout first.
 The gate opens when a request cannot connect to the upstream or the credential
 source reports its API unavailable. A `5xx` response or a response-header
 timeout never opens it: one repository can be slow or failing while the host is
-healthy, and a client can provoke those for its own requests.
+healthy, and a client can provoke those for its own requests. A connect failure
+of a request that began before the latest upstream success is ignored. The gate
+affects only reads offered to the cache; passthrough reads and pushes ignore
+it.
 
 While the gate is open:
 
-- a request with a qualifying stored entry is answered from it at once, without
-  contacting the upstream;
-- a request without one still goes to the upstream, since nothing else can answer
-  it; and
+- a request with a qualifying entry on this replica's disk is answered from it
+  at once, without contacting the upstream and without taking a fill slot, so
+  fills stuck on the upstream cannot crowd it out;
+- a request whose only qualifying entry is in the remote tier is answered from
+  it through a fill, which takes a fill slot and stores the copy on disk; with
+  no slot free it takes the passthrough path, like any other request;
+- a request without a qualifying entry still goes to the upstream, since
+  nothing else can answer it; and
 - one request at a time goes to the upstream as a probe, at most once every 5
-  seconds. A failed probe is answered stale like any other request.
+  seconds. A probe that has a qualifying entry on disk waits at most 5 seconds
+  for the upstream's response headers and is then answered stale, leaving the
+  gate open; a probe without one waits the full `responseHeaderTimeout`. A
+  failed probe is answered stale like any other request.
 
 Any upstream answer other than `500`, `502`, `503` or `504` closes the gate.
 Probes ride on client requests, so with no traffic the gate stays open until the
-next request finds the upstream reachable. Opening and closing are logged at Info
-with the `host`: `upstream health gate opened; stale entries answer requests
-without contacting upstream` and `upstream health gate closed`.
+next request finds the upstream reachable. Opening and closing are logged at
+Info with the `host`, and the opening line also carries the `reason`:
+`upstream health gate opened; stale entries answer requests without contacting
+upstream` and `upstream health gate closed`. The gate is kept per process in
+memory, so a restarted replica, or another replica, starts with it closed.
+
+An upstream that accepts connections but never answers never opens the gate,
+since header timeouts do not. Each request then waits `responseHeaderTimeout`
+before it is answered stale, so for that kind of outage lower
+`responseHeaderTimeout`.
 
 ## Observing the cache
 
@@ -609,9 +673,10 @@ Log lines to alert on, all at Warn unless noted:
   operations retry on use`: the bucket could not be reached at startup.
 - the `cache_stale_served` security event: a read was answered from a stale
   entry because the upstream could not answer. Alert on any occurrence where
-  `staleIfErrorFor` is set; its `reason` field tells an outage (`connect`,
-  `credential_unavailable`, `health_gate`) from a failing repository
-  (`upstream_status`, `header_timeout`).
+  `staleIfErrorFor` is set. Its `reason` field says why: `connect`,
+  `credential_unavailable` and `health_gate` mean the host was unreachable;
+  `upstream_status` and `header_timeout` mean it answered badly or slowly,
+  which can be one repository or the whole host.
 
 Lines of lower value, all at Warn except where noted:
 
@@ -912,12 +977,14 @@ configuration reference lists the messages.
 A push deletes the repository's cached refs entries on the replica that handled
 it, and then in the remote tier, best effort. Other replicas keep their local
 copies until `refsMaxAge` passes, which matters only when `refsMaxAge` is above
-`0s`. If the deletion from the bucket fails (`remote cache tier operation
-failed` with `operation=list` or `operation=delete`), pre-push refs entries can
-stay in the bucket for up to `refsMaxAge`. The replica that handled the push
-never serves them, because it remembers the push time, but other replicas can
-read them from the bucket, and so can the same replica after a restart, which
-forgets the push time.
+`0s`, or during an outage with `staleIfErrorFor` set, when they can serve them
+stale for up to `staleIfErrorFor`. If the deletion from the bucket fails
+(`remote cache tier operation failed` with `operation=list` or
+`operation=delete`), pre-push refs entries can stay in the bucket for up to
+`refsMaxAge`, or `staleIfErrorFor` for stale service. The replica that
+handled the push never serves them, because it remembers the push time, but
+other replicas can read them from the bucket, and so can the same replica after
+a restart, which forgets the push time.
 
 Pre-push refs entries can also reach the bucket, or be served from it, when
 the deletion succeeds:
@@ -937,10 +1004,12 @@ the deletion succeeds:
   restarts, the pre-push object stays, and the restarted replica, which has
   forgotten the push time, can serve it until it is older than `refsMaxAge`.
 
-None of these cases arise at the default `refsMaxAge` of `0s`, because refs
-entries are then neither uploaded nor read from the bucket.
+With `staleIfErrorFor` set, each case also applies to stale answers during an
+outage, for up to `staleIfErrorFor` instead of `refsMaxAge`. None of these
+cases arise when both are `0s`, the defaults, because refs entries are then
+neither uploaded nor read from the bucket.
 
-## Limits and roadmap
+## Limits
 
 In this release:
 

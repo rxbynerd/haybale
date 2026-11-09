@@ -534,9 +534,10 @@ connection would otherwise hold all of them. Expiry is treated as an upstream
 failure. If the response headers had not arrived, the waiting requests are
 released to the passthrough path and reach the upstream directly, so clients see
 a delay of up to `responseHeaderTimeout`, unless stale-if-error answers them from
-a stored entry. If the body stalls after bytes were
-sent, the waiting clients' connections are closed without a clean ending. In
-both cases requests for the same key go straight to the upstream for one minute.
+a stored entry. If the body stalls after bytes were sent, the waiting clients'
+connections are closed without a clean ending. In both cases requests for the
+same key go straight to the upstream for one minute, except while
+stale-if-error is enabled, when the key stays cacheable.
 The number of fills in flight is bounded by `cache.maxConcurrentFills`; a
 request that finds no free slot is proxied directly.
 
@@ -555,16 +556,28 @@ accepts these risks:
   so once haybale's own upstream access is revoked or the repository is
   deleted, retained entries can be served for up to `staleIfErrorFor` while the
   upstream is failing, rather than for `accessRecheck`. Policy still applies:
-  only an identity that policy allows to read the repository is served.
+  only an identity that policy allows to read the repository is served. A
+  reachable upstream that refuses access (`401`, `403`, `404`, or a credential
+  refusal) is never masked, and the next probe closes the health gate. Only a
+  revocation that coincides with an outage is hidden.
+- **Chosen outages.** A party on the network path between haybale and the
+  upstream can cause the connect failures that trigger stale service. Anyone
+  who can disrupt haybale's egress (DNS poisoning, blocked connections, a bad
+  certificate) can choose when stale service starts and hold it open, which
+  pins clients to content up to `staleIfErrorFor` old, for example to keep a
+  security fix away from CI. Certificate verification failures stay eligible,
+  because an adversary who can present a bad certificate can also block
+  connections, so excluding them would gain nothing.
 
 A read is answered stale only when that read's own upstream request failed in
 one of these ways:
 
-- the connection to the upstream failed before any request was sent: name
+- the connection to the upstream failed before response headers arrived: name
   resolution, the TCP connection or the TLS handshake, including an untrusted
-  certificate;
-- the credential source reported that its API could not be reached
-  (`upstream.ErrUnavailable`: a network error, its own timeout or a `5xx`);
+  certificate. A TLS alert on an established connection also counts as a
+  connect failure;
+- the credential source reported that its API could not be reached (a network
+  error, its own timeout or a `5xx`);
 - no response headers arrived within `cache.responseHeaderTimeout`; or
 - the upstream answered `500`, `502`, `503` or `504`.
 
@@ -581,19 +594,30 @@ These never trigger stale service:
   sent; and
 - every write. Pushes are never offered to the cache.
 
+haybale relays an upstream `401` or `403` to the cache as a `502` carrying an
+internal `Haybale-Upstream-Status` header. Any copy of that header the upstream
+sends is removed, on the cache and passthrough paths alike, and the cache
+honours it only on a `502` and only for `401` or `403`, so an upstream cannot
+use it to trigger or suppress stale service.
+
 The entry served must be an entry for the identical request, created no more
 than `staleIfErrorFor` ago, verified like any other entry, and not covered by a
-purge. A client that makes its own request fail upstream, for example with a
-request that makes the upstream answer `500`, can only steer that request to the
-stored answer for the same request; it changes nothing for other readers.
+purge. With a remote tier, a replica learns of a purge made on another host
+only from the repository's purge marker, so no entry is served stale until the
+marker check is current: read within the last minute or read now. If the
+marker cannot be read or fails verification, stale service fails closed and the
+request fails as it would without the setting. A client that makes its own
+request fail upstream, for example with a request that makes the upstream answer
+`500`, can only steer that request to the stored answer for the same request;
+it changes nothing for other readers.
 
 To avoid a connection timeout per request during an outage, each upstream host
-has a health gate. It opens only on failures a client cannot cause: a failed
-connection and an unavailable credential API. A `5xx` or a header timeout never
-opens it. While it is open, a request with a qualifying entry is answered
-without contacting the upstream, one request every 5 seconds probes the
-upstream, and any upstream answer other than `500`, `502`, `503` or `504` closes
-it.
+has a health gate. It opens only on failures a client cannot cause, although a
+party on the network path can: a failed connection and an unavailable
+credential API. A `5xx` or a header timeout never opens it. While it is open, a
+request with a qualifying entry is answered without contacting the upstream,
+one request every 5 seconds probes the upstream, and any upstream answer other
+than `500`, `502`, `503` or `504` closes it.
 
 Every stale response logs a `cache_stale_served` security event with the
 identity, the repository, the request class, the tier, the reason and the
