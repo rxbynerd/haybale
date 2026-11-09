@@ -275,8 +275,8 @@ How the two tiers interact:
 
 - After a fill from the upstream stores an entry on disk, the replica uploads
   it in the background. Pack entries are always uploaded. Refs entries are
-  uploaded only when `refsMaxAge` is above `0s`, because otherwise no replica
-  reads them from the bucket. Four uploads run at a time and up to 256 wait;
+  uploaded only when `refsMaxAge` or `staleIfErrorFor` is above `0s`, because
+  otherwise no replica reads them from the bucket. Four uploads run at a time and up to 256 wait;
   when the queue is full the entry is not uploaded, and `uploads.total` counts
   it with `result=dropped`. A refs entry replaces the bucket's copy, so peers
   see the latest tips. An upload is skipped (`result=skipped`) when the bucket

@@ -277,10 +277,10 @@ no effect on cache behaviour.
   `cache.refsMaxAge`** (default `0s`: always revalidate with upstream).
   They are still stored, because stale-if-error needs them and they are a
   few hundred bytes, and they are uploaded to tier 2 only when a replica
-  can read them back: when `refsMaxAge > 0`, and, once stale-if-error
-  ships, when `staleIfErrorFor > 0`. Refs requests are coalesced only
-  when `refsMaxAge > 0`; with the default every refs request reaches
-  upstream, so no client ever observes tips older than its own request.
+  can read them back: when `refsMaxAge > 0` or `staleIfErrorFor > 0`.
+  Refs requests are coalesced only when `refsMaxAge > 0`; with the
+  default every refs request reaches upstream, so no client ever
+  observes tips older than its own request.
   An operator who wants to absorb a burst of ref lookups sets a few
   seconds and accepts tips up to that age. The v2 capability
   advertisement follows the refs policy deliberately: it is tiny and

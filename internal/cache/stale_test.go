@@ -539,6 +539,36 @@ func TestStaleServiceSkipsRemoteEntriesPastTheBound(t *testing.T) {
 	}
 }
 
+// TestStaleServiceServesRemoteRefs: with stale-if-error enabled, refs
+// entries are uploaded at refsMaxAge zero so a cold replica can answer an
+// outage from the remote tier, except for refs created before its own
+// last push to the repository.
+func TestStaleServiceServesRemoteRefs(t *testing.T) {
+	stale := func(o *Options) { o.StaleIfErrorFor = testStaleFor }
+	store := newMemBlobStore()
+	seedPeerWith(t, store, remotePack(t), stale)
+
+	c, clock, _ := newRemoteTestCache(t, store, stale)
+	clock.Advance(time.Minute)
+	rec := newCollectWriter()
+	out, handled, _ := serve(c, rec, postV2(lsRefsBody(t)), &failing{err: errDialRefused})
+	status, body, _ := rec.result()
+	if !handled || out.Result != observability.ResultStale || status != 200 || !bytes.Equal(body, lsRefsResultBody(t)) {
+		t.Fatalf("ls-refs = %+v status %d, want the remote refs served stale", out, status)
+	}
+
+	pushed, pushedClock, _ := newRemoteTestCache(t, store, stale)
+	pushedClock.Advance(time.Minute)
+	store.set(func(m *memBlobStore) { m.listErr = errors.New("memblob: 503 SlowDown") })
+	pushed.Invalidate(context.Background(), testRepo, testBaseURL)
+	if got := store.keys(refsPrefix); len(got) != 1 {
+		t.Fatalf("remote refs after a failed invalidation = %v, want the pre-push copy kept", got)
+	}
+	if out, handled, _ := serve(pushed, newCollectWriter(), postV2(lsRefsBody(t)), &failing{err: errDialRefused}); handled || out.Result != observability.ResultBypass {
+		t.Errorf("ls-refs after a push = %+v handled %v, want the pre-push refs refused", out, handled)
+	}
+}
+
 func TestNewRejectsStaleIfErrorForBeyondRetention(t *testing.T) {
 	opts := Options{
 		Dir: cacheDir(t), Keyring: testKeyring(t), MaxDiskSize: 64 << 20, MaxEntrySize: 8 << 20,

@@ -166,17 +166,20 @@ func (c *Cache) openStaleEntry(key entryKey, repo gitproto.Repo, class string) *
 	return e
 }
 
-// staleAcceptable applies the stale rules to a remote entry's header. An
-// entry past retention or older than the repository's last purge is
-// deleted from the remote tier.
+// staleAcceptable applies the stale rules to a remote entry's header,
+// and refuses a refs entry created before this process's last push to
+// the repository. An entry past retention or older than the repository's
+// last purge is deleted from the remote tier in the background.
 func (f *fill) staleAcceptable(h entryHeader) bool {
 	c := f.c
 	age := c.now().Sub(h.CreatedAt)
 	switch {
 	case age > c.opts.Retention || c.purges.covers(f.key, h.CreatedAt):
-		c.deleteRemote(f.key.Path())
+		f.expireRemote()
 		return false
 	case age > c.opts.StaleIfErrorFor:
+		return false
+	case f.prePushRefs(h):
 		return false
 	}
 	return true

@@ -67,9 +67,10 @@ var (
 
 // uploadsGroup reports whether committed entries of group are uploaded
 // to the remote tier. Packs always are. Refs are uploaded only when a
-// replica can serve them back, which needs a positive refsMaxAge.
+// replica can serve them back: as hits with a positive refsMaxAge, or as
+// stale answers with stale-if-error enabled.
 func (c *Cache) uploadsGroup(group Group) bool {
-	return group == GroupPack || c.opts.RefsMaxAge > 0
+	return group == GroupPack || c.opts.RefsMaxAge > 0 || c.staleEnabled()
 }
 
 // remoteEligible reports whether a fill may be served from the remote
@@ -187,27 +188,37 @@ func (f *fill) remoteFresh(h entryHeader) bool {
 	age := c.now().Sub(h.CreatedAt)
 	switch {
 	case age > c.opts.Retention || c.purges.covers(f.key, h.CreatedAt):
-		// Deleted in the background so a slow bucket does not delay the
-		// fall-through. It can race the upload that follows, which then
-		// finds the old object, skips, and leaves the key absent until a
-		// later miss uploads it.
-		path := f.key.Path()
-		c.goRemote(func(ctx context.Context) {
-			if err := c.remote.Delete(ctx, path); err != nil {
-				c.remoteErrorUnlessClosed(observability.OperationDelete, err)
-			}
-		})
+		f.expireRemote()
 		return false
 	case f.key.Group == GroupRefs && age > c.opts.RefsMaxAge:
 		return false
-	case f.key.Group == GroupRefs && !h.CreatedAt.After(c.gens.pushedAt(f.key.RepoHash)):
-		// Created no later than this process's last push to the
-		// repository, so it may hold the pre-push tips. A peer may still
-		// serve it until refsMaxAge; it is left for the push's own
-		// deletion.
+	case f.prePushRefs(h):
 		return false
 	}
 	return true
+}
+
+// prePushRefs reports whether h is a refs entry created no later than
+// this process's last push to the repository, so it may hold the
+// pre-push tips. A peer may still serve it; it is left for the push's own
+// deletion.
+func (f *fill) prePushRefs(h entryHeader) bool {
+	return f.key.Group == GroupRefs && !h.CreatedAt.After(f.c.gens.pushedAt(f.key.RepoHash))
+}
+
+// expireRemote deletes the fill's remote object, past retention or
+// covered by a purge, in the background so a slow bucket does not delay
+// the fall-through. It can race the upload that follows, which then finds
+// the old object, skips, and leaves the key absent until a later miss
+// uploads it.
+func (f *fill) expireRemote() {
+	c := f.c
+	path := f.key.Path()
+	c.goRemote(func(ctx context.Context) {
+		if err := c.remote.Delete(ctx, path); err != nil {
+			c.remoteErrorUnlessClosed(observability.OperationDelete, err)
+		}
+	})
 }
 
 // streamRemote reads the remote entry through sr, which verifies every
