@@ -203,6 +203,86 @@ func buildTestConfig(t *testing.T, tokenEnv string) *config.Config {
 	}
 }
 
+// TestNewResponseCacheDisabled confirms a config without a cache block
+// yields no cache and no proxy option, so the proxy is a pure
+// passthrough, and that closing a nil cache is a no-op.
+func TestNewResponseCacheDisabled(t *testing.T) {
+	const tokenEnv = "HAYBALE_SERVE_TEST_CACHE_OFF_TOKEN" //nolint:gosec // G101: an environment-variable name, not a credential value
+	t.Setenv(tokenEnv, "test-token-value")
+	cfg := buildTestConfig(t, tokenEnv)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	c, opts, err := newResponseCache(cfg, discardLogger(), observability.NewNoopMetrics())
+	if err != nil {
+		t.Fatalf("newResponseCache: %v", err)
+	}
+	if c != nil || len(opts) != 0 {
+		t.Errorf("newResponseCache = %v, %d options; want nil and none", c, len(opts))
+	}
+	closeResponseCache(nil, discardLogger())
+}
+
+// TestNewResponseCacheEnabled confirms an enabled cache block builds a
+// cache under an ephemeral key, creates its directory, yields the proxy
+// option that installs it, and closes cleanly within the bound.
+func TestNewResponseCacheEnabled(t *testing.T) {
+	const tokenEnv = "HAYBALE_SERVE_TEST_CACHE_ON_TOKEN" //nolint:gosec // G101: an environment-variable name, not a credential value
+	t.Setenv(tokenEnv, "test-token-value")
+	cfg := buildTestConfig(t, tokenEnv)
+	cfg.Cache = config.CacheConfig{
+		Enabled:       true,
+		Dir:           filepath.Join(t.TempDir(), "cache"),
+		MaxDiskSize:   64 << 20,
+		MaxEntrySize:  8 << 20,
+		Retention:     "1h",
+		AccessRecheck: "5m",
+	}
+	// Validate parses the durations BuildCache needs; the remaining
+	// defaults come from Load in production and are supplied here.
+	cfg.Cache.MaxConcurrentFills, cfg.Cache.MaxRequestBody = 2, 1<<20
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	c, opts, err := newResponseCache(cfg, logger, observability.NewNoopMetrics())
+	if err != nil {
+		t.Fatalf("newResponseCache: %v", err)
+	}
+	if c == nil || len(opts) != 1 {
+		t.Fatalf("newResponseCache = %v, %d options; want a cache and one option", c, len(opts))
+	}
+	if info, err := os.Stat(cfg.Cache.Dir); err != nil || !info.IsDir() {
+		t.Errorf("cache dir was not created: %v", err)
+	}
+	if !strings.Contains(buf.String(), "will not survive a restart") {
+		t.Errorf("log = %q, want the ephemeral-key notice", buf.String())
+	}
+	// The option must be usable by proxy.New.
+	auth, _ := newJWTTestAuth(t, "cache-wiring")
+	eng, err := policy.NewGlobEngine(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstreams, err := buildUpstreams(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources, err := buildCredentialSources(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := proxy.New(upstreams, sources, auth, eng, discardLogger(), observability.NewNoopMetrics(), opts...); err != nil {
+		t.Fatalf("proxy.New with the cache option: %v", err)
+	}
+	closeResponseCache(c, logger)
+	if strings.Contains(buf.String(), "did not close cleanly") {
+		t.Errorf("log = %q, want a clean close", buf.String())
+	}
+}
+
 func TestBuildUpstreams(t *testing.T) {
 	const tokenEnv = "HAYBALE_SERVE_TEST_TOKEN" //nolint:gosec // G101: this is an environment-variable *name*, not a credential value — the actual test token is the separate, non-secret literal passed to t.Setenv below
 	t.Setenv(tokenEnv, "test-token-value")

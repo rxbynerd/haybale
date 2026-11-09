@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	"github.com/rxbynerd/haybale/internal/cache"
 	"github.com/rxbynerd/haybale/internal/config"
 	"github.com/rxbynerd/haybale/internal/observability"
 	"github.com/rxbynerd/haybale/internal/proxy"
@@ -40,6 +41,12 @@ const readHeaderTimeout = 10 * time.Second
 // last batch of spans/metrics/logs gets a fair chance to flush without
 // letting a dead collector stall shutdown indefinitely.
 const telemetryShutdownTimeout = 5 * time.Second
+
+// cacheCloseTimeout bounds how long process exit waits for the response
+// cache to cancel its fills and close its store. It runs after in-flight
+// requests have drained, so only fills with no remaining subscribers can
+// still be running.
+const cacheCloseTimeout = 30 * time.Second
 
 var (
 	configPath       string
@@ -170,10 +177,22 @@ func runServe(cmd *cobra.Command, path string) error {
 	if err != nil {
 		return fmt.Errorf("build authenticator: %w", err)
 	}
+	// The response cache, like the authenticator, is built only here:
+	// BuildCache reads the key from the environment and opens the cache
+	// directory, which the offline `haybale policy check` must never do.
+	// Its fills run on their own lifetime, not ctx, so they survive the
+	// drain window; the deferred close runs after serveWithGracefulDrain
+	// returns and before the telemetry shutdown registered above.
+	responseCache, proxyOpts, err := newResponseCache(cfg, logger, providers.Metrics)
+	if err != nil {
+		return fmt.Errorf("build cache: %w", err)
+	}
+	defer closeResponseCache(responseCache, logger)
+
 	// proxy.New rejects a nil authenticator/policyEngine at construction,
 	// so a caller bug (Validate() didn't run, leaving Engine() nil)
 	// surfaces here as an error rather than a panic on the first request.
-	p, err := proxy.New(upstreams, credentialSources, authenticator, cfg.Policy.Engine(), logger, providers.Metrics)
+	p, err := proxy.New(upstreams, credentialSources, authenticator, cfg.Policy.Engine(), logger, providers.Metrics, proxyOpts...)
 	if err != nil {
 		return fmt.Errorf("build proxy: %w", err)
 	}
@@ -334,6 +353,34 @@ func serveWithGracefulDrain(ctx context.Context, srv *http.Server, p *proxy.Prox
 			return serveErr
 		}
 		return shutdownErr
+	}
+}
+
+// newResponseCache builds the response cache cfg describes and the
+// proxy option that installs it. Both are nil when the cache is disabled,
+// so the proxy is exactly the passthrough it is without a cache block.
+func newResponseCache(cfg *config.Config, logger *slog.Logger, metrics *observability.Metrics) (*cache.Cache, []proxy.Option, error) {
+	c, err := cfg.Cache.BuildCache(logger, metrics)
+	if err != nil {
+		return nil, nil, err
+	}
+	if c == nil {
+		return nil, nil, nil
+	}
+	return c, []proxy.Option{proxy.WithCache(c)}, nil
+}
+
+// closeResponseCache closes c within cacheCloseTimeout, logging rather
+// than failing when fills are still running at the bound. A nil c is a
+// no-op.
+func closeResponseCache(c *cache.Cache, logger *slog.Logger) {
+	if c == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cacheCloseTimeout)
+	defer cancel()
+	if err := c.Close(ctx); err != nil {
+		logger.Warn("response cache did not close cleanly", "error", err)
 	}
 }
 
