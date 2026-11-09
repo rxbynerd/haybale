@@ -524,7 +524,7 @@ func (f *fill) finish(result, reason string, markFor time.Duration) {
 	}
 	f.finished = true
 	ctx := context.Background()
-	f.c.metrics.RecordResponseCacheFill(ctx, f.repo.Host, string(f.req.Class), result, reason)
+	f.c.metrics.RecordResponseCacheFill(ctx, f.repo.Host, string(f.req.Class), f.source, result, reason)
 	if f.fetched > 0 {
 		f.c.metrics.RecordResponseCacheFillBytes(ctx, f.repo.Host, string(f.req.Class), f.source, f.fetched)
 	}

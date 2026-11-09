@@ -252,18 +252,18 @@ func TestRecordResponseCacheFill(t *testing.T) {
 	}{
 		{
 			name: "stored omits reason", result: FillResultStored,
-			want: map[string]string{attrHost: "github.com", attrClass: "fetch", attrResult: FillResultStored},
+			want: map[string]string{attrHost: "github.com", attrClass: "fetch", attrTier: TierUpstream, attrResult: FillResultStored},
 		},
 		{
 			name: "discarded carries reason", result: FillResultDiscarded, reason: FillReasonTruncated,
-			want: map[string]string{attrHost: "github.com", attrClass: "fetch", attrResult: FillResultDiscarded, attrReason: FillReasonTruncated},
+			want: map[string]string{attrHost: "github.com", attrClass: "fetch", attrTier: TierUpstream, attrResult: FillResultDiscarded, attrReason: FillReasonTruncated},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			m, reader := newTestMetrics(t)
-			m.RecordResponseCacheFill(context.Background(), "github.com", "fetch", tt.result, tt.reason)
+			m.RecordResponseCacheFill(context.Background(), "github.com", "fetch", TierUpstream, tt.result, tt.reason)
 
 			dp := onlyPoint(t, reader, "haybale.response_cache.fills.total")
 			if dp.Value != 1 {
@@ -371,7 +371,7 @@ func TestResponseCacheNoopMetricsRecordWithoutPanic(t *testing.T) {
 	m := NewNoopMetrics()
 	ctx := context.Background()
 	m.RecordResponseCacheLookup(ctx, "h", "fetch", ResultBypass)
-	m.RecordResponseCacheFill(ctx, "h", "fetch", FillResultDiscarded, FillReasonFetchError)
+	m.RecordResponseCacheFill(ctx, "h", "fetch", TierUpstream, FillResultDiscarded, FillReasonFetchError)
 	m.RecordResponseCacheFillBytes(ctx, "h", "fetch", TierUpstream, 1)
 	m.RecordResponseCacheServedBytes(ctx, "h", "fetch", TierDisk, 1)
 	m.RecordResponseCacheCollapsed(ctx, "h")

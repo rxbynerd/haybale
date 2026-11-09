@@ -122,13 +122,13 @@ func (f *fill) fillFromRemote() bool {
 		return false
 	}
 
+	f.source = observability.TierRemote
 	sp, err := c.store.Create(path, info.Size, true)
 	if err != nil {
 		f.release(storeReason(err), transientCooldown)
 		return true
 	}
 	f.spool = sp
-	f.source = observability.TierRemote
 	if _, err := sp.Write(prefix); err != nil {
 		f.abort(err, storeReason(err))
 		return true
@@ -181,7 +181,8 @@ func (f *fill) streamRemote(sr *sealedReader, tee *spoolTee) {
 	}()
 	buf := make([]byte, segmentSize)
 	for {
-		_, err := sr.Read(buf)
+		n, err := sr.Read(buf)
+		f.fetched += int64(n)
 		if errors.Is(err, io.EOF) {
 			break
 		}
@@ -198,7 +199,6 @@ func (f *fill) streamRemote(sr *sealedReader, tee *spoolTee) {
 		}
 		return
 	}
-	f.fetched, _ = sr.bodyLength()
 	switch {
 	case f.fetched > f.c.opts.MaxEntrySize:
 		f.discard(observability.FillReasonTooLarge, 0)

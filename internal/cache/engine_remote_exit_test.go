@@ -3,11 +3,14 @@ package cache
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"testing"
 	"time"
+
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
 	"github.com/rxbynerd/haybale/internal/observability"
 	"github.com/rxbynerd/haybale/internal/security"
@@ -269,5 +272,75 @@ func TestRemoteHeaderFailureFallsThroughWithoutResuming(t *testing.T) {
 			}
 			assertStoreIdle(t, c)
 		})
+	}
+}
+
+// fillsFrom counts fills.total for tier, result and, when not empty, reason.
+func fillsFrom(t *testing.T, reader *sdkmetric.ManualReader, tier, result, reason string) int64 {
+	t.Helper()
+	want := map[string]string{"haybale.tier": tier, "haybale.result": result}
+	if reason != "" {
+		want["haybale.reason"] = reason
+	}
+	return sumWhere(t, reader, "haybale.response_cache.fills.total", want)
+}
+
+func TestFillsAreCountedByTheTierTheyReadFrom(t *testing.T) {
+	store := newMemBlobStore()
+	pack := remotePack(t)
+	seedPeer(t, store, pack)
+	c, _, reader := newRemoteTestCache(t, store, nil)
+	lsRefs(t, c, refsFetcher(t))
+	if out, _, _ := serve(c, newCollectWriter(), fetchRequest(t), packFetcher(pack)); !out.Stored {
+		t.Fatalf("fetch = %+v, want a stored remote fill", out)
+	}
+	store.set(func(m *memBlobStore) {
+		m.getHook = func(string, int64) error { return errors.New("memblob: 503 SlowDown") }
+	})
+	other := packFetcher(fetchResultBody(t, 3, 100))
+	if out, _, _ := serve(c, newCollectWriter(), otherFetchRequest(t), other); !out.Stored || other.calls.Load() != 1 {
+		t.Fatalf("fetch with a failing remote = %+v upstream %d, want a stored upstream fill", out, other.calls.Load())
+	}
+	assertStoreIdle(t, c)
+
+	if got := fillsFrom(t, reader, observability.TierRemote, observability.FillResultStored, ""); got != 1 {
+		t.Errorf("fills{tier=remote,result=stored} = %d, want 1", got)
+	}
+	if got := fillsFrom(t, reader, observability.TierUpstream, observability.FillResultStored, ""); got != 2 {
+		t.Errorf("fills{tier=upstream,result=stored} = %d, want the ls-refs and the fall-through", got)
+	}
+	if got := sumWhere(t, reader, "haybale.response_cache.fills.total", nil); got != 3 {
+		t.Errorf("fills = %d, want 3: a remote attempt that falls through is one upstream fill", got)
+	}
+}
+
+func TestAnAbortedRemoteFillCountsItsBytes(t *testing.T) {
+	store := newMemBlobStore()
+	pack := remotePack(t)
+	seedPeer(t, store, pack)
+	key := store.keys(packPrefix)[0]
+	store.set(func(m *memBlobStore) {
+		m.wrapBody = func(_ context.Context, k string, offset int64, body io.Reader) io.Reader {
+			switch {
+			case k != key:
+				return body
+			case offset == 0:
+				return cutReader(body, 80000)
+			default:
+				return cutReader(body, 0)
+			}
+		}
+	})
+	c, _, reader := newRemoteTestCache(t, store, nil)
+	lsRefs(t, c, refsFetcher(t))
+	if _, _, aborted := serve(c, newCollectWriter(), fetchRequest(t), packFetcher(pack)); !aborted {
+		t.Fatal("the response was not aborted")
+	}
+	assertStoreIdle(t, c)
+	if got := fillsFrom(t, reader, observability.TierRemote, observability.FillResultDiscarded, observability.FillReasonFetchError); got != 1 {
+		t.Errorf("fills{tier=remote,reason=fetch_error} = %d, want 1", got)
+	}
+	if got := tierSum(t, reader, "fill_bytes.total", observability.TierRemote); got <= 0 || got >= int64(len(pack)) {
+		t.Errorf("fill_bytes{tier=remote} = %d, want the verified bytes read before the abort", got)
 	}
 }
