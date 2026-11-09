@@ -488,6 +488,11 @@ func (c *CacheConfig) validate() error {
 	if c.parsedRetention > 0 && c.parsedStaleIfErrorFor > c.parsedRetention {
 		return fmt.Errorf("cache: staleIfErrorFor %q must not exceed retention %q: no entry is kept longer than retention", c.StaleIfErrorFor, c.Retention)
 	}
+	// An unset responseHeaderTimeout takes its non-zero default in Load,
+	// so only an explicit zero is refused.
+	if c.parsedStaleIfErrorFor > 0 && c.ResponseHeaderTimeout != "" && c.parsedResponseHeaderTimeout == 0 {
+		return errors.New("cache: staleIfErrorFor requires a non-zero responseHeaderTimeout; with no header bound a hung upstream would hold requests indefinitely")
+	}
 	return nil
 }
 

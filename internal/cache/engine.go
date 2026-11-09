@@ -33,6 +33,10 @@ const (
 // errClientGone reports that the client stopped accepting the response.
 var errClientGone = errors.New("cache: client stopped reading")
 
+// errStaleNeedsHeaderTimeout rejects stale-if-error without a bound on the
+// wait for upstream response headers.
+var errStaleNeedsHeaderTimeout = errors.New("cache: staleIfErrorFor requires a non-zero responseHeaderTimeout; with no header bound a hung upstream would hold requests indefinitely")
+
 // Options configures a Cache.
 type Options struct {
 	// Dir is the cache directory; see openDiskStore for its requirements.
@@ -69,7 +73,7 @@ type Options struct {
 	ExposeStatus bool
 	// StaleIfErrorFor is the maximum age of an entry served when upstream
 	// cannot answer a read; zero disables stale service. It must not
-	// exceed Retention.
+	// exceed Retention, and needs a positive ResponseHeaderTimeout.
 	StaleIfErrorFor time.Duration
 	// Remote is the optional remote tier, shared by every replica that
 	// holds the same key. The implementation bounds the time to first
@@ -213,7 +217,7 @@ func New(opts Options) (*Cache, error) {
 		flushInterval: sealFlushInterval,
 		access:        accessRecords{window: opts.AccessRecheck},
 		purges:        purgeRecords{retention: opts.Retention, interval: markerCheckInterval(opts.AccessRecheck)},
-		gates:         healthGates{logger: logger},
+		gates:         healthGates{logger: logger, interval: healthProbeInterval},
 		remote:        opts.Remote,
 		remoteCtx:     remoteCtx,
 		remoteCancel:  remoteCancel,
@@ -255,6 +259,8 @@ func validateOptions(opts Options) error {
 		return errors.New("cache: durations must not be negative")
 	case opts.StaleIfErrorFor > opts.Retention:
 		return fmt.Errorf("cache: stale-if-error age %v must not exceed retention %v", opts.StaleIfErrorFor, opts.Retention)
+	case opts.StaleIfErrorFor > 0 && opts.ResponseHeaderTimeout == 0:
+		return errStaleNeedsHeaderTimeout
 	}
 	return nil
 }
@@ -313,10 +319,19 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo
 	}
 	class := string(req.Class)
 	key := entryKey{Group: req.Class.Group(), RepoHash: c.keyring.RepoHash(baseURL, repo), KeyHash: c.keyring.pathHash(req.Digest)}
+	// A request the health gate holds is answered from its stale entry
+	// wherever it would otherwise start or join a fill, and also when its
+	// key is marked uncacheable.
 	if c.marks.marked(key, c.now()) {
+		if out, ok := c.serveHeld(w, key, repo, class, identity, release); ok {
+			return out, true
+		}
 		return c.declined(w, host, class, "uncacheable"), false
 	}
 	if key.Group == GroupRefs && c.opts.RefsMaxAge <= 0 {
+		if out, ok := c.serveHeld(w, key, repo, class, identity, release); ok {
+			return out, true
+		}
 		f, ok := c.startSingle(key, req, repo, baseURL, fetch)
 		if !ok {
 			return c.declined(w, host, class, "no_slot"), false
@@ -330,6 +345,9 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo
 		if out, ok := c.serveOpened(w, e, repo, class, cacheStatus{result: observability.ResultHit}, observability.TierDisk); ok {
 			return out, true
 		}
+	}
+	if out, ok := c.serveHeld(w, key, repo, class, identity, release); ok {
+		return out, true
 	}
 	// A stored entry that fails verification before any byte is written
 	// has been deleted, so the request joins or starts a fill instead; a
@@ -718,6 +736,24 @@ func (c *Cache) writeShared(w http.ResponseWriter, out *fillOutcome, host, class
 	return Outcome{Result: observability.ResultMiss, Collapsed: collapsed, Status: out.status, BytesOut: int64(n)}
 }
 
+// serveHeld answers a request whose host's health gate holds it from the
+// key's qualifying tier-1 stale entry, before any fill slot, spool or
+// upstream request is taken, and releases the classification slot first.
+// ok is false, with nothing written, when stale service is disabled, the
+// gate does not hold the host, or no tier-1 entry qualifies; the request
+// then proceeds as it would otherwise.
+func (c *Cache) serveHeld(w http.ResponseWriter, key entryKey, repo gitproto.Repo, class, identity string, release func()) (Outcome, bool) {
+	if !c.staleEnabled() || !c.gates.held(repo.Host, c.now()) {
+		return Outcome{}, false
+	}
+	e := c.openStaleEntry(key, repo, class)
+	if e == nil {
+		return Outcome{}, false
+	}
+	release()
+	return c.serveStaleOpened(w, e, repo, class, false, identity, &staleService{reason: staleReasonHealthGate})
+}
+
 // serveStaleEntry answers the request from the stale tier-1 entry for
 // key and records the cache_stale_served event. ok is false, with nothing
 // written, when no entry qualifies any longer.
@@ -726,6 +762,12 @@ func (c *Cache) serveStaleEntry(w http.ResponseWriter, key entryKey, repo gitpro
 	if e == nil {
 		return Outcome{}, false
 	}
+	return c.serveStaleOpened(w, e, repo, class, collapsed, identity, st)
+}
+
+// serveStaleOpened streams the opened stale entry e as serveStaleEntry
+// does, and closes it.
+func (c *Cache) serveStaleOpened(w http.ResponseWriter, e *openedEntry, repo gitproto.Repo, class string, collapsed bool, identity string, st *staleService) (Outcome, bool) {
 	served := *st
 	served.createdAt = e.sr.Header().CreatedAt
 	res, ok := c.serveOpened(w, e, repo, class, cacheStatus{result: observability.ResultStale, collapsed: collapsed, fwdStatus: st.fwdStatus}, observability.TierDisk)

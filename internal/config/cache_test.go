@@ -442,6 +442,13 @@ func TestCacheConfigValidate(t *testing.T) {
 			mutate:  func(c *CacheConfig) { c.Retention = "30m"; c.StaleIfErrorFor = "1h" },
 			wantErr: `cache: staleIfErrorFor "1h" must not exceed retention "30m"`,
 		},
+		{
+			name:    "staleIfErrorFor with no response header bound",
+			mutate:  func(c *CacheConfig) { c.StaleIfErrorFor = "1h"; c.ResponseHeaderTimeout = "0s" },
+			wantErr: "cache: staleIfErrorFor requires a non-zero responseHeaderTimeout; with no header bound a hung upstream would hold requests indefinitely",
+		},
+		{name: "staleIfErrorFor with an unset response header bound", mutate: func(c *CacheConfig) { c.StaleIfErrorFor = "1h"; c.ResponseHeaderTimeout = "" }},
+		{name: "no response header bound without staleIfErrorFor", mutate: func(c *CacheConfig) { c.StaleIfErrorFor = "0s"; c.ResponseHeaderTimeout = "0s" }},
 		{name: "staleIfErrorFor zero spelled 0", mutate: func(c *CacheConfig) { c.StaleIfErrorFor = "0" }},
 		{name: "staleIfErrorFor zero spelled 0m", mutate: func(c *CacheConfig) { c.StaleIfErrorFor = "0m" }},
 		{

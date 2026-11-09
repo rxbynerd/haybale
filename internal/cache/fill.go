@@ -58,6 +58,16 @@ const (
 	contentTypeAdvertisement = "application/x-git-upload-pack-advertisement"
 )
 
+// Values of fill.headerCut.
+const (
+	headerCutNone uint32 = iota
+	// headerCutTimeout: the response-header timeout expired.
+	headerCutTimeout
+	// headerCutProbe: the probe deadline of a gate probe holding a
+	// qualifying stale entry expired.
+	headerCutProbe
+)
+
 // errOversizeGrowth reports that a response outgrew the entry size limit
 // and the free disk budget could not hold the rest of it.
 var errOversizeGrowth = errors.New("cache: response exceeds the entry size limit and the free budget")
@@ -118,9 +128,10 @@ type fill struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	abandoned atomic.Bool
-	// headerTimedOut records that the response-header timeout cancelled
-	// the upstream request.
-	headerTimedOut atomic.Bool
+	// headerCut records which timer, if any, cancelled the upstream
+	// request before its response headers arrived: headerCutTimeout or
+	// headerCutProbe.
+	headerCut atomic.Uint32
 
 	spool       *spool
 	headerReady chan struct{}
@@ -204,35 +215,52 @@ func (f *fill) perform() {
 	if f.remoteEligible() && f.fillFromRemote(nil) {
 		return
 	}
+	probing := false
 	if f.c.staleEnabled() {
 		held, probe := f.c.gates.admit(f.repo.Host, f.c.now())
-		if probe {
-			defer f.c.gates.endProbe(f.repo.Host)
-		}
 		if held && f.serveStale(upstreamResult{eligible: true, reason: staleReasonHealthGate}, fillOutcome{kind: fillReleased}, "") {
 			return
 		}
+		probing = probe
 	}
+	// The probe ends once upstream headers or the fetch error arrive, not
+	// when the body has streamed, so a newer failure can admit the next.
+	endProbe := func() {
+		if probing {
+			probing = false
+			f.c.gates.endProbe(f.repo.Host)
+		}
+	}
+	defer endProbe()
+	probeDeadline := probing && f.holdsStaleEntry()
 	// A refs fill from upstream renews the repository's access record, so
 	// the purge marker is checked first, alongside the upstream request.
 	purge := f.startPurgeCheck()
 	defer purge.wait()
-	resp, done, err := f.fetchHeaders()
+	started := f.c.now()
+	resp, done, err := f.fetchHeaders(probeDeadline)
 	if err != nil {
 		// The error is not logged: a credential source's error may carry
 		// upstream response bytes.
 		f.logger().Debug("upstream fetch failed")
-		res := classifyFetchError(err, f.headerTimedOut.Load())
-		if f.ctx.Err() != nil {
-			res = upstreamResult{}
+		var res upstreamResult
+		switch {
+		case f.ctx.Err() != nil:
+			// A cancelled fill's dial error says nothing about upstream.
+		case f.headerCut.Load() == headerCutProbe:
+			res = upstreamResult{eligible: true, reason: staleReasonHealthGate}
+		default:
+			res = classifyFetchError(err, f.headerCut.Load() == headerCutTimeout)
 		}
-		f.reportHealth(res)
+		f.reportHealth(res, started)
+		endProbe()
 		f.releaseOrServeStale(res, observability.FillReasonFetchError)
 		return
 	}
 	defer done()
 	res := classifyStatus(upstreamStatus(resp))
-	f.reportHealth(res)
+	f.reportHealth(res, started)
+	endProbe()
 	body := newIdleReader(resp.Body, f.c.opts.IdleTimeout, f.cancel)
 	defer func() { _ = body.Close() }()
 
@@ -259,16 +287,25 @@ func (f *fill) perform() {
 
 // fetchHeaders performs the upstream round trip under a context of its
 // own, cancelled if response headers do not arrive within the
-// response-header timeout. The timer is stopped once headers arrive so
-// the body is not bounded by it. The caller calls done once it has
-// finished with the body.
-func (f *fill) fetchHeaders() (resp *http.Response, done context.CancelFunc, err error) {
+// response-header timeout or, with probeDeadline set, within the gate's
+// probe interval, whichever expires first; headerCut records which. The
+// timers are stopped once headers arrive so the body is not bounded by
+// them. The caller calls done once it has finished with the body.
+func (f *fill) fetchHeaders(probeDeadline bool) (resp *http.Response, done context.CancelFunc, err error) {
 	ctx, cancel := context.WithCancel(f.ctx)
+	cut := func(reason uint32) func() {
+		return func() {
+			if f.headerCut.CompareAndSwap(headerCutNone, reason) {
+				cancel()
+			}
+		}
+	}
 	if t := f.c.opts.ResponseHeaderTimeout; t > 0 {
-		timer := time.AfterFunc(t, func() {
-			f.headerTimedOut.Store(true)
-			cancel()
-		})
+		timer := time.AfterFunc(t, cut(headerCutTimeout))
+		defer timer.Stop()
+	}
+	if probeDeadline {
+		timer := time.AfterFunc(f.c.gates.interval, cut(headerCutProbe))
 		defer timer.Stop()
 	}
 	resp, err = f.fetch.Fetch(ctx, f.req)
@@ -312,12 +349,23 @@ func (f *fill) share(resp *http.Response, body io.Reader, res upstreamResult) {
 	f.setOutcome(shared)
 }
 
-// reportHealth applies the fill's upstream result to its host's health
-// gate while stale-if-error is enabled.
-func (f *fill) reportHealth(res upstreamResult) {
+// reportHealth applies the result of the fill's upstream request, begun
+// at started, to its host's health gate while stale-if-error is enabled.
+func (f *fill) reportHealth(res upstreamResult, started time.Time) {
 	if f.c.staleEnabled() {
-		f.c.gates.report(f.repo.Host, res, f.c.now())
+		f.c.gates.report(f.repo.Host, res, started, f.c.now())
 	}
+}
+
+// holdsStaleEntry reports whether the fill's key has a tier-1 entry that
+// stale service could answer with.
+func (f *fill) holdsStaleEntry() bool {
+	e := f.c.openStaleEntry(f.key, f.repo, string(f.req.Class))
+	if e == nil {
+		return false
+	}
+	e.close()
+	return true
 }
 
 // releaseOrServeStale answers the fill's subscribers from a stale entry

@@ -7,7 +7,9 @@ import (
 )
 
 // healthProbeInterval is how long an open health gate waits after its
-// last probe before it lets another request reach upstream as a probe.
+// last probe before it lets another request reach upstream as a probe,
+// and how long a probe that holds a qualifying stale entry waits for
+// upstream response headers.
 const healthProbeInterval = 5 * time.Second
 
 // gateSignal is what one upstream result tells its host's health gate.
@@ -25,13 +27,16 @@ const (
 // healthGates holds a health gate per upstream host. A gate opens when a
 // fill for the host cannot connect or the credential source reports its
 // API unavailable, failures a client cannot induce. While it is open, a
-// fill with a qualifying stale entry is answered from it without
+// request with a qualifying stale entry is answered from it without
 // contacting upstream, except for one probe at a time, admitted at most
-// once per healthProbeInterval. Fills without a stale entry still go
-// upstream. Any upstream answer other than an eligible 5xx closes the
-// gate. Gates exist only while stale-if-error is enabled.
+// once per interval. Requests without a stale entry still go upstream.
+// Any upstream answer other than an eligible 5xx closes the gate, and a
+// connect failure of an attempt that began before the latest success is
+// ignored. Gates exist only while stale-if-error is enabled.
 type healthGates struct {
 	logger *slog.Logger
+	// interval is the probe interval; New sets it to healthProbeInterval.
+	interval time.Duration
 
 	mu    sync.Mutex
 	hosts map[string]*healthGate
@@ -42,13 +47,25 @@ type healthGate struct {
 	probing bool
 	// lastProbe is when the gate opened or last admitted a probe.
 	lastProbe time.Time
+	// lastSuccess is when an upstream request for the host last
+	// succeeded.
+	lastSuccess time.Time
+}
+
+// held reports whether a request for host at now would be held by its
+// gate: the gate is open and no probe is due. It admits no probe.
+func (g *healthGates) held(host string, now time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	h := g.hosts[host]
+	return h != nil && h.open && (h.probing || now.Sub(h.lastProbe) < g.interval)
 }
 
 // admit decides how a fill for host proceeds at now. held is true while
 // the gate is open and the fill is not its probe: the fill should answer
 // from a stale entry without contacting upstream. probe is true when the
-// fill is the gate's probe; its caller must call endProbe once the
-// upstream request has finished.
+// fill is the gate's probe; its caller must call endProbe once upstream
+// response headers or the fetch error have arrived.
 func (g *healthGates) admit(host string, now time.Time) (held, probe bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -56,7 +73,7 @@ func (g *healthGates) admit(host string, now time.Time) (held, probe bool) {
 	switch {
 	case h == nil || !h.open:
 		return false, false
-	case !h.probing && now.Sub(h.lastProbe) >= healthProbeInterval:
+	case !h.probing && now.Sub(h.lastProbe) >= g.interval:
 		h.probing = true
 		h.lastProbe = now
 		return false, true
@@ -74,27 +91,33 @@ func (g *healthGates) endProbe(host string) {
 	}
 }
 
-// report applies the result of an upstream request for host at now.
-func (g *healthGates) report(host string, res upstreamResult, now time.Time) {
+// report applies, at now, the result of an upstream request for host
+// that began at started.
+func (g *healthGates) report(host string, res upstreamResult, started, now time.Time) {
+	if res.signal == gateNeutral {
+		return
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	h := g.hosts[host]
+	if h == nil {
+		if g.hosts == nil {
+			g.hosts = make(map[string]*healthGate)
+		}
+		h = &healthGate{}
+		g.hosts[host] = h
+	}
 	switch res.signal {
 	case gateFailure:
-		if h == nil {
-			if g.hosts == nil {
-				g.hosts = make(map[string]*healthGate)
-			}
-			h = &healthGate{}
-			g.hosts[host] = h
+		if h.open || started.Before(h.lastSuccess) {
+			return
 		}
-		if !h.open {
-			h.open = true
-			h.lastProbe = now
-			g.logger.Info("upstream health gate opened; stale entries answer requests without contacting upstream", "host", host, "reason", res.reason)
-		}
+		h.open = true
+		h.lastProbe = now
+		g.logger.Info("upstream health gate opened; stale entries answer requests without contacting upstream", "host", host, "reason", res.reason)
 	case gateSuccess:
-		if h != nil && h.open {
+		h.lastSuccess = now
+		if h.open {
 			h.open = false
 			g.logger.Info("upstream health gate closed", "host", host)
 		}

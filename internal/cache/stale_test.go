@@ -26,6 +26,13 @@ import (
 // testStaleFor is the stale-if-error age the stale tests configure.
 const testStaleFor = time.Hour
 
+// enableStale turns stale-if-error on with the response-header bound it
+// requires.
+func enableStale(o *Options) {
+	o.StaleIfErrorFor = testStaleFor
+	o.ResponseHeaderTimeout = time.Minute
+}
+
 // handshakeTimeoutError stands in for net/http's unexported TLS handshake
 // timeout error.
 type handshakeTimeoutError struct{}
@@ -256,7 +263,7 @@ func newStaleHarness(t *testing.T, mutate func(*Options)) *staleHarness {
 	logger, logs := newLogCapture()
 	metrics, reader := observability.NewTestMetrics()
 	c, clock := newTestCache(t, func(o *Options) {
-		o.StaleIfErrorFor = testStaleFor
+		enableStale(o)
 		o.ExposeStatus = true
 		o.Logger = logger
 		o.Metrics = metrics
@@ -543,7 +550,7 @@ func TestStaleServiceFromTheRemoteTier(t *testing.T) {
 	seedPeer(t, store, pack)
 	logger, logs := newLogCapture()
 	c, clock, reader := newRemoteTestCache(t, store, func(o *Options) {
-		o.StaleIfErrorFor = testStaleFor
+		enableStale(o)
 		o.ExposeStatus = true
 		o.Logger = logger
 	})
@@ -578,7 +585,7 @@ func TestStaleServiceFromTheRemoteTier(t *testing.T) {
 func TestStaleServiceSkipsRemoteEntriesPastTheBound(t *testing.T) {
 	store := newMemBlobStore()
 	seedPeer(t, store, remotePack(t))
-	c, clock, _ := newRemoteTestCache(t, store, func(o *Options) { o.StaleIfErrorFor = testStaleFor })
+	c, clock, _ := newRemoteTestCache(t, store, enableStale)
 	clock.Advance(testStaleFor + time.Minute)
 	if out, _, _ := serve(c, newCollectWriter(), fetchRequest(t), &failing{status: 502}); out.Result != observability.ResultMiss || out.Status != 502 {
 		t.Errorf("got %+v, want the shared 502", out)
@@ -590,11 +597,10 @@ func TestStaleServiceSkipsRemoteEntriesPastTheBound(t *testing.T) {
 // outage from the remote tier, except for refs created before its own
 // last push to the repository.
 func TestStaleServiceServesRemoteRefs(t *testing.T) {
-	stale := func(o *Options) { o.StaleIfErrorFor = testStaleFor }
 	store := newMemBlobStore()
-	seedPeerWith(t, store, remotePack(t), stale)
+	seedPeerWith(t, store, remotePack(t), enableStale)
 
-	c, clock, _ := newRemoteTestCache(t, store, stale)
+	c, clock, _ := newRemoteTestCache(t, store, enableStale)
 	clock.Advance(time.Minute)
 	rec := newCollectWriter()
 	out, handled, _ := serve(c, rec, postV2(lsRefsBody(t)), &failing{err: errDialRefused})
@@ -603,7 +609,7 @@ func TestStaleServiceServesRemoteRefs(t *testing.T) {
 		t.Fatalf("ls-refs = %+v status %d, want the remote refs served stale", out, status)
 	}
 
-	pushed, pushedClock, _ := newRemoteTestCache(t, store, stale)
+	pushed, pushedClock, _ := newRemoteTestCache(t, store, enableStale)
 	pushedClock.Advance(time.Minute)
 	store.set(func(m *memBlobStore) { m.listErr = errors.New("memblob: 503 SlowDown") })
 	pushed.Invalidate(context.Background(), testRepo, testBaseURL)
@@ -627,5 +633,23 @@ func TestNewRejectsStaleIfErrorForBeyondRetention(t *testing.T) {
 	opts.StaleIfErrorFor = -time.Second
 	if _, err := New(opts); err == nil {
 		t.Error("New with a negative staleIfErrorFor succeeded")
+	}
+}
+
+func TestNewRejectsStaleIfErrorForWithoutAHeaderTimeout(t *testing.T) {
+	opts := Options{
+		Dir: cacheDir(t), Keyring: testKeyring(t), MaxDiskSize: 64 << 20, MaxEntrySize: 8 << 20,
+		MaxConcurrentFills: 1, MaxRequestBody: 1 << 20, Retention: time.Hour, StaleIfErrorFor: time.Hour,
+	}
+	if _, err := New(opts); !errors.Is(err, errStaleNeedsHeaderTimeout) {
+		t.Errorf("New with staleIfErrorFor and no header timeout = %v, want %v", err, errStaleNeedsHeaderTimeout)
+	}
+	opts.StaleIfErrorFor = 0
+	c, err := New(opts)
+	if err != nil {
+		t.Fatalf("New with neither = %v, want success", err)
+	}
+	if err := c.Close(context.Background()); err != nil {
+		t.Errorf("Close: %v", err)
 	}
 }

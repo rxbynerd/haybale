@@ -49,7 +49,8 @@ func TestStaleServiceThroughTheProxy(t *testing.T) {
 	}
 	c, err := cache.New(cache.Options{
 		Dir: dir, Keyring: kr, MaxDiskSize: 16 << 20, MaxEntrySize: 4 << 20, MaxConcurrentFills: 2,
-		MaxRequestBody: 1 << 20, Retention: time.Hour, StaleIfErrorFor: time.Hour, ExposeStatus: true, Logger: logger,
+		MaxRequestBody: 1 << 20, Retention: time.Hour, StaleIfErrorFor: time.Hour, ResponseHeaderTimeout: 5 * time.Second,
+		ExposeStatus: true, Logger: logger,
 	})
 	if err != nil {
 		t.Fatal(err)
