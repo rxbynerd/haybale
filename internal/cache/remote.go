@@ -48,6 +48,9 @@ var (
 	// errRemoteChanged reports that a remote object was replaced while a
 	// fill was reading it, so its bytes cannot be resumed.
 	errRemoteChanged = errors.New("cache: remote object changed during the read")
+	// errRemoteGone reports that a remote object was deleted while a fill
+	// was reading it, for example by a purge or a lifecycle rule.
+	errRemoteGone = errors.New("cache: remote object was deleted during the read")
 	// errRemoteRead reports a remote read that failed before resumes were
 	// enabled or past its resumes. The error that wraps it never wraps the
 	// transport error too, so a short read is not mistaken for a
@@ -422,6 +425,9 @@ func (r *remoteReader) resume() error {
 	case errors.Is(err, ErrObjectChanged):
 		cancel()
 		return errRemoteChanged
+	case errors.Is(err, ErrNotFound):
+		cancel()
+		return errRemoteGone
 	case err != nil:
 		cancel()
 		if cerr := r.ctx.Err(); cerr != nil {

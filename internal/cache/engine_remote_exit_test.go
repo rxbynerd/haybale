@@ -620,3 +620,37 @@ func TestTheHeaderBoundEndsWithTheHeaderRead(t *testing.T) {
 		t.Errorf("Get offsets = %v, want the first body read to its end", got)
 	}
 }
+
+func TestRemoteObjectDeletedDuringTheReadIsNotRetried(t *testing.T) {
+	store := newMemBlobStore()
+	c, logs, pack, key, discarded := newRemoteFillCase(t, store, nil, func(key string, _ []byte) {
+		store.set(func(m *memBlobStore) {
+			m.wrapBody = func(_ context.Context, k string, offset int64, body io.Reader) io.Reader {
+				if k != key || offset != 0 {
+					return body
+				}
+				return io.MultiReader(io.LimitReader(body, 80000), readerFunc(func([]byte) (int, error) {
+					store.set(func(m *memBlobStore) { delete(m.objects, key) })
+					return 0, errCut
+				}))
+			}
+		})
+	})
+	_, _, aborted := serve(c, newCollectWriter(), fetchRequest(t), packFetcher(pack))
+	if !aborted {
+		t.Fatal("the response was not aborted after the object was deleted")
+	}
+	assertStoreIdle(t, c)
+	if got := store.getOffsets(key); fmt.Sprint(got) != "[0 80000]" {
+		t.Errorf("remote Get offsets = %v, want the first Get and one resume", got)
+	}
+	if got := discarded(observability.FillReasonFetchError); got != 1 {
+		t.Errorf("fills discarded with fetch_error = %d, want 1", got)
+	}
+	if got := logs.securityEvents(t, security.EventCacheIntegrityFailed); len(got) != 0 {
+		t.Errorf("integrity events = %v, want none", got)
+	}
+	if n := store.count("delete", key); n != 0 {
+		t.Errorf("remote deletes = %d, want none", n)
+	}
+}
