@@ -196,3 +196,187 @@ func TestNewNoopMetricsRecordsWithoutPanicOrProvider(t *testing.T) {
 		t.Errorf("noop shutdown() error = %v, want nil", err)
 	}
 }
+
+// onlyPoint collects the named Sum[int64] metric and returns its single data
+// point, failing the test if there is not exactly one.
+func onlyPoint(t *testing.T, reader *sdkmetric.ManualReader, name string) metricdata.DataPoint[int64] {
+	t.Helper()
+	points := collectSum(t, reader, name)
+	if len(points) != 1 {
+		t.Fatalf("%s: got %d data points, want 1", name, len(points))
+	}
+	return points[0]
+}
+
+// wantAttrs fails the test unless set holds exactly the want key/value
+// pairs: no missing label and no extra one, so a stray high-cardinality
+// label cannot slip in.
+func wantAttrs(t *testing.T, name string, set attribute.Set, want map[string]string) {
+	t.Helper()
+	if set.Len() != len(want) {
+		t.Errorf("%s: %d attributes (%v), want %d (%v)", name, set.Len(), set.ToSlice(), len(want), want)
+	}
+	for key, value := range want {
+		if got := attrString(set, key); got != value {
+			t.Errorf("%s: attribute %s = %q, want %q", name, key, got, value)
+		}
+	}
+}
+
+func TestRecordResponseCacheLookup(t *testing.T) {
+	t.Parallel()
+	for _, result := range []string{ResultHit, ResultMiss, ResultStale, ResultBypass} {
+		t.Run(result, func(t *testing.T) {
+			t.Parallel()
+			m, reader := newTestMetrics(t)
+			m.RecordResponseCacheLookup(context.Background(), "github.com", "fetch", result)
+
+			dp := onlyPoint(t, reader, "haybale.response_cache.lookups.total")
+			if dp.Value != 1 {
+				t.Errorf("value = %d, want 1", dp.Value)
+			}
+			wantAttrs(t, "lookups", dp.Attributes, map[string]string{
+				attrHost: "github.com", attrClass: "fetch", attrResult: result,
+			})
+		})
+	}
+}
+
+func TestRecordResponseCacheFill(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		result string
+		reason string
+		want   map[string]string
+	}{
+		{
+			name: "stored omits reason", result: FillResultStored,
+			want: map[string]string{attrHost: "github.com", attrClass: "fetch", attrResult: FillResultStored},
+		},
+		{
+			name: "discarded carries reason", result: FillResultDiscarded, reason: FillReasonTruncated,
+			want: map[string]string{attrHost: "github.com", attrClass: "fetch", attrResult: FillResultDiscarded, attrReason: FillReasonTruncated},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m, reader := newTestMetrics(t)
+			m.RecordResponseCacheFill(context.Background(), "github.com", "fetch", tt.result, tt.reason)
+
+			dp := onlyPoint(t, reader, "haybale.response_cache.fills.total")
+			if dp.Value != 1 {
+				t.Errorf("value = %d, want 1", dp.Value)
+			}
+			wantAttrs(t, "fills", dp.Attributes, tt.want)
+		})
+	}
+}
+
+func TestRecordResponseCacheBytes(t *testing.T) {
+	t.Parallel()
+	m, reader := newTestMetrics(t)
+	ctx := context.Background()
+	m.RecordResponseCacheFillBytes(ctx, "github.com", "fetch", TierUpstream, 1000)
+	m.RecordResponseCacheFillBytes(ctx, "github.com", "fetch", TierUpstream, 24)
+	m.RecordResponseCacheServedBytes(ctx, "github.com", "advertisement", TierDisk, 4096)
+
+	fill := onlyPoint(t, reader, "haybale.response_cache.fill_bytes.total")
+	if fill.Value != 1024 {
+		t.Errorf("fill_bytes value = %d, want 1024", fill.Value)
+	}
+	wantAttrs(t, "fill_bytes", fill.Attributes, map[string]string{
+		attrHost: "github.com", attrClass: "fetch", attrTier: TierUpstream,
+	})
+
+	served := onlyPoint(t, reader, "haybale.response_cache.served_bytes.total")
+	if served.Value != 4096 {
+		t.Errorf("served_bytes value = %d, want 4096", served.Value)
+	}
+	wantAttrs(t, "served_bytes", served.Attributes, map[string]string{
+		attrHost: "github.com", attrClass: "advertisement", attrTier: TierDisk,
+	})
+}
+
+func TestRecordResponseCacheCollapsed(t *testing.T) {
+	t.Parallel()
+	m, reader := newTestMetrics(t)
+	m.RecordResponseCacheCollapsed(context.Background(), "github.com")
+	m.RecordResponseCacheCollapsed(context.Background(), "github.com")
+
+	dp := onlyPoint(t, reader, "haybale.response_cache.collapsed.total")
+	if dp.Value != 2 {
+		t.Errorf("value = %d, want 2", dp.Value)
+	}
+	wantAttrs(t, "collapsed", dp.Attributes, map[string]string{attrHost: "github.com"})
+}
+
+func TestRecordResponseCacheStoreError(t *testing.T) {
+	t.Parallel()
+	m, reader := newTestMetrics(t)
+	m.RecordResponseCacheStoreError(context.Background(), TierDisk, "open")
+
+	dp := onlyPoint(t, reader, "haybale.response_cache.store_errors.total")
+	if dp.Value != 1 {
+		t.Errorf("value = %d, want 1", dp.Value)
+	}
+	wantAttrs(t, "store_errors", dp.Attributes, map[string]string{attrTier: TierDisk, attrOperation: "open"})
+}
+
+func TestRecordResponseCacheEvictionsHasNoLabels(t *testing.T) {
+	t.Parallel()
+	m, reader := newTestMetrics(t)
+	m.RecordResponseCacheEvictions(context.Background(), 3)
+	m.RecordResponseCacheEvictions(context.Background(), 2)
+
+	dp := onlyPoint(t, reader, "haybale.response_cache.evictions.total")
+	if dp.Value != 5 {
+		t.Errorf("value = %d, want 5", dp.Value)
+	}
+	wantAttrs(t, "evictions", dp.Attributes, map[string]string{})
+}
+
+func TestRecordResponseCacheUpload(t *testing.T) {
+	t.Parallel()
+	m, reader := newTestMetrics(t)
+	m.RecordResponseCacheUpload(context.Background(), "ok")
+
+	dp := onlyPoint(t, reader, "haybale.response_cache.uploads.total")
+	if dp.Value != 1 {
+		t.Errorf("value = %d, want 1", dp.Value)
+	}
+	wantAttrs(t, "uploads", dp.Attributes, map[string]string{attrResult: "ok"})
+}
+
+func TestResponseCacheDiskBytesAddsAndSubtracts(t *testing.T) {
+	t.Parallel()
+	m, reader := newTestMetrics(t)
+	ctx := context.Background()
+	m.ResponseCacheDiskBytesAdd(ctx, 5000)
+	m.ResponseCacheDiskBytesAdd(ctx, 2000)
+	m.ResponseCacheDiskBytesAdd(ctx, -3000)
+
+	dp := onlyPoint(t, reader, "haybale.response_cache.disk_bytes")
+	if dp.Value != 4000 {
+		t.Errorf("disk_bytes value = %d, want 4000 (7000 added, 3000 removed)", dp.Value)
+	}
+}
+
+// TestResponseCacheNoopMetricsRecordWithoutPanic confirms the no-op
+// instance covers every response-cache instrument, so call sites need no
+// nil or enabled checks.
+func TestResponseCacheNoopMetricsRecordWithoutPanic(t *testing.T) {
+	t.Parallel()
+	m := NewNoopMetrics()
+	ctx := context.Background()
+	m.RecordResponseCacheLookup(ctx, "h", "fetch", ResultBypass)
+	m.RecordResponseCacheFill(ctx, "h", "fetch", FillResultDiscarded, FillReasonFetchError)
+	m.RecordResponseCacheFillBytes(ctx, "h", "fetch", TierUpstream, 1)
+	m.RecordResponseCacheServedBytes(ctx, "h", "fetch", TierDisk, 1)
+	m.RecordResponseCacheCollapsed(ctx, "h")
+	m.RecordResponseCacheStoreError(ctx, TierRemote, "get")
+	m.RecordResponseCacheEvictions(ctx, 1)
+	m.RecordResponseCacheUpload(ctx, "ok")
+	m.ResponseCacheDiskBytesAdd(ctx, 1)
+}
