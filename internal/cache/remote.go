@@ -497,10 +497,15 @@ func (c *Cache) enqueueUpload(job uploadJob) {
 }
 
 // runUploads is the body of an upload worker. It returns once the queue is
-// closed and drained.
+// closed and drained. Once Close has cancelled the remote tier's context,
+// each job left is counted as dropped without reaching the store.
 func (c *Cache) runUploads() {
 	defer c.remoteWG.Done()
 	for job := range c.uploads {
+		if c.remoteCtx.Err() != nil {
+			c.metrics.RecordResponseCacheUpload(context.Background(), observability.UploadResultDropped)
+			continue
+		}
 		c.uploadOne(job)
 	}
 }
@@ -522,7 +527,8 @@ func (c *Cache) uploadOne(job uploadJob) {
 // upload stores one committed entry in the remote tier and returns the
 // upload result. A pack entry already present remotely is skipped, since
 // its content is fixed by its key; a refs entry always replaces the
-// remote copy so peers see the latest tips.
+// remote copy so peers see the latest tips. An upload cut short by Close
+// is dropped, not failed.
 func (c *Cache) upload(ctx context.Context, job uploadJob) string {
 	if job.key.Group == GroupRefs && c.gens.current(job.key.RepoHash) != job.gen {
 		return observability.UploadResultSkipped
@@ -536,6 +542,8 @@ func (c *Cache) upload(ctx context.Context, job uploadJob) string {
 		switch {
 		case err == nil:
 			return observability.UploadResultSkipped
+		case c.remoteCtx.Err() != nil:
+			return observability.UploadResultDropped
 		case !errors.Is(err, ErrNotFound):
 			c.remoteError(observability.OperationStat, err)
 			return observability.UploadResultFailed
@@ -547,8 +555,11 @@ func (c *Cache) upload(ctx context.Context, job uploadJob) string {
 	}
 	defer func() { _ = e.Close() }()
 	if err := c.remote.Put(ctx, path, e, e.Size()); err != nil {
-		if errors.Is(err, ErrTooLarge) {
+		switch {
+		case errors.Is(err, ErrTooLarge):
 			return observability.UploadResultTooLarge
+		case c.remoteCtx.Err() != nil:
+			return observability.UploadResultDropped
 		}
 		c.remoteError(observability.OperationPut, err)
 		return observability.UploadResultFailed

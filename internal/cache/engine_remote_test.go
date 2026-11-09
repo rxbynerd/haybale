@@ -1297,6 +1297,46 @@ func TestCloseFlushesPendingUploads(t *testing.T) {
 	}
 }
 
+func TestUploadsLeftAtTheCloseDeadlineAreDropped(t *testing.T) {
+	store := newMemBlobStore()
+	store.set(func(m *memBlobStore) {
+		m.statHook = func(ctx context.Context, _ string) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+	})
+	logger, logs := newLogCapture()
+	c, _, reader := newRemoteTestCache(t, store, func(o *Options) { o.Logger = logger })
+	const queued = uploadWorkers + 5
+	for i := range queued {
+		k := entryKey{Group: GroupPack}
+		binary.BigEndian.PutUint32(k.KeyHash[:], uint32(i)) //nolint:gosec // i is a small test index
+		c.enqueueUpload(uploadJob{key: k, repo: testRepo})
+	}
+	waitFor(t, "every worker to be busy", func() bool { return store.count("stat", "") == uploadWorkers })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := c.Close(ctx); err == nil {
+		t.Fatal("Close returned nil with uploads blocked")
+	}
+	waitFor(t, "every queued upload to be counted", func() bool {
+		return uploadsWith(t, reader, observability.UploadResultDropped) == queued
+	})
+	if got := uploadsWith(t, reader, observability.UploadResultFailed); got != 0 {
+		t.Errorf("failed uploads = %d, want none", got)
+	}
+	if got := remoteStoreErrors(t, reader, observability.OperationStat); got != 0 {
+		t.Errorf("store_errors{operation=stat} = %d, want none", got)
+	}
+	if got := store.count("stat", ""); got != uploadWorkers {
+		t.Errorf("Stats = %d, want only the in-flight uploads'", got)
+	}
+	if got := logs.records(t, "remote cache tier operation failed"); len(got) != 0 {
+		t.Errorf("warnings = %v, want none", got)
+	}
+}
+
 func TestCloseCancelsUploadsAtItsDeadline(t *testing.T) {
 	store := newMemBlobStore()
 	cancelled := make(chan struct{})
