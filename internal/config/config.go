@@ -563,12 +563,10 @@ type CredentialConfig struct {
 // otlpProtocolGRPC and otlpProtocolHTTP are the two OTLP wire protocols
 // Telemetry.Protocol accepts (an empty value means grpc). They are string
 // literals here rather than an import of internal/observability's own
-// ProtocolGRPC/ProtocolHTTP constants deliberately: keeping config free of
-// the OpenTelemetry SDK dependency means a production build of
-// internal/config — and every package that imports it — does not pull in
-// the otel module graph. cmd/haybale/cmd/serve.go is the single seam that
-// bridges this config into internal/observability. If these values ever
-// diverge from observability's ProtocolGRPC/ProtocolHTTP, the (test-only)
+// ProtocolGRPC/ProtocolHTTP constants so the telemetry block stays a plain
+// description of the YAML; cmd/haybale/cmd/serve.go is the seam that
+// bridges it into internal/observability. If these values ever diverge
+// from observability's ProtocolGRPC/ProtocolHTTP, the (test-only)
 // round-trip check TestOTLPProtocolConstantsMatchObservability in
 // telemetry_test.go fails.
 const (
@@ -673,9 +671,21 @@ func Load(path string, opts ...LoadOption) (*Config, error) {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}
 
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	// The document is parsed once into a node tree so the cache block can
+	// be checked for unknown keys, which the field-by-field decode below
+	// tolerates everywhere else.
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
+	}
+	var cfg Config
+	if doc.Kind != 0 {
+		if err := doc.Decode(&cfg); err != nil {
+			return nil, fmt.Errorf("config: parse %s: %w", path, err)
+		}
+	}
+	if err := validateCacheKeys(&doc); err != nil {
+		return nil, fmt.Errorf("config: %s: %w", path, err)
 	}
 
 	for _, opt := range opts {

@@ -148,8 +148,8 @@ func TestCacheConfigApplyDefaults(t *testing.T) {
 	if c.MaxEntrySize != gib {
 		t.Errorf("MaxEntrySize = %s, want 1GiB", c.MaxEntrySize)
 	}
-	if c.MaxConcurrentFills != 32 {
-		t.Errorf("MaxConcurrentFills = %d, want 32", c.MaxConcurrentFills)
+	if c.MaxConcurrentFills != 4 {
+		t.Errorf("MaxConcurrentFills = %d, want 4", c.MaxConcurrentFills)
 	}
 	if c.MaxRequestBody != mib {
 		t.Errorf("MaxRequestBody = %s, want 1MiB", c.MaxRequestBody)
@@ -163,8 +163,11 @@ func TestCacheConfigApplyDefaults(t *testing.T) {
 	if c.AccessRecheck != "5m" {
 		t.Errorf("AccessRecheck = %q, want 5m", c.AccessRecheck)
 	}
-	if c.ResponseHeaderTimeout != "0s" {
-		t.Errorf("ResponseHeaderTimeout = %q, want 0s", c.ResponseHeaderTimeout)
+	if c.ResponseHeaderTimeout != "60s" {
+		t.Errorf("ResponseHeaderTimeout = %q, want 60s", c.ResponseHeaderTimeout)
+	}
+	if c.IdleTimeout != "2m" {
+		t.Errorf("IdleTimeout = %q, want 2m", c.IdleTimeout)
 	}
 	if c.ExposeStatus {
 		t.Error("ExposeStatus = true, want false")
@@ -181,8 +184,11 @@ func TestCacheConfigApplyDefaults(t *testing.T) {
 	if got := c.ParsedAccessRecheck(); got != 5*time.Minute {
 		t.Errorf("ParsedAccessRecheck() = %v, want 5m", got)
 	}
-	if got := c.ParsedResponseHeaderTimeout(); got != 0 {
-		t.Errorf("ParsedResponseHeaderTimeout() = %v, want 0", got)
+	if got := c.ParsedResponseHeaderTimeout(); got != time.Minute {
+		t.Errorf("ParsedResponseHeaderTimeout() = %v, want 1m", got)
+	}
+	if got := c.ParsedIdleTimeout(); got != 2*time.Minute {
+		t.Errorf("ParsedIdleTimeout() = %v, want 2m", got)
 	}
 }
 
@@ -199,6 +205,7 @@ func TestCacheConfigApplyDefaultsKeepsExplicitValues(t *testing.T) {
 		RefsMaxAge:            "10s",
 		AccessRecheck:         "1m",
 		ResponseHeaderTimeout: "60s",
+		IdleTimeout:           "30s",
 	}
 	want := c
 	c.applyDefaults()
@@ -248,13 +255,28 @@ func TestCacheConfigValidate(t *testing.T) {
 				c.RefsMaxAge = "30s"
 				c.AccessRecheck = "10m"
 				c.ResponseHeaderTimeout = "60s"
+				c.IdleTimeout = "0s"
 				c.ExposeStatus = true
 				c.StaleIfErrorFor = "0s"
 			},
 		},
+		{name: "refsMaxAge with accessRecheck disabled", mutate: func(c *CacheConfig) { c.RefsMaxAge = "1h"; c.AccessRecheck = "0s" }},
+		{name: "refsMaxAge below accessRecheck", mutate: func(c *CacheConfig) { c.RefsMaxAge = "4m59s"; c.AccessRecheck = "5m" }},
+		{
+			name:    "refsMaxAge equal to accessRecheck",
+			mutate:  func(c *CacheConfig) { c.RefsMaxAge = "5m"; c.AccessRecheck = "5m" },
+			wantErr: "cache: refsMaxAge \"5m\" must be less than accessRecheck",
+		},
+		{
+			name:    "refsMaxAge above accessRecheck",
+			mutate:  func(c *CacheConfig) { c.RefsMaxAge = "10m" },
+			wantErr: "cache: refsMaxAge \"10m\" must be less than accessRecheck",
+		},
+		{name: "idleTimeout unparseable", mutate: func(c *CacheConfig) { c.IdleTimeout = "2" }, wantErr: "cache: idleTimeout"},
+		{name: "idleTimeout negative", mutate: func(c *CacheConfig) { c.IdleTimeout = "-2m" }, wantErr: "cache: idleTimeout"},
 		{name: "empty staleIfErrorFor", mutate: func(c *CacheConfig) { c.StaleIfErrorFor = "" }},
 		{name: "empty durations accepted as zero", mutate: func(c *CacheConfig) {
-			c.Retention, c.RefsMaxAge, c.AccessRecheck, c.ResponseHeaderTimeout = "", "", "", ""
+			c.Retention, c.RefsMaxAge, c.AccessRecheck, c.ResponseHeaderTimeout, c.IdleTimeout = "", "", "", "", ""
 		}},
 		{name: "entry size equal to disk size", mutate: func(c *CacheConfig) { c.MaxEntrySize = c.MaxDiskSize }},
 		{name: "dir required", mutate: func(c *CacheConfig) { c.Dir = "" }, wantErr: "cache: dir is required"},
@@ -395,6 +417,7 @@ cache:
   refsMaxAge: 15s
   accessRecheck: 10m
   responseHeaderTimeout: 60s
+  idleTimeout: 45s
   exposeStatus: true
   staleIfErrorFor: 0s
 `)
@@ -412,9 +435,10 @@ cache:
 		t.Errorf("MaxConcurrentFills = %d, want 16", c.MaxConcurrentFills)
 	}
 	if c.ParsedRetention() != 48*time.Hour || c.ParsedRefsMaxAge() != 15*time.Second ||
-		c.ParsedAccessRecheck() != 10*time.Minute || c.ParsedResponseHeaderTimeout() != time.Minute {
-		t.Errorf("parsed durations = %v/%v/%v/%v, want 48h/15s/10m/1m",
-			c.ParsedRetention(), c.ParsedRefsMaxAge(), c.ParsedAccessRecheck(), c.ParsedResponseHeaderTimeout())
+		c.ParsedAccessRecheck() != 10*time.Minute || c.ParsedResponseHeaderTimeout() != time.Minute ||
+		c.ParsedIdleTimeout() != 45*time.Second {
+		t.Errorf("parsed durations = %v/%v/%v/%v/%v, want 48h/15s/10m/1m/45s",
+			c.ParsedRetention(), c.ParsedRefsMaxAge(), c.ParsedAccessRecheck(), c.ParsedResponseHeaderTimeout(), c.ParsedIdleTimeout())
 	}
 }
 
@@ -424,11 +448,13 @@ func TestLoadCacheAppliesDefaults(t *testing.T) {
 		t.Fatalf("Load() error = %v, want nil", err)
 	}
 	c := cfg.Cache
-	if c.MaxDiskSize != 10*gib || c.MaxEntrySize != gib || c.MaxConcurrentFills != 32 || c.MaxRequestBody != mib {
-		t.Errorf("defaults = %s/%s/%d/%s, want 10GiB/1GiB/32/1MiB", c.MaxDiskSize, c.MaxEntrySize, c.MaxConcurrentFills, c.MaxRequestBody)
+	if c.MaxDiskSize != 10*gib || c.MaxEntrySize != gib || c.MaxConcurrentFills != 4 || c.MaxRequestBody != mib {
+		t.Errorf("defaults = %s/%s/%d/%s, want 10GiB/1GiB/4/1MiB", c.MaxDiskSize, c.MaxEntrySize, c.MaxConcurrentFills, c.MaxRequestBody)
 	}
-	if c.ParsedRetention() != 24*time.Hour || c.ParsedAccessRecheck() != 5*time.Minute {
-		t.Errorf("parsed retention/accessRecheck = %v/%v, want 24h/5m", c.ParsedRetention(), c.ParsedAccessRecheck())
+	if c.ParsedRetention() != 24*time.Hour || c.ParsedAccessRecheck() != 5*time.Minute ||
+		c.ParsedResponseHeaderTimeout() != time.Minute || c.ParsedIdleTimeout() != 2*time.Minute {
+		t.Errorf("parsed defaults = %v/%v/%v/%v, want 24h/5m/1m/2m",
+			c.ParsedRetention(), c.ParsedAccessRecheck(), c.ParsedResponseHeaderTimeout(), c.ParsedIdleTimeout())
 	}
 }
 
@@ -482,6 +508,11 @@ func TestLoadCacheRejections(t *testing.T) {
 		{"staleIfErrorFor", "cache:\n  enabled: true\n  dir: /c\n  staleIfErrorFor: 1h\n", "cache.staleIfErrorFor is not supported in this release"},
 		{"entry above disk", "cache:\n  enabled: true\n  dir: /c\n  maxDiskSize: 1GiB\n  maxEntrySize: 2GiB\n", "cache: maxEntrySize"},
 		{"negative retention", "cache:\n  enabled: true\n  dir: /c\n  retention: -1h\n", "cache: retention"},
+		{"refsMaxAge not below accessRecheck", "cache:\n  enabled: true\n  dir: /c\n  refsMaxAge: 5m\n", "cache: refsMaxAge"},
+		{"unknown key", "cache:\n  enabled: true\n  dir: /c\n  maxDiskSiez: 1GiB\n", `cache: unknown field "maxDiskSiez" (line`},
+		{"renamed key", "cache:\n  enabled: true\n  dir: /c\n  timeout: 10s\n", `cache: unknown field "timeout"`},
+		{"unknown remote key", "cache:\n  enabled: false\n  remote:\n    timeout: 10s\n", `cache.remote: unknown field "timeout"`},
+		{"unknown key in a disabled block", "cache:\n  enabled: false\n  retentoin: 1h\n", `cache: unknown field "retentoin"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -2,24 +2,35 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"math/big"
+	"os"
+	"reflect"
 	"regexp"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/rxbynerd/haybale/internal/cache"
+	"github.com/rxbynerd/haybale/internal/observability"
 )
 
 // Defaults applied to an enabled CacheConfig by applyDefaults. A disabled
 // block receives none of them and stays inert.
 const (
-	defaultCacheMaxDiskSize           = 10 * gib
-	defaultCacheMaxEntrySize          = 1 * gib
-	defaultCacheMaxConcurrentFills    = 32
+	defaultCacheMaxDiskSize  = 10 * gib
+	defaultCacheMaxEntrySize = 1 * gib
+	// defaultCacheMaxConcurrentFills times defaultCacheMaxEntrySize is
+	// the most that fills in flight can reserve: 4GiB of the 10GiB
+	// budget, leaving the rest for stored entries.
+	defaultCacheMaxConcurrentFills    = 4
 	defaultCacheMaxRequestBody        = 1 * mib
 	defaultCacheRetention             = "24h"
 	defaultCacheRefsMaxAge            = "0s"
 	defaultCacheAccessRecheck         = "5m"
-	defaultCacheResponseHeaderTimeout = "0s"
+	defaultCacheResponseHeaderTimeout = "60s"
+	defaultCacheIdleTimeout           = "2m"
 )
 
 // Binary (IEC) size units, the only units ByteSize accepts.
@@ -128,8 +139,9 @@ type CacheConfig struct {
 	// stream through unstored. It must not exceed MaxDiskSize. Defaults
 	// to 1GiB.
 	MaxEntrySize ByteSize `yaml:"maxEntrySize"`
-	// MaxConcurrentFills bounds simultaneous cache fills. Must be at
-	// least 1. Defaults to 32.
+	// MaxConcurrentFills bounds simultaneous cache fills; a read that
+	// finds no free slot is proxied without the cache. Must be at least
+	// 1. Defaults to 4.
 	MaxConcurrentFills int `yaml:"maxConcurrentFills"`
 	// MaxRequestBody is the largest decoded request body the cache will
 	// inspect; a read with a larger body bypasses the cache. Must be
@@ -146,11 +158,20 @@ type CacheConfig struct {
 	// AccessRecheck is a Go duration string: how long after the last
 	// successful upstream refs response a pack hit is served without
 	// another upstream check. "0s" disables the check. Defaults to "5m".
+	// When both are non-zero, RefsMaxAge must be less than AccessRecheck:
+	// a refs hit does not renew the access record, so a larger RefsMaxAge
+	// would stop packs hitting while refs still hit.
 	AccessRecheck string `yaml:"accessRecheck"`
-	// ResponseHeaderTimeout is a Go duration string bounding how long the
-	// cache's upstream fetches wait for response headers. "0s" (the
-	// default) applies no bound.
+	// ResponseHeaderTimeout is a Go duration string bounding how long a
+	// cache fill waits for the upstream's response headers. "0s" applies
+	// no bound. It does not affect reads proxied without the cache.
+	// Defaults to "60s".
 	ResponseHeaderTimeout string `yaml:"responseHeaderTimeout"`
+	// IdleTimeout is a Go duration string bounding the gap between body
+	// bytes from the upstream during a cache fill. "0s" leaves the gap
+	// unbounded. It does not affect reads proxied without the cache.
+	// Defaults to "2m".
+	IdleTimeout string `yaml:"idleTimeout"`
 	// ExposeStatus makes haybale emit a Cache-Status response header.
 	// Defaults to false.
 	ExposeStatus bool `yaml:"exposeStatus"`
@@ -168,6 +189,7 @@ type CacheConfig struct {
 	parsedRefsMaxAge            time.Duration
 	parsedAccessRecheck         time.Duration
 	parsedResponseHeaderTimeout time.Duration
+	parsedIdleTimeout           time.Duration
 }
 
 // RemoteCacheConfig configures the optional shared remote cache tier,
@@ -188,9 +210,9 @@ type RemoteCacheConfig struct {
 	Endpoint string `yaml:"endpoint"`
 	// ForcePathStyle selects path-style bucket addressing.
 	ForcePathStyle bool `yaml:"forcePathStyle"`
-	// Timeout is a Go duration string bounding each remote operation on
-	// the request path.
-	Timeout string `yaml:"timeout"`
+	// HeaderTimeout is a Go duration string bounding the time to first
+	// byte of a remote read on the request path.
+	HeaderTimeout string `yaml:"headerTimeout"`
 	// SSE is the server-side encryption mode, "AES256" or "aws:kms".
 	SSE string `yaml:"sse"`
 	// KMSKeyID names the KMS key when SSE is "aws:kms".
@@ -217,6 +239,11 @@ func (c CacheConfig) ParsedAccessRecheck() time.Duration { return c.parsedAccess
 func (c CacheConfig) ParsedResponseHeaderTimeout() time.Duration {
 	return c.parsedResponseHeaderTimeout
 }
+
+// ParsedIdleTimeout returns the time.Duration a prior successful call to
+// Config.Validate parsed from IdleTimeout. Zero means "no bound" (or that
+// Validate has not run).
+func (c CacheConfig) ParsedIdleTimeout() time.Duration { return c.parsedIdleTimeout }
 
 // applyDefaults fills in every unset field of an enabled block. A
 // disabled block is left untouched so it stays inert.
@@ -248,6 +275,9 @@ func (c *CacheConfig) applyDefaults() {
 	if c.ResponseHeaderTimeout == "" {
 		c.ResponseHeaderTimeout = defaultCacheResponseHeaderTimeout
 	}
+	if c.IdleTimeout == "" {
+		c.IdleTimeout = defaultCacheIdleTimeout
+	}
 }
 
 // validate fail-fasts on an enabled block that is structurally unusable:
@@ -274,6 +304,7 @@ func (c *CacheConfig) validate() error {
 		{"refsMaxAge", c.RefsMaxAge, &c.parsedRefsMaxAge},
 		{"accessRecheck", c.AccessRecheck, &c.parsedAccessRecheck},
 		{"responseHeaderTimeout", c.ResponseHeaderTimeout, &c.parsedResponseHeaderTimeout},
+		{"idleTimeout", c.IdleTimeout, &c.parsedIdleTimeout},
 	}
 	for _, d := range durations {
 		if d.raw == "" {
@@ -295,6 +326,9 @@ func (c *CacheConfig) validate() error {
 		// more likely a mistake than an intent.
 		return fmt.Errorf("cache: retention %q must be greater than zero", c.Retention)
 	}
+	if c.parsedRefsMaxAge > 0 && c.parsedAccessRecheck > 0 && c.parsedRefsMaxAge >= c.parsedAccessRecheck {
+		return fmt.Errorf("cache: refsMaxAge %q must be less than accessRecheck %q: a refs response served from the cache does not renew the upstream access check cached packs depend on", c.RefsMaxAge, c.AccessRecheck)
+	}
 	if c.MaxEntrySize > c.MaxDiskSize {
 		return fmt.Errorf("cache: maxEntrySize %s must not exceed maxDiskSize %s", c.MaxEntrySize, c.MaxDiskSize)
 	}
@@ -312,4 +346,113 @@ func (c *CacheConfig) validate() error {
 		return fmt.Errorf("cache: cache.staleIfErrorFor is not supported in this release (got %q); leave it empty or \"0s\"", c.StaleIfErrorFor)
 	}
 	return nil
+}
+
+// validateCacheKeys rejects unknown keys in the cache block of a parsed
+// YAML document. The rest of the file tolerates unknown keys, but a
+// mistyped or renamed cache key would otherwise silently revert to its
+// default. doc is the document node Load parsed; a file without a cache
+// block is valid.
+func validateCacheKeys(doc *yaml.Node) error {
+	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
+		doc = doc.Content[0]
+	}
+	block := mappingValue(doc, "cache")
+	if block == nil {
+		return nil
+	}
+	if err := checkKnownKeys(block, reflect.TypeFor[CacheConfig](), "cache"); err != nil {
+		return err
+	}
+	if remote := mappingValue(block, "remote"); remote != nil {
+		return checkKnownKeys(remote, reflect.TypeFor[RemoteCacheConfig](), "cache.remote")
+	}
+	return nil
+}
+
+// mappingValue returns the value node for key in a mapping node, or nil
+// when node is not a mapping or has no such key.
+func mappingValue(node *yaml.Node, key string) *yaml.Node {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
+	return nil
+}
+
+// checkKnownKeys requires every key of the mapping node to name a yaml
+// field of typ. prefix is the block's name for the error.
+func checkKnownKeys(node *yaml.Node, typ reflect.Type, prefix string) error {
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	known := make(map[string]bool, typ.NumField())
+	for i := range typ.NumField() {
+		if tag, _, _ := strings.Cut(typ.Field(i).Tag.Get("yaml"), ","); tag != "" && tag != "-" {
+			known[tag] = true
+		}
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if key := node.Content[i]; !known[key.Value] {
+			return fmt.Errorf("%s: unknown field %q (line %d)", prefix, key.Value, key.Line)
+		}
+	}
+	return nil
+}
+
+// BuildCache constructs the live response cache from a validated block:
+// it reads the key from the environment variable named by KeyEnv, or
+// generates an ephemeral key when KeyEnv is empty, opens the cache
+// directory and starts the janitor. It returns nil, nil when the cache is
+// disabled. It must be called after Validate and only by `haybale
+// serve`; it is deliberately separate from validate so the offline
+// `haybale policy check` never touches the directory or the environment.
+// The caller closes the returned cache after draining in-flight requests.
+func (c CacheConfig) BuildCache(logger *slog.Logger, metrics *observability.Metrics) (*cache.Cache, error) {
+	if !c.Enabled {
+		return nil, nil
+	}
+	var keyring cache.Keyring
+	if c.KeyEnv != "" {
+		raw, ok := os.LookupEnv(c.KeyEnv)
+		if !ok || raw == "" {
+			return nil, fmt.Errorf("cache: environment variable %q (keyEnv) is unset or empty", c.KeyEnv)
+		}
+		key, err := cache.Decode32(raw)
+		if err != nil {
+			// Decode32's errors never include the value.
+			return nil, fmt.Errorf("cache: environment variable %q (keyEnv): %w", c.KeyEnv, err)
+		}
+		keyring, err = cache.NewKeyring(key)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		var err error
+		keyring, err = cache.EphemeralKeyring()
+		if err != nil {
+			return nil, err
+		}
+		logger.Info("cache: keyEnv is not set; entries are sealed under an ephemeral key and the cache will not survive a restart")
+	}
+	return cache.New(cache.Options{
+		Dir:                   c.Dir,
+		Keyring:               keyring,
+		MaxDiskSize:           int64(c.MaxDiskSize),
+		MaxEntrySize:          int64(c.MaxEntrySize),
+		MaxConcurrentFills:    c.MaxConcurrentFills,
+		MaxRequestBody:        int64(c.MaxRequestBody),
+		Retention:             c.parsedRetention,
+		RefsMaxAge:            c.parsedRefsMaxAge,
+		AccessRecheck:         c.parsedAccessRecheck,
+		ResponseHeaderTimeout: c.parsedResponseHeaderTimeout,
+		IdleTimeout:           c.parsedIdleTimeout,
+		ExposeStatus:          c.ExposeStatus,
+		Logger:                logger,
+		Metrics:               metrics,
+	})
 }
