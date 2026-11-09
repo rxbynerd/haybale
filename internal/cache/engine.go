@@ -129,6 +129,9 @@ type fillHooks struct {
 	// beforeOpenReader runs in a subscriber just before it opens the
 	// spool of a streaming fill.
 	beforeOpenReader func(key entryKey)
+	// afterCommittedOpen runs in a subscriber that found the spool
+	// committed, once it has told the fill it opened the entry.
+	afterCommittedOpen func(key entryKey)
 }
 
 // New opens the cache directory, indexes its entries, removes entries
@@ -582,9 +585,14 @@ func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, colla
 	}
 	rd, err := f.spool.NewReader()
 	if errors.Is(err, errSpoolCommitted) {
+		// The entry is opened before readerOpened, which lets the fill
+		// delete an entry a push superseded.
+		e := c.openEntry(f.key, repo, class, false)
 		opened = true
 		f.readerOpened()
-		e := c.openEntry(f.key, repo, class, false)
+		if h := c.hooks.afterCommittedOpen; h != nil {
+			h(f.key)
+		}
 		if e == nil {
 			return c.declined(w, host, class, "fill_ended"), false
 		}

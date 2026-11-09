@@ -201,6 +201,42 @@ func TestPushBetweenGenerationCheckAndCommitDeletesTheEntry(t *testing.T) {
 	assertStoreIdle(t, c)
 }
 
+func TestSubscriberFindingASupersededCommitHoldsTheEntryBeforeItIsDeleted(t *testing.T) {
+	c, _ := newTestCache(t, func(o *Options) { o.RefsMaxAge = time.Minute; o.AccessRecheck = 0 })
+	c.hooks.beforeCommit = func(key entryKey) {
+		if key.Group == GroupRefs {
+			c.Invalidate(context.Background(), testRepo, testBaseURL)
+		}
+	}
+	// The leader reaches the spool only after the fill has ended, so it
+	// finds it committed, and goes on only once the fill has deleted the
+	// entry the push superseded.
+	var fillEnded, entryDeleted bool
+	c.hooks.beforeOpenReader = func(entryKey) {
+		fillEnded = pollFor(func() bool {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			return len(c.fills) == 0
+		})
+	}
+	c.hooks.afterCommittedOpen = func(entryKey) {
+		entryDeleted = pollFor(func() bool { return len(entryFiles(t, c.opts.Dir)) == 0 })
+	}
+	refs := &fixedFetcher{status: 200, contentType: contentTypeAdvertisement, body: advertisementBody(t)}
+	rec := httptest.NewRecorder()
+	out, handled, _ := serve(c, rec, get(), refs)
+	if !fillEnded || !entryDeleted {
+		t.Fatalf("before the leader went on: fill ended %v, entry deleted %v", fillEnded, entryDeleted)
+	}
+	if !handled || out.Result != observability.ResultMiss || out.Stored || !bytes.Equal(rec.Body.Bytes(), refs.body) {
+		t.Fatalf("leader = %+v handled %v, want an unstored miss with the full body", out, handled)
+	}
+	if refs.calls.Load() != 1 {
+		t.Errorf("upstream fetched %d times, want 1", refs.calls.Load())
+	}
+	assertStoreIdle(t, c)
+}
+
 func TestRefsRequestAfterAPushDoesNotJoinAStaleFill(t *testing.T) {
 	c, logs, _ := exitCache(t, func(o *Options) { o.RefsMaxAge = time.Minute })
 	pr, pw := io.Pipe()
