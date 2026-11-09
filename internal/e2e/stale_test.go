@@ -17,6 +17,7 @@ import (
 
 	"github.com/rxbynerd/haybale/internal/cache"
 	"github.com/rxbynerd/haybale/internal/observability"
+	"github.com/rxbynerd/haybale/internal/pktline"
 	"github.com/rxbynerd/haybale/internal/policy"
 	"github.com/rxbynerd/haybale/internal/proxy"
 )
@@ -186,7 +187,9 @@ type staleHarness struct {
 	token    string
 }
 
-func newStaleHarness(t *testing.T) *staleHarness {
+// newStaleHarness builds the harness; mutate, when given, adjusts the
+// cache options first.
+func newStaleHarness(t *testing.T, mutate ...func(*cache.Options)) *staleHarness {
 	t.Helper()
 	gitPath, httpBackendPath := requireGit(t)
 	projectRoot := t.TempDir()
@@ -214,7 +217,7 @@ func newStaleHarness(t *testing.T) *staleHarness {
 		t.Fatal(err)
 	}
 	clock := &manualClock{t: time.Now()}
-	c, err := cache.New(cache.Options{
+	opts := cache.Options{
 		Dir:                   filepath.Join(t.TempDir(), "cache"),
 		Keyring:               kr,
 		MaxDiskSize:           256 << 20,
@@ -230,7 +233,11 @@ func newStaleHarness(t *testing.T) *staleHarness {
 		Logger:                logger,
 		Metrics:               observability.NewNoopMetrics(),
 		Now:                   clock.Now,
-	})
+	}
+	for _, m := range mutate {
+		m(&opts)
+	}
+	c, err := cache.New(opts)
 	if err != nil {
 		t.Fatalf("cache.New(): %v", err)
 	}
@@ -386,6 +393,89 @@ func TestStaleIfErrorAnswersAnUpstream5xx(t *testing.T) {
 	logs := waitForLogSubstring(h.logs, `"cache":"stale"`)
 	if strings.Contains(logs, "upstream health gate opened") {
 		t.Error("an upstream 503 opened the health gate")
+	}
+}
+
+// TestStaleIfErrorAnswersAClonePastTheProbeWithTheSlotHeld: with the only
+// pack fill slot held by an uncached fetch stuck on an upstream that
+// accepts connections but never answers, a clone that arrives once a probe
+// is due is answered stale within the probe deadline instead of waiting on
+// that upstream.
+func TestStaleIfErrorAnswersAClonePastTheProbeWithTheSlotHeld(t *testing.T) {
+	h := newStaleHarness(t, func(o *cache.Options) { o.MaxConcurrentFills = 1 })
+	h.clone(t, repoName)
+	h.upstream.stop()
+	h.clock.Advance(pastAccessRecheck)
+	h.clone(t, repoName)
+	h.upstream.hang(t)
+	defer h.upstream.closeHang()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stuck := make(chan struct{})
+	go func() {
+		defer close(stuck)
+		body := pktStream(t, "command=fetch\n", pktline.Delim, "want aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "done\n", pktline.Flush)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.baseURL+"/"+hostKey+"/"+owner+"/"+repoName+".git/git-upload-pack", strings.NewReader(body))
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		req.SetBasicAuth("haybale-e2e", h.token)
+		req.Header.Set("Content-Type", "application/x-git-upload-pack-request")
+		req.Header.Set("Git-Protocol", "version=2")
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for h.upstream.accepted.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the uncached fetch never reached the hung upstream")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	h.clock.Advance(pastProbeInterval)
+	mark := h.statuses.count()
+	// Each response moves the clock past the probe interval, as the probe
+	// deadline does in real time, so every request of the clone finds a
+	// probe due unless one is still in flight.
+	stopAdvancing := make(chan struct{})
+	advancing := make(chan struct{})
+	go func() {
+		defer close(advancing)
+		seen := mark
+		for {
+			select {
+			case <-stopAdvancing:
+				return
+			case <-time.After(time.Millisecond):
+			}
+			if n := h.statuses.count(); n > seen {
+				seen = n
+				h.clock.Advance(pastProbeInterval)
+			}
+		}
+	}()
+	start := time.Now()
+	h.clone(t, repoName)
+	close(stopAdvancing)
+	<-advancing
+	if elapsed := time.Since(start); elapsed > staleHeaderTimeout/3 {
+		t.Errorf("clone with the slot held took %v, want about the probe deadline", elapsed)
+	}
+	h.wantStatuses(t, mark,
+		"GET refs haybale; hit; fwd=stale",
+		"POST git-upload-pack haybale; hit; fwd=stale",
+		"POST git-upload-pack haybale; hit; fwd=stale",
+	)
+	cancel()
+	h.upstream.closeHang()
+	select {
+	case <-stuck:
+	case <-time.After(10 * time.Second):
+		t.Error("the uncached fetch never finished")
 	}
 }
 
