@@ -637,12 +637,11 @@ func remotePermanentError(e *s3store.Error) bool {
 		"NoCredentials", "TLSVerificationFailed":
 		return true
 	}
-	switch {
-	case e.Status == http.StatusRequestTimeout || e.Status == http.StatusTooManyRequests:
+	switch e.Status {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests:
 		return false
-	default:
-		return e.Status >= 300 && e.Status < 500
 	}
+	return e.Status >= 300 && e.Status < 500
 }
 
 // BuildCache constructs the live response cache from a validated block:

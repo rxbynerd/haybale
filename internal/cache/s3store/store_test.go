@@ -854,7 +854,7 @@ func TestNewReportsAMissingProfileWithoutSDKText(t *testing.T) {
 
 func writeFile(t *testing.T, path, data string) {
 	t.Helper()
-	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil { //nolint:gosec // G703: test paths under t.TempDir
 		t.Fatal(err)
 	}
 }

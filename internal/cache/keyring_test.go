@@ -138,9 +138,13 @@ func TestPathHashIsKeyedAndStable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	again, err := NewKeyring(testKey(1))
+	if err != nil {
+		t.Fatal(err)
+	}
 	digest := sha256.Sum256([]byte("fetch request"))
-	if a.pathHash(digest) != a.pathHash(digest) {
-		t.Error("pathHash is not stable under one key")
+	if a.pathHash(digest) != again.pathHash(digest) {
+		t.Error("pathHash differs between keyrings of one key")
 	}
 	if a.pathHash(digest) == b.pathHash(digest) {
 		t.Error("pathHash is the same under two keys")
