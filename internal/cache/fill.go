@@ -135,6 +135,10 @@ type fill struct {
 	idle          *time.Timer
 	noPending     chan struct{}
 	pendingClosed bool
+
+	// dropEntry marks a committed refs entry that a push superseded. It is
+	// deleted by releaseSpool once pending subscribers have opened it.
+	dropEntry bool
 }
 
 func (c *Cache) newFill(key entryKey, req Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher, shared bool) *fill {
@@ -351,8 +355,10 @@ func (f *fill) streamBody(contentLength int64, body io.Reader) {
 
 // commit stores the spool. The body is complete and readable by then, so
 // a commit failure is a discard, not an abort. A refs entry committed
-// after a push bumped the repository's generation is deleted again,
-// since it may carry the pre-push tips.
+// after a push bumped the repository's generation may carry the pre-push
+// tips, so it is deleted again, but only once every subscriber attached
+// to this fill has opened it: they are still served the bytes upstream
+// sent them.
 func (f *fill) commit() {
 	if h := f.c.hooks.beforeCommit; h != nil {
 		h(f.key)
@@ -363,7 +369,7 @@ func (f *fill) commit() {
 		return
 	}
 	if f.key.Group == GroupRefs && f.c.gens.current(f.key.RepoHash) != f.gen {
-		_ = f.spool.DeleteEntry()
+		f.dropEntry = true
 		f.finish(observability.FillResultDiscarded, observability.FillReasonGeneration, 0)
 		return
 	}
@@ -527,11 +533,17 @@ func (f *fill) end() {
 	f.cancel()
 }
 
-// releaseSpool removes a discarded spool once every subscriber attached
-// before the fill ended has opened it or left, or the grace period has
-// passed. Committed and failed spools need nothing here.
+// releaseSpool removes a discarded spool, or deletes the entry of a
+// commit that a push superseded, once every subscriber attached before
+// the fill ended has opened it or left, or the grace period has passed.
+// Readers that already hold the file keep reading it. Stored and failed
+// spools need nothing here.
 func (f *fill) releaseSpool() {
-	if f.spool == nil || !f.spool.discarded() {
+	if f.spool == nil {
+		return
+	}
+	discarded := f.spool.discarded()
+	if !discarded && !f.dropEntry {
 		return
 	}
 	timer := time.NewTimer(lateSubscriberGrace)
@@ -541,7 +553,11 @@ func (f *fill) releaseSpool() {
 	case <-timer.C:
 		f.logger().Warn("subscribers did not open the spool in time; releasing it")
 	}
-	f.spool.Release()
+	if discarded {
+		f.spool.Release()
+		return
+	}
+	_ = f.spool.DeleteEntry()
 }
 
 // attachLocked adds a subscriber. Cache.mu must be held.
