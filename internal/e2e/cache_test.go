@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rxbynerd/haybale/internal/observability"
 	"github.com/rxbynerd/haybale/internal/pktline"
 	"github.com/rxbynerd/haybale/internal/policy"
 )
@@ -259,7 +260,7 @@ func TestPolicyDeniedRequestWithCacheEnabled(t *testing.T) {
 		{Identities: []string{testID}, Repos: []string{repoKey(hostKey, owner, "some-other-repo")}, Permissions: readOnly},
 	})
 	creds := credentialsForHost(t, hostKey, upstreamBasicAuthUsername, upstreamBasicAuthToken)
-	c, cacheDir := newTestCache(t, cacheSettings{})
+	c, cacheDir := newTestCache(t, cacheSettings{}, observability.NewNoopMetrics())
 	haybale := mustNewProxyWithCache(t, upstreamURL, creds, auth, eng, c)
 	haybaleSrv := newServer(t, haybale)
 
@@ -372,11 +373,11 @@ func TestCacheStatusHeader(t *testing.T) {
 	})
 }
 
-// TestTinyDiskBudgetBypassesLargeClone: a pack larger than maxEntrySize is
+// TestOversizePackIsServedButNotStored: a pack larger than maxEntrySize is
 // streamed to the first clone through the spool but not stored, and the
 // key is marked so the second clone passes straight through; both
 // succeed.
-func TestTinyDiskBudgetBypassesLargeClone(t *testing.T) {
+func TestOversizePackIsServedButNotStored(t *testing.T) {
 	h := newCacheHarness(t, cacheSettings{maxDiskSize: 2 << 20, maxEntrySize: 64 << 10}, bareRepoOptions{blobBytes: 300 << 10}, readOnly)
 
 	for i := range 2 {
@@ -389,6 +390,148 @@ func TestTinyDiskBudgetBypassesLargeClone(t *testing.T) {
 	}
 	if packs := h.packEntries(t); len(packs) != 0 {
 		t.Errorf("pack entries = %v, want none for an oversize pack", packs)
+	}
+	if got := h.fillsDiscarded(t, observability.FillReasonTooLarge); got != 1 {
+		t.Errorf("fills discarded too_large = %d, want 1", got)
+	}
+}
+
+// TestDiskBudgetExhaustedFallsBackToPassthrough: with a disk budget of
+// exactly two entry limits, two pack fills cannot both reserve their
+// sealed size. The second clone, started while the first fill is still
+// receiving its body, passes through instead; both succeed.
+func TestDiskBudgetExhaustedFallsBackToPassthrough(t *testing.T) {
+	h := newCacheHarness(t, cacheSettings{maxDiskSize: 4 << 20, maxEntrySize: 2 << 20}, bareRepoOptions{blobBytes: 100 << 10}, readOnly)
+	held := h.faults.holdNextFetch()
+
+	results := make(chan cloneResult, 1)
+	go func() { results <- cloneOnce(h.gitPath, h.cloneURL, t.TempDir()) }()
+	select {
+	case <-held.started:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the first fetch never reached the upstream")
+	}
+
+	if _, _, sha := h.clone(t, "--depth", "1"); sha != h.headSHA {
+		t.Errorf("second clone HEAD = %s, want %s", sha, h.headSHA)
+	}
+	close(held.release)
+	first := <-results
+	if first.err != nil {
+		t.Fatalf("first clone: %v", first.err)
+	}
+	if first.sha != h.headSHA {
+		t.Errorf("first clone HEAD = %s, want %s", first.sha, h.headSHA)
+	}
+	// The second clone's fill fetched upstream before it found no room
+	// to spool, then released the clone to the passthrough path, which
+	// fetched again.
+	if got := h.upstream.Count(endpointFetch); got != 3 {
+		t.Errorf("upstream fetch requests = %d, want 3", got)
+	}
+	if got := h.fillsDiscarded(t, observability.FillReasonDiskBudget); got != 1 {
+		t.Errorf("fills discarded disk_budget = %d, want 1", got)
+	}
+	if packs := h.packEntries(t); len(packs) != 1 {
+		t.Errorf("pack entries = %v, want the first clone's entry only", packs)
+	}
+}
+
+// TestPackLargerThanDiskBudgetAbortsOnceThenPassesThrough: a pack of
+// unknown length that outgrows the entry limit and then the free budget
+// cannot be served to completion from the spool, so the first clone is
+// aborted and the key marked for the retention period; the next clone
+// passes through and succeeds, and the refs entries stored alongside
+// survive untouched.
+func TestPackLargerThanDiskBudgetAbortsOnceThenPassesThrough(t *testing.T) {
+	// The budget leaves room for the refs fills' own reservations; the
+	// pack still outgrows the entry limit and then the free budget.
+	h := newCacheHarness(t, cacheSettings{maxDiskSize: 4 << 20, maxEntrySize: 256 << 10, refsMaxAge: time.Minute}, bareRepoOptions{blobBytes: 8 << 20}, readOnly)
+
+	env := isolatedGitEnv(t.TempDir())
+	runGitExpectError(t, h.gitPath, t.TempDir(), env, "clone", "--quiet", "-c", "protocol.version=2", h.cloneURL, filepath.Join(t.TempDir(), "clone"))
+	if got := h.fillsDiscarded(t, observability.FillReasonTooLarge); got != 1 {
+		t.Errorf("fills discarded too_large = %d, want 1", got)
+	}
+	refsBefore := h.refsEntries(t)
+	if len(refsBefore) == 0 {
+		t.Fatal("no refs entries were stored by the first clone")
+	}
+
+	if _, _, sha := h.clone(t, "-c", "protocol.version=2"); sha != h.headSHA {
+		t.Errorf("clone after the abort HEAD = %s, want %s", sha, h.headSHA)
+	}
+	if got := h.upstream.Count(endpointFetch); got != 2 {
+		t.Errorf("upstream fetch requests = %d, want 2", got)
+	}
+	if got := h.upstream.Count(endpointLsRefs); got != 1 {
+		t.Errorf("upstream ls-refs requests = %d, want 1: the refs entries must survive the aborted pack fill", got)
+	}
+	if packs := h.packEntries(t); len(packs) != 0 {
+		t.Errorf("pack entries = %v, want none", packs)
+	}
+	if refs := h.refsEntries(t); len(refs) != len(refsBefore) {
+		t.Errorf("refs entries = %v, want the %d stored before", refs, len(refsBefore))
+	}
+}
+
+// TestEncodedUpstreamResponsePassesThrough: an upstream that gzips the
+// pack response despite Accept-Encoding: identity is never streamed from
+// the spool or stored. The first clone's fill releases it to the
+// passthrough path, which relays the encoded response as is, and the
+// marked key sends the second clone straight through.
+func TestEncodedUpstreamResponsePassesThrough(t *testing.T) {
+	h := newCacheHarness(t, cacheSettings{}, bareRepoOptions{}, readOnly)
+	h.faults.gzipFetch.Store(true)
+
+	for i := range 2 {
+		if _, _, sha := h.clone(t, "-c", "protocol.version=2"); sha != h.headSHA {
+			t.Errorf("clone %d HEAD = %s, want %s", i, sha, h.headSHA)
+		}
+	}
+	// The first clone's fill fetched once and released; its passthrough
+	// and the second clone's passthrough fetched once each.
+	if got := h.upstream.Count(endpointFetch); got != 3 {
+		t.Errorf("upstream fetch requests = %d, want 3", got)
+	}
+	if got := h.fillsDiscarded(t, observability.FillReasonEncoding); got != 1 {
+		t.Errorf("fills discarded encoding = %d, want 1", got)
+	}
+	if packs := h.packEntries(t); len(packs) != 0 {
+		t.Errorf("pack entries = %v, want none for an encoded response", packs)
+	}
+}
+
+// TestPushInvalidatesRefsEvenWhenThePusherDisconnects: the upstream
+// applies a push whose response the client never waits for. The refs
+// entries are still invalidated, so the next clone asks upstream for refs
+// and sees the pushed tip.
+func TestPushInvalidatesRefsEvenWhenThePusherDisconnects(t *testing.T) {
+	h := newCacheHarness(t, cacheSettings{refsMaxAge: time.Minute}, bareRepoOptions{}, []policy.Permission{policy.PermissionRead, policy.PermissionWrite})
+
+	dir, env, sha := h.clone(t, "-c", "protocol.version=2")
+	if sha != h.headSHA {
+		t.Fatalf("first clone HEAD = %s, want %s", sha, h.headSHA)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "NEWFILE.md"), []byte("pushed while leaving\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, h.gitPath, dir, env, "add", "NEWFILE.md")
+	runGit(t, h.gitPath, dir, env, "commit", "--quiet", "-m", "add NEWFILE.md")
+	pushed := headOf(t, h.gitPath, dir, env)
+
+	// The upstream applies the push and then withholds the response for
+	// longer than the client's low-speed limit, so git gives up on the
+	// response and disconnects.
+	h.faults.holdReceivePack.Store(int64(3 * time.Second))
+	runGitExpectError(t, h.gitPath, dir, env, "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=1", "push", "--quiet", "origin", "HEAD:main")
+	h.faults.holdReceivePack.Store(0)
+
+	if _, _, sha := h.clone(t, "-c", "protocol.version=2"); sha != pushed {
+		t.Errorf("clone after the push HEAD = %s, want the pushed commit %s (stale refs served)", sha, pushed)
+	}
+	if got := h.upstream.Count(endpointLsRefs); got != 2 {
+		t.Errorf("upstream ls-refs requests = %d, want 2", got)
 	}
 }
 

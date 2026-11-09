@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // upstreamBasicAuthUsername and upstreamBasicAuthToken are the Basic-auth
@@ -163,6 +164,41 @@ type upstreamFaults struct {
 	// of upload-pack's output, with a Content-Length that matches what is
 	// sent, so the HTTP exchange is clean but the pkt-line stream is cut.
 	truncateFetch atomic.Bool
+	// gzipFetch gzips every fetch response and says so with
+	// Content-Encoding, whatever Accept-Encoding the request carried.
+	gzipFetch atomic.Bool
+	// holdReceivePack delays every receive-pack response, headers
+	// included, by this many nanoseconds after the backend has run.
+	holdReceivePack atomic.Int64
+
+	mu   sync.Mutex
+	held *heldFetch
+}
+
+// heldFetch makes one fetch response pause after its first half: started
+// is closed once the half has been flushed and the rest follows once
+// release is closed.
+type heldFetch struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+// holdNextFetch arranges for the next fetch response to pause halfway.
+func (f *upstreamFaults) holdNextFetch() *heldFetch {
+	h := &heldFetch{started: make(chan struct{}), release: make(chan struct{})}
+	f.mu.Lock()
+	f.held = h
+	f.mu.Unlock()
+	return h
+}
+
+// takeHeld returns the pending hold, if any, and clears it.
+func (f *upstreamFaults) takeHeld() *heldFetch {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	h := f.held
+	f.held = nil
+	return h
 }
 
 // newUpstream stands up a real git smart-HTTP server: an httptest server
@@ -207,11 +243,22 @@ func newFaultyUpstream(t *testing.T, httpBackendPath, projectRoot string) (*http
 			return
 		}
 		ep := rec.observe(r)
-		if ep == endpointFetch && faults.truncateFetch.Load() {
+		switch {
+		case ep == endpointFetch && faults.truncateFetch.Load():
 			truncateResponse(w, r, backend)
-			return
+		case ep == endpointFetch && faults.gzipFetch.Load():
+			gzipResponse(w, r, backend)
+		case ep == endpointReceivePack && faults.holdReceivePack.Load() > 0:
+			delayResponse(w, r, backend, time.Duration(faults.holdReceivePack.Load()))
+		default:
+			if ep == endpointFetch {
+				if held := faults.takeHeld(); held != nil {
+					holdResponse(w, r, backend, held)
+					return
+				}
+			}
+			backend.ServeHTTP(w, r)
 		}
-		backend.ServeHTTP(w, r)
 	})
 
 	srv := httptest.NewServer(mux)
@@ -222,15 +269,61 @@ func newFaultyUpstream(t *testing.T, httpBackendPath, projectRoot string) (*http
 // truncateResponse runs next into a buffer and relays its status and
 // headers with only the first half of its body, declaring that length.
 func truncateResponse(w http.ResponseWriter, r *http.Request, next http.Handler) {
+	buf := bufferResponse(w, r, next)
+	body := buf.Body.Bytes()[:buf.Body.Len()/2]
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(buf.Code)
+	_, _ = w.Write(body)
+}
+
+// gzipResponse runs next into a buffer and relays its status and headers
+// with the body gzipped and Content-Encoding set.
+func gzipResponse(w http.ResponseWriter, r *http.Request, next http.Handler) {
+	buf := bufferResponse(w, r, next)
+	var zipped bytes.Buffer
+	zw := gzip.NewWriter(&zipped)
+	_, _ = zw.Write(buf.Body.Bytes())
+	_ = zw.Close()
+	w.Header().Set("Content-Encoding", "gzip")
+	w.Header().Set("Content-Length", strconv.Itoa(zipped.Len()))
+	w.WriteHeader(buf.Code)
+	_, _ = w.Write(zipped.Bytes())
+}
+
+// holdResponse runs next into a buffer, sends the first half of its body
+// with an unknown length, signals held.started, and sends the rest once
+// held.release is closed.
+func holdResponse(w http.ResponseWriter, r *http.Request, next http.Handler, held *heldFetch) {
+	buf := bufferResponse(w, r, next)
+	body := buf.Body.Bytes()
+	w.WriteHeader(buf.Code)
+	_, _ = w.Write(body[:len(body)/2])
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	close(held.started)
+	<-held.release
+	_, _ = w.Write(body[len(body)/2:])
+}
+
+// delayResponse runs next into a buffer and relays it in full after d.
+func delayResponse(w http.ResponseWriter, r *http.Request, next http.Handler, d time.Duration) {
+	buf := bufferResponse(w, r, next)
+	time.Sleep(d)
+	w.Header().Set("Content-Length", strconv.Itoa(buf.Body.Len()))
+	w.WriteHeader(buf.Code)
+	_, _ = w.Write(buf.Body.Bytes())
+}
+
+// bufferResponse runs next into a recorder and copies its headers, except
+// the framing ones, onto w.
+func bufferResponse(w http.ResponseWriter, r *http.Request, next http.Handler) *httptest.ResponseRecorder {
 	buf := httptest.NewRecorder()
 	next.ServeHTTP(buf, r)
-	body := buf.Body.Bytes()[:buf.Body.Len()/2]
 	for k, vs := range buf.Header() {
 		if k != "Content-Length" && k != "Transfer-Encoding" {
 			w.Header()[k] = vs
 		}
 	}
-	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-	w.WriteHeader(buf.Code)
-	_, _ = w.Write(body)
+	return buf
 }

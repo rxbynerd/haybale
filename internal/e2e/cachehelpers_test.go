@@ -11,6 +11,9 @@ import (
 	"testing"
 	"time"
 
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+
 	"github.com/rxbynerd/haybale/internal/cache"
 	"github.com/rxbynerd/haybale/internal/identity"
 	"github.com/rxbynerd/haybale/internal/observability"
@@ -30,7 +33,7 @@ type cacheSettings struct {
 
 // newTestCache opens a response cache on a fresh directory under an
 // ephemeral key, closing it when the test ends.
-func newTestCache(t *testing.T, s cacheSettings) (*cache.Cache, string) {
+func newTestCache(t *testing.T, s cacheSettings, metrics *observability.Metrics) (*cache.Cache, string) {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "cache")
 	kr, err := cache.EphemeralKeyring()
@@ -58,6 +61,7 @@ func newTestCache(t *testing.T, s cacheSettings) (*cache.Cache, string) {
 		IdleTimeout:           time.Minute,
 		ExposeStatus:          s.exposeStatus,
 		Logger:                discardLogger(),
+		Metrics:               metrics,
 	})
 	if err != nil {
 		t.Fatalf("cache.New(): %v", err)
@@ -105,6 +109,7 @@ type cacheHarness struct {
 	inbound   *requestRecorder
 	cache     *cache.Cache
 	cacheDir  string
+	metrics   *sdkmetric.ManualReader
 	serverURL string
 	token     string
 	cloneURL  string
@@ -134,8 +139,9 @@ func newCacheHarness(t *testing.T, settings cacheSettings, repo bareRepoOptions,
 	})
 	creds := credentialsForHost(t, hostKey, upstreamBasicAuthUsername, upstreamBasicAuthToken)
 
-	c, cacheDir := newTestCache(t, settings)
-	haybale, err := proxy.New(map[string]*url.URL{hostKey: upstreamURL}, creds, auth, eng, discardLogger(), observability.NewNoopMetrics(), proxy.WithCache(c))
+	metrics, reader := observability.NewTestMetrics()
+	c, cacheDir := newTestCache(t, settings, metrics)
+	haybale, err := proxy.New(map[string]*url.URL{hostKey: upstreamURL}, creds, auth, eng, discardLogger(), metrics, proxy.WithCache(c))
 	if err != nil {
 		t.Fatalf("proxy.New() error = %v", err)
 	}
@@ -152,6 +158,7 @@ func newCacheHarness(t *testing.T, settings cacheSettings, repo bareRepoOptions,
 		inbound:   inbound,
 		cache:     c,
 		cacheDir:  cacheDir,
+		metrics:   reader,
 		serverURL: haybaleSrv.URL,
 		token:     token,
 		cloneURL:  withToken(t, haybaleSrv.URL+"/"+hostKey+"/"+owner+"/"+repoName+".git", token),
@@ -218,6 +225,47 @@ func (h *cacheHarness) expectCounts(t *testing.T, infoRefs, lsRefs, fetch int) {
 	if got := h.upstream.Count(endpointFetch); got != fetch {
 		t.Errorf("upstream fetch requests = %d, want %d", got, fetch)
 	}
+}
+
+// fillsDiscarded returns how many fills ended discarded with reason.
+func (h *cacheHarness) fillsDiscarded(t *testing.T, reason string) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := h.metrics.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	var total int64
+	for _, sm := range rm.ScopeMetrics {
+		for _, md := range sm.Metrics {
+			if md.Name != "haybale.response_cache.fills.total" {
+				continue
+			}
+			sum, ok := md.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("fills.total is %T", md.Data)
+			}
+			for _, dp := range sum.DataPoints {
+				res, _ := dp.Attributes.Value("haybale.result")
+				why, _ := dp.Attributes.Value("haybale.reason")
+				if res.AsString() == observability.FillResultDiscarded && why.AsString() == reason {
+					total += dp.Value
+				}
+			}
+		}
+	}
+	return total
+}
+
+// refsEntries returns the stored refs entries.
+func (h *cacheHarness) refsEntries(t *testing.T) []string {
+	t.Helper()
+	var refs []string
+	for _, f := range cacheEntries(t, h.cacheDir) {
+		if strings.HasPrefix(f, "v1/refs/") {
+			refs = append(refs, f)
+		}
+	}
+	return refs
 }
 
 // packEntries returns the stored pack entries.
