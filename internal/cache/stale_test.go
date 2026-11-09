@@ -431,10 +431,11 @@ func TestStaleServiceTakesPrecedenceOverTheSharedResponse(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := range subscribers {
 		recs[i] = newCollectWriter()
+		r := fetchRequest(t)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			outs[i], _, _ = serve(h.c, recs[i], fetchRequest(t), fetch)
+			outs[i], _, _ = serve(h.c, recs[i], r, fetch)
 		}()
 		waitForSubscribers(t, h.c, i+1)
 	}
@@ -447,6 +448,9 @@ func TestStaleServiceTakesPrecedenceOverTheSharedResponse(t *testing.T) {
 		}
 		if got := recs[i].Header().Get("Cache-Status"); got != "haybale; hit; fwd=stale; fwd-status=503" {
 			t.Errorf("subscriber %d Cache-Status = %q", i, got)
+		}
+		if outs[i].Collapsed != (i > 0) {
+			t.Errorf("subscriber %d collapsed = %v, want %v", i, outs[i].Collapsed, i > 0)
 		}
 	}
 	if got := len(h.logs.securityEvents(t, security.EventCacheStaleServed)); got != subscribers {

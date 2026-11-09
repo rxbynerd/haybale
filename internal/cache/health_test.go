@@ -130,7 +130,7 @@ func (b *blockingFetch) Fetch(ctx context.Context, _ Request) (*http.Response, e
 // open a key with a stale entry is answered without a fetch, a key
 // without one still goes upstream, one probe reaches upstream after the
 // interval while other requests are held, and the probe's success closes
-// the gate.
+// the gate. The phases share one cache and run in order.
 func TestHealthGateServesStaleWithoutContactingUpstream(t *testing.T) {
 	h := newStaleHarness(t, nil)
 	otherPack := fetchResultBody(t, 2, 50)
@@ -139,71 +139,87 @@ func TestHealthGateServesStaleWithoutContactingUpstream(t *testing.T) {
 	}
 	h.clock.Advance(10 * time.Minute)
 
-	refused := &failing{err: errDialRefused}
-	if out, _, _ := serve(h.c, newCollectWriter(), fetchRequest(t), refused); out.Result != observability.ResultStale {
-		t.Fatalf("refused fetch = %+v, want stale", out)
-	}
-	if got := len(h.logs.records(t, gateOpenedMsg)); got != 1 {
-		t.Fatalf("gate opened logs = %d, want 1", got)
-	}
+	t.Run("a refused connection opens the gate", func(t *testing.T) {
+		refused := &failing{err: errDialRefused}
+		if out, _, _ := serve(h.c, newCollectWriter(), fetchRequest(t), refused); out.Result != observability.ResultStale {
+			t.Fatalf("refused fetch = %+v, want stale", out)
+		}
+		if got := len(h.logs.records(t, gateOpenedMsg)); got != 1 {
+			t.Fatalf("gate opened logs = %d, want 1", got)
+		}
+	})
 
-	untouched := newBlockingFetch(nil)
-	rec := newCollectWriter()
-	out, _, _ := serve(h.c, rec, fetchRequest(t), untouched)
-	if status, body, _ := rec.result(); out.Result != observability.ResultStale || status != 200 || !bytes.Equal(body, h.pack) {
-		t.Fatalf("held request = %+v status %d, want the stale pack", out, status)
-	}
-	if untouched.calls.Load() != 0 {
-		t.Errorf("held request fetched %d times, want none", untouched.calls.Load())
-	}
-	if got := rec.Header().Get("Cache-Status"); got != "haybale; hit; fwd=stale" {
-		t.Errorf("held Cache-Status = %q, want the stale form without fwd-status", got)
-	}
-	events := h.logs.securityEvents(t, security.EventCacheStaleServed)
-	if last := events[len(events)-1]; last["reason"] != staleReasonHealthGate || last["identity"] != testIdentity {
-		t.Errorf("held event = %v, want reason %s for the identity", last, staleReasonHealthGate)
-	}
+	t.Run("a key with an entry is held", func(t *testing.T) {
+		untouched := &failing{err: errDialRefused}
+		rec := newCollectWriter()
+		out, _, _ := serve(h.c, rec, fetchRequest(t), untouched)
+		if status, body, _ := rec.result(); out.Result != observability.ResultStale || status != 200 || !bytes.Equal(body, h.pack) {
+			t.Fatalf("held request = %+v status %d, want the stale pack", out, status)
+		}
+		if untouched.count() != 0 {
+			t.Errorf("held request fetched %d times, want none", untouched.count())
+		}
+		if got := rec.Header().Get("Cache-Status"); got != "haybale; hit; fwd=stale" {
+			t.Errorf("held Cache-Status = %q, want the stale form without fwd-status", got)
+		}
+		events := h.logs.securityEvents(t, security.EventCacheStaleServed)
+		if last := events[len(events)-1]; last["reason"] != staleReasonHealthGate || last["identity"] != testIdentity {
+			t.Errorf("held event = %v, want reason %s for the identity", last, staleReasonHealthGate)
+		}
+	})
 
-	unseen := &failing{err: errDialRefused}
-	if out, handled, _ := serve(h.c, newCollectWriter(), postV2(fetchBody(t, "want "+oidA+"\n", "done\n")), unseen); handled || unseen.count() != 1 {
-		t.Errorf("unseen key = %+v handled %v fetches %d, want it sent upstream and released", out, handled, unseen.count())
-	}
+	t.Run("a key without an entry goes upstream", func(t *testing.T) {
+		unseen := &failing{err: errDialRefused}
+		if out, handled, _ := serve(h.c, newCollectWriter(), postV2(fetchBody(t, "want "+oidA+"\n", "done\n")), unseen); handled || unseen.count() != 1 {
+			t.Errorf("unseen key = %+v handled %v fetches %d, want it sent upstream and released", out, handled, unseen.count())
+		}
+	})
 
-	h.clock.Advance(healthProbeInterval)
-	probe := newBlockingFetch(func() *http.Response { return response(200, contentTypeResult, h.pack) })
-	probeDone := make(chan Outcome, 1)
-	go func() {
-		out, _, _ := serve(h.c, newCollectWriter(), fetchRequest(t), probe)
-		probeDone <- out
-	}()
-	select {
-	case <-probe.called:
-	case <-time.After(shortly):
-		t.Fatal("the probe never reached upstream")
-	}
-	heldFetch := newBlockingFetch(nil)
-	rec = newCollectWriter()
-	if out, _, _ := serve(h.c, rec, otherFetchRequest(t), heldFetch); out.Result != observability.ResultStale {
-		t.Errorf("request during the probe = %+v, want stale", out)
-	}
-	if _, body, _ := rec.result(); !bytes.Equal(body, otherPack) {
-		t.Errorf("request during the probe served %d bytes, want the second key's entry", len(body))
-	}
-	if heldFetch.calls.Load() != 0 {
-		t.Errorf("request during the probe fetched %d times, want none", heldFetch.calls.Load())
-	}
-	close(probe.release)
-	if out := <-probeDone; out.Result != observability.ResultMiss || !out.Stored {
-		t.Errorf("probe = %+v, want a stored miss", out)
-	}
-	if got := len(h.logs.records(t, gateClosedMsg)); got != 1 {
-		t.Errorf("gate closed logs = %d, want 1", got)
-	}
+	t.Run("one probe while others are held, and its success closes the gate", func(t *testing.T) {
+		h.clock.Advance(healthProbeInterval)
+		probe := newBlockingFetch(func() *http.Response { return response(200, contentTypeResult, h.pack) })
+		probeReq := fetchRequest(t)
+		probeDone := make(chan Outcome, 1)
+		go func() {
+			out, _, _ := serve(h.c, newCollectWriter(), probeReq, probe)
+			probeDone <- out
+		}()
+		select {
+		case <-probe.called:
+		case <-time.After(shortly):
+			t.Fatal("the probe never reached upstream")
+		}
+		heldFetch := &failing{err: errDialRefused}
+		rec := newCollectWriter()
+		if out, _, _ := serve(h.c, rec, otherFetchRequest(t), heldFetch); out.Result != observability.ResultStale {
+			t.Errorf("request during the probe = %+v, want stale", out)
+		}
+		if _, body, _ := rec.result(); !bytes.Equal(body, otherPack) {
+			t.Errorf("request during the probe served %d bytes, want the second key's entry", len(body))
+		}
+		if heldFetch.count() != 0 {
+			t.Errorf("request during the probe fetched %d times, want none", heldFetch.count())
+		}
+		close(probe.release)
+		select {
+		case out := <-probeDone:
+			if out.Result != observability.ResultMiss || !out.Stored {
+				t.Errorf("probe = %+v, want a stored miss", out)
+			}
+		case <-time.After(shortly):
+			t.Fatal("the probe never finished")
+		}
+		if got := len(h.logs.records(t, gateClosedMsg)); got != 1 {
+			t.Errorf("gate closed logs = %d, want 1", got)
+		}
+	})
 
-	after := &failing{status: 503}
-	if out, _, _ := serve(h.c, newCollectWriter(), otherFetchRequest(t), after); out.Result != observability.ResultStale || after.count() != 1 {
-		t.Errorf("after the gate closed = %+v fetches %d, want an upstream attempt answered stale", out, after.count())
-	}
+	t.Run("after the gate closed requests go upstream", func(t *testing.T) {
+		after := &failing{status: 503}
+		if out, _, _ := serve(h.c, newCollectWriter(), otherFetchRequest(t), after); out.Result != observability.ResultStale || after.count() != 1 {
+			t.Errorf("after the gate closed = %+v fetches %d, want an upstream attempt answered stale", out, after.count())
+		}
+	})
 	assertStoreIdle(t, h.c)
 }
 
@@ -238,10 +254,11 @@ func TestHealthGateIsInertWithoutStaleIfError(t *testing.T) {
 	h := newStaleHarness(t, func(o *Options) { o.StaleIfErrorFor = 0 })
 	h.clock.Advance(10 * time.Minute)
 	serve(h.c, newCollectWriter(), fetchRequest(t), &failing{err: errDialRefused})
-	next := &failing{err: errDialRefused}
-	serve(h.c, newCollectWriter(), otherFetchRequest(t), next)
-	if next.count() != 1 {
-		t.Errorf("next request fetched %d times, want it to reach upstream", next.count())
+	h.c.gates.mu.Lock()
+	hosts := len(h.c.gates.hosts)
+	h.c.gates.mu.Unlock()
+	if hosts != 0 {
+		t.Errorf("gates = %d, want none", hosts)
 	}
 	if got := len(h.logs.records(t, gateOpenedMsg)); got != 0 {
 		t.Errorf("gate opened logs = %d, want none", got)

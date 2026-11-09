@@ -172,6 +172,9 @@ type fillHooks struct {
 	// afterFetch runs in a fill once its Fetcher has returned a response,
 	// before the fill claims the response from its header timers.
 	afterFetch func(key entryKey)
+	// beforeStaleOutcome runs in a fill that has found a qualifying
+	// tier-1 entry, before it tells its subscribers to serve it.
+	beforeStaleOutcome func(key entryKey)
 }
 
 // New opens the cache directory, indexes its entries, removes entries
