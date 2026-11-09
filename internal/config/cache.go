@@ -418,12 +418,13 @@ func (c *CacheConfig) applyDefaults() {
 
 // validate fail-fasts on an enabled block that is structurally unusable:
 // a missing dir, a duration that does not parse or is negative, sizes or
-// limits out of range, an invalid remote block or one without keyEnv, or
-// a staleIfErrorFor above retention. It does
-// no filesystem, network or environment access, so `haybale policy check`
-// stays offline; the directory and key are checked when the cache is
-// built. A disabled block is always valid. An empty duration is accepted
-// as zero, as drainTimeout is, since applyDefaults only runs in Load.
+// limits out of range, an invalid remote block or one without keyEnv, a
+// staleIfErrorFor above retention, or a staleIfErrorFor with an explicit
+// zero responseHeaderTimeout. It does no filesystem, network or
+// environment access, so `haybale policy check` stays offline; the
+// directory and key are checked when the cache is built. A disabled block
+// is always valid. An empty duration is accepted as zero, as drainTimeout
+// is, since applyDefaults only runs in Load.
 func (c *CacheConfig) validate() error {
 	if !c.Enabled {
 		return nil

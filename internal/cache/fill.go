@@ -712,7 +712,8 @@ func (f *fill) abort(err error, reason string) {
 // finish records the fill's result once and marks the key uncacheable for
 // markFor when it is positive. A fill cancelled because its subscribers
 // left marks nothing: the next request for the key should start afresh.
-// Nor does a fetch error while stale service is enabled.
+// Nor does a fetch error while stale service is enabled, so the next
+// request for the key can still be answered stale.
 func (f *fill) finish(result, reason string, markFor time.Duration) {
 	if f.finished {
 		return
@@ -723,8 +724,6 @@ func (f *fill) finish(result, reason string, markFor time.Duration) {
 	if f.fetched > 0 {
 		f.c.metrics.RecordResponseCacheFillBytes(ctx, f.repo.Host, string(f.req.Class), f.source, f.fetched)
 	}
-	// With stale service enabled a fetch error leaves the key cacheable,
-	// so the next request for it can still be answered stale.
 	if reason == observability.FillReasonFetchError && f.c.staleEnabled() {
 		markFor = 0
 	}

@@ -53,7 +53,7 @@ type upstreamResult struct {
 // classifyFetchError classifies a Fetcher error. headerTimedOut reports
 // that the fill's response-header timeout cancelled the request. A
 // credential source that could not reach its API, and a connection that
-// failed before any request was sent, are outages: eligible, and they
+// failed before response headers arrived, are outages: eligible, and they
 // open the health gate. A header timeout is eligible but leaves the gate
 // alone, since a slow repository is not an unreachable host. Every other
 // error is neither.
@@ -85,9 +85,10 @@ func classifyStatus(status int) upstreamResult {
 }
 
 // connectFailure reports whether err shows the upstream connection
-// failed before a request could be sent: name resolution, the dial, or
-// the TLS handshake. Errors that may arise after a connection exists,
-// such as a reset or an EOF, are not counted.
+// failed before response headers arrived: name resolution, the dial, the
+// TLS handshake, or a TLS alert on the connection. Other errors that may
+// arise once a connection exists, such as a reset or an EOF, are not
+// counted.
 func connectFailure(err error) bool {
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
