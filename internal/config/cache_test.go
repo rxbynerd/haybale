@@ -387,7 +387,7 @@ func TestCacheConfigValidate(t *testing.T) {
 		{
 			name:    "remote endpoint with a query",
 			mutate:  withRemote(func(r *RemoteCacheConfig) { r.Endpoint = "https://s3.example.com/?x=1" }),
-			wantErr: "must not carry userinfo, a query or a fragment",
+			wantErr: `cache.remote: endpoint "https://s3.example.com" must not carry a query`,
 		},
 		{name: "remote with an empty prefix", mutate: withRemote(func(r *RemoteCacheConfig) { r.Prefix = "" })},
 		{name: "remote prefix with a leading slash", mutate: withRemote(func(r *RemoteCacheConfig) { r.Prefix = "/prod/" })},

@@ -742,7 +742,7 @@ func TestNewValidatesConfig(t *testing.T) {
 		{name: "unsupported scheme", mutate: func(c *Config) { c.Endpoint = "ftp://127.0.0.1" }, wantErr: "must use https"},
 		{name: "relative endpoint", mutate: func(c *Config) { c.Endpoint = "s3.example.com" }, wantErr: "absolute URL"},
 		{name: "endpoint with userinfo", mutate: func(c *Config) { c.Endpoint = "https://user:pass@s3.example.com" }, wantErr: "must not carry userinfo"},
-		{name: "endpoint with query", mutate: func(c *Config) { c.Endpoint = "https://s3.example.com/?x=1" }, wantErr: "must not carry userinfo"},
+		{name: "endpoint with query", mutate: func(c *Config) { c.Endpoint = "https://s3.example.com/?x=1" }, wantErr: "must not carry a query"},
 		{name: "negative header timeout", mutate: func(c *Config) { c.HeaderTimeout = -time.Second }, wantErr: "must not be negative"},
 		{name: "unknown sse", mutate: func(c *Config) { c.SSE = "aws:kms:dsse" }, wantErr: "sse"},
 		{name: "kms key without kms sse", mutate: func(c *Config) { c.SSE, c.KMSKeyID = "AES256", "alias/haybale" }, wantErr: "KMS key id requires"},
@@ -897,5 +897,24 @@ func TestErrorWhenTheServerCertificateIsUntrusted(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "x509") || strings.Contains(err.Error(), "127.0.0.1") {
 		t.Errorf("error %q carries TLS detail", err)
+	}
+}
+
+func TestEndpointErrorsShowOnlySchemeAndHost(t *testing.T) {
+	tests := []struct{ endpoint, part string }{
+		{"https://SECRETTOKEN@s3.example.com", "userinfo"},
+		{"https://user:SECRETPASS@s3.example.com", "userinfo"},
+		{"https://s3.example.com/?X-Amz-Security-Token=SECRETQ", "a query"},
+		{"https://s3.example.com/#SECRETFRAG", "a fragment"},
+	}
+	for _, tt := range tests {
+		err := ValidateEndpoint(tt.endpoint)
+		want := `endpoint "https://s3.example.com" must not carry ` + tt.part
+		if err == nil || err.Error() != want {
+			t.Errorf("ValidateEndpoint(%q) = %v, want %q", tt.endpoint, err, want)
+		}
+		if err != nil && strings.Contains(err.Error(), "SECRET") {
+			t.Errorf("ValidateEndpoint(%q) error %q echoes the secret", tt.endpoint, err)
+		}
 	}
 }

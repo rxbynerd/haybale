@@ -94,25 +94,34 @@ func ValidateDefaultRegion(region string) error {
 }
 
 // ValidateEndpoint requires an absolute https URL, or http for a loopback
-// host, with no credentials, query or fragment. Its errors show the URL
-// with any password redacted.
+// host, with no credentials, query or fragment. An endpoint carrying any
+// of those, which can hold a secret, is shown only as scheme://host.
 func ValidateEndpoint(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return errors.New("endpoint is not a valid URL")
 	}
-	shown := u.Redacted()
+	var part string
 	switch {
-	case u.User != nil || u.RawQuery != "" || u.Fragment != "":
-		return fmt.Errorf("endpoint %q must not carry userinfo, a query or a fragment", shown)
+	case u.User != nil:
+		part = "userinfo"
+	case u.RawQuery != "" || u.ForceQuery:
+		part = "a query"
+	case u.Fragment != "":
+		part = "a fragment"
+	}
+	if part != "" {
+		return fmt.Errorf("endpoint %q must not carry %s", u.Scheme+"://"+u.Host, part)
+	}
+	switch {
 	case u.Host == "":
-		return fmt.Errorf("endpoint %q must be an absolute URL with a host", shown)
+		return fmt.Errorf("endpoint %q must be an absolute URL with a host", raw)
 	case u.Scheme == "https":
 		return nil
 	case u.Scheme == "http" && isLoopbackHost(u.Hostname()):
 		return nil
 	default:
-		return fmt.Errorf("endpoint %q must use https (http is permitted only for a loopback host)", shown)
+		return fmt.Errorf("endpoint %q must use https (http is permitted only for a loopback host)", raw)
 	}
 }
 
