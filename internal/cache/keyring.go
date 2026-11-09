@@ -23,9 +23,14 @@ const KeySize = 32
 // keyIDLen is the length of a key id: hex characters of the key's SHA-256.
 const keyIDLen = 8
 
-// sealingKeyInfo separates the AES-256-GCM sealing key from other uses of
-// the configured cache key, such as the RepoHash HMAC.
-const sealingKeyInfo = "haybale response cache entry sealing v1"
+// sealingKeyInfo separates the master sealing key from other uses of the
+// configured cache key, such as the RepoHash HMAC. entryKeyInfo derives
+// each entry's AES-256-GCM key from the master sealing key and the entry's
+// salt. Both strings are part of the on-disk format.
+const (
+	sealingKeyInfo = "haybale response cache entry sealing v1"
+	entryKeyInfo   = "haybale response cache entry key v1"
+)
 
 // Keyring holds the active cache key. Entries are sealed under it and
 // opened only when their preamble names its id; rotating the key is a cold
@@ -35,7 +40,8 @@ type Keyring struct {
 	active string
 	// key is the raw active cache key, the HMAC key for RepoHash.
 	key []byte
-	// sealing maps a key id to the sealing key derived from that cache key.
+	// sealing maps a key id to the master sealing key derived from that
+	// cache key; entry keys derive from it and a per-entry salt.
 	sealing map[string][KeySize]byte
 }
 
@@ -70,13 +76,22 @@ func (k Keyring) RepoHash(baseURL *url.URL, repo gitproto.Repo) [32]byte {
 	return RepoHash(k.key, baseURL, repo)
 }
 
-// aead returns an AES-256-GCM instance for the key with id.
-func (k Keyring) aead(id string) (cipher.AEAD, bool) {
+// holds reports whether the keyring has the key with id.
+func (k Keyring) holds(id string) bool {
+	_, ok := k.sealing[id]
+	return ok
+}
+
+// aead returns an AES-256-GCM instance for the entry key derived from the
+// key with id and salt. Every entry has its own salt, so entries never
+// share an AES key.
+func (k Keyring) aead(id string, salt []byte) (cipher.AEAD, bool) {
 	sealing, ok := k.sealing[id]
 	if !ok {
 		return nil, false
 	}
-	block, err := aes.NewCipher(sealing[:])
+	entryKey := deriveEntryKey(sealing, salt)
+	block, err := aes.NewCipher(entryKey[:])
 	if err != nil {
 		// A 32-byte key is always a valid AES key.
 		panic(fmt.Sprintf("cache: aes.NewCipher: %v", err))
@@ -88,7 +103,21 @@ func (k Keyring) aead(id string) (cipher.AEAD, bool) {
 	return gcm, true
 }
 
-// deriveKey validates key and returns its id and derived sealing key.
+// deriveEntryKey derives an entry's AES key from a master sealing key and
+// the entry's salt.
+func deriveEntryKey(sealing [KeySize]byte, salt []byte) [KeySize]byte {
+	derived, err := hkdf.Key(sha256.New, sealing[:], salt, entryKeyInfo, KeySize)
+	if err != nil {
+		// Only an invalid hash or length can fail here; both are fixed.
+		panic(fmt.Sprintf("cache: derive entry key: %v", err))
+	}
+	var entryKey [KeySize]byte
+	copy(entryKey[:], derived)
+	return entryKey
+}
+
+// deriveKey validates key and returns its id and derived master sealing
+// key.
 func deriveKey(key []byte) (string, [KeySize]byte, error) {
 	if len(key) != KeySize {
 		return "", [KeySize]byte{}, fmt.Errorf("cache: key must be %d bytes, got %d", KeySize, len(key))

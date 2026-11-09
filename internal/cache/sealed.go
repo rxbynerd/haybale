@@ -13,10 +13,11 @@ import (
 
 // Sealed entry format, version 1. All integers are big-endian.
 //
-//	preamble (21 bytes, clear text)
+//	preamble (37 bytes, clear text)
 //	  magic        4 bytes  "HBCE"
 //	  version      2 bytes  FormatVersion
 //	  key id       8 bytes  lowercase hex, see Keyring.ActiveID
+//	  salt        16 bytes  random per entry; derives the entry key
 //	  nonce prefix 7 bytes  random per entry
 //	header (4096 bytes)
 //	  AES-256-GCM seal of a 4080-byte header record (Header fields, then
@@ -34,8 +35,12 @@ import (
 //	                        prefix || counter || flag 0x01 (final); same
 //	                        associated data
 //
-// The header is encrypted, so repository names and base URLs are not
-// readable without the key. The trailer is the only segment sealed with the
+// Every segment of an entry is sealed under a key derived from the cache
+// key and the entry's salt (see Keyring.aead), so no two entries share an
+// AES key and a repeated nonce prefix across entries reuses no nonce. The
+// salt is authenticated as part of the preamble. The header is encrypted,
+// so repository names and base URLs are not readable without the key. The
+// trailer is the only segment sealed with the
 // final flag and nothing may follow it, so truncation at any offset,
 // reordering, duplication, and splicing segments or headers between
 // entries all fail authentication, and the trailer's length cross-checks
@@ -49,8 +54,9 @@ const (
 	SegmentSize = 64 << 10
 
 	magic             = "HBCE"
+	saltLen           = 16
 	noncePrefixLen    = 7
-	preambleLen       = len(magic) + 2 + keyIDLen + noncePrefixLen
+	preambleLen       = len(magic) + 2 + keyIDLen + saltLen + noncePrefixLen
 	tagLen            = 16
 	frameLen          = 4
 	headerSealedLen   = 4096
@@ -131,13 +137,13 @@ type SealedWriter struct {
 	err     error
 }
 
-// NewSealedWriter writes the preamble and sealed header for h, under kr's
-// active key, to w and returns a writer for the body. Close must be called
-// to write the trailer; without it the entry fails verification.
+// NewSealedWriter writes the preamble and sealed header for h, under a
+// key derived from kr's active key and a fresh salt, to w and returns a
+// writer for the body. Close must be called to write the trailer; without
+// it the entry fails verification.
 func NewSealedWriter(w io.Writer, kr Keyring, h Header) (*SealedWriter, error) {
 	id := kr.ActiveID()
-	gcm, ok := kr.aead(id)
-	if !ok {
+	if !kr.holds(id) {
 		return nil, errors.New("cache: keyring has no active key")
 	}
 	if h.Version != 0 && h.Version != FormatVersion {
@@ -155,17 +161,25 @@ func NewSealedWriter(w io.Writer, kr Keyring, h Header) (*SealedWriter, error) {
 
 	sw := &SealedWriter{
 		w:       w,
-		aead:    gcm,
 		buf:     make([]byte, 0, SegmentSize),
 		out:     make([]byte, 0, frameLen+maxSegmentCTLen),
 		counter: 1,
 	}
+	var salt [saltLen]byte
+	if _, err := rand.Read(salt[:]); err != nil {
+		return nil, fmt.Errorf("cache: generate entry salt: %w", err)
+	}
 	if _, err := rand.Read(sw.prefix[:]); err != nil {
 		return nil, fmt.Errorf("cache: generate nonce prefix: %w", err)
 	}
+	gcm, ok := kr.aead(id, salt[:])
+	if !ok {
+		return nil, errors.New("cache: keyring has no active key")
+	}
+	sw.aead = gcm
 
 	out := make([]byte, 0, headerFixedPrefix)
-	out = appendPreamble(out, id, sw.prefix)
+	out = appendPreamble(out, id, salt, sw.prefix)
 	preamble := out[:preambleLen]
 	nonce := segmentNonce(sw.prefix, 0, flagHeader)
 	out = gcm.Seal(out, nonce[:], record, preamble)
@@ -309,10 +323,11 @@ func NewSealedReader(r io.Reader, kr Keyring) (*SealedReader, error) {
 		return nil, fmt.Errorf("%w: unknown format version %d", ErrIntegrity, v)
 	}
 	id := string(preamble[len(magic)+2 : len(magic)+2+keyIDLen])
-	gcm, ok := kr.aead(id)
-	if !ok {
+	if !kr.holds(id) {
 		return nil, fmt.Errorf("%w: unknown key id", ErrIntegrity)
 	}
+	salt := preamble[len(magic)+2+keyIDLen : len(magic)+2+keyIDLen+saltLen]
+	gcm, _ := kr.aead(id, salt)
 	sr := &SealedReader{
 		r:       r,
 		aead:    gcm,
@@ -320,7 +335,7 @@ func NewSealedReader(r io.Reader, kr Keyring) (*SealedReader, error) {
 		pt:      make([]byte, 0, SegmentSize),
 		counter: 1,
 	}
-	copy(sr.prefix[:], preamble[len(magic)+2+keyIDLen:])
+	copy(sr.prefix[:], preamble[len(magic)+2+keyIDLen+saltLen:])
 
 	nonce := segmentNonce(sr.prefix, 0, flagHeader)
 	record, err := gcm.Open(nil, nonce[:], buf[preambleLen:], preamble)
@@ -427,10 +442,11 @@ func truncated(err error, where string) error {
 	return err
 }
 
-func appendPreamble(dst []byte, keyID string, prefix [noncePrefixLen]byte) []byte {
+func appendPreamble(dst []byte, keyID string, salt [saltLen]byte, prefix [noncePrefixLen]byte) []byte {
 	dst = append(dst, magic...)
 	dst = binary.BigEndian.AppendUint16(dst, FormatVersion)
 	dst = append(dst, keyID...)
+	dst = append(dst, salt[:]...)
 	return append(dst, prefix[:]...)
 }
 
