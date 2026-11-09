@@ -28,8 +28,8 @@ const (
 // fill with a qualifying stale entry is answered from it without
 // contacting upstream, except for one probe at a time, admitted at most
 // once per healthProbeInterval. Fills without a stale entry still go
-// upstream. Any upstream answer closes the gate. Gates exist only while
-// stale-if-error is enabled.
+// upstream. Any upstream answer other than an eligible 5xx closes the
+// gate. Gates exist only while stale-if-error is enabled.
 type healthGates struct {
 	logger *slog.Logger
 

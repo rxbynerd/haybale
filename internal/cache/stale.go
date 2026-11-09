@@ -55,7 +55,8 @@ type upstreamResult struct {
 // failed before any request was sent, are outages: eligible, and they
 // open the health gate. A header timeout is eligible but leaves the gate
 // alone, since a slow repository is not an unreachable host. Every other
-// error, including the fill's own cancellation, is neither.
+// error is neither. A fill that was itself cancelled discards the result,
+// since a cancelled dial looks like a failed one.
 func classifyFetchError(err error, headerTimedOut bool) upstreamResult {
 	switch {
 	case headerTimedOut:
