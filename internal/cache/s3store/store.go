@@ -18,6 +18,7 @@ import (
 	"iter"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -58,11 +59,15 @@ var _ cache.BlobStore = (*Store)(nil)
 
 // New validates cfg and builds a Store. It sends no request; credentials
 // are resolved on first use. ctx bounds loading the SDK's shared
-// configuration.
+// configuration. A custom CA bundle, from AWS_CA_BUNDLE or the selected
+// profile, is refused, as is an AWS_PROFILE naming a missing profile.
 func New(ctx context.Context, cfg Config) (*Store, error) {
 	endpoint, err := cfg.validate()
 	if err != nil {
 		return nil, err
+	}
+	if os.Getenv("AWS_CA_BUNDLE") != "" {
+		return nil, errCABundle
 	}
 	httpClient := newHTTPClient()
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
@@ -72,7 +77,7 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 		awsconfig.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("s3store: loading AWS configuration: %w", err)
+		return nil, configLoadError(err)
 	}
 	if awsCfg.Credentials != nil {
 		awsCfg.Credentials = credentialsProvider{awsCfg.Credentials}
@@ -97,6 +102,35 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 		s.kmsKeyID = aws.String(cfg.KMSKeyID)
 	}
 	return s, nil
+}
+
+var (
+	// errCABundle reports AWS_CA_BUNDLE set. The store's own transport
+	// trusts the system roots only, and the SDK cannot add a bundle to it.
+	errCABundle = errors.New("s3store: AWS_CA_BUNDLE is set, but the remote tier trusts only the system certificate store; " +
+		"unset AWS_CA_BUNDLE and add the CA certificate to the system trust store")
+	// errProfileCABundle reports a ca_bundle in the selected shared
+	// configuration profile, which fails for the same reason.
+	errProfileCABundle = errors.New("s3store: the selected AWS profile sets ca_bundle, but the remote tier trusts only the system certificate store; " +
+		"remove ca_bundle from the profile and add the CA certificate to the system trust store")
+	// errNoProfile reports an AWS_PROFILE naming a profile the shared
+	// configuration files do not hold.
+	errNoProfile = errors.New("s3store: AWS_PROFILE names a profile that does not exist in the shared AWS configuration files")
+)
+
+// configLoadError maps a failure to load the SDK's shared configuration
+// to a static message where the cause is known.
+func configLoadError(err error) error {
+	var noProfile awsconfig.SharedConfigProfileNotExistError
+	switch {
+	case errors.As(err, &noProfile):
+		return errNoProfile
+	// The SDK reports a CA bundle it cannot install as untyped text.
+	case strings.Contains(err.Error(), "custom RootCAs"):
+		return errProfileCABundle
+	default:
+		return fmt.Errorf("s3store: loading AWS configuration: %w", err)
+	}
 }
 
 // credentialsProvider marks every error of the provider it wraps as a

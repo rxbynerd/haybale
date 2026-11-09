@@ -145,3 +145,33 @@ func TestBuildCacheIgnoresAWSEndpointEnvironment(t *testing.T) {
 		t.Errorf("decoy requests = %d, fake probes = %d; want the configured endpoint only", decoyHits.Load(), probeRequests(fake))
 	}
 }
+
+func TestBuildRemoteRefusesAmbientAWSSettingsItCannotHonour(t *testing.T) {
+	tests := map[string]struct {
+		name, value, want string
+	}{
+		"a custom CA bundle": {"AWS_CA_BUNDLE", "/etc/ssl/custom.pem", "unset AWS_CA_BUNDLE and add the CA certificate to the system trust store"},
+		"a missing profile":  {"AWS_PROFILE", "no-such-profile", "AWS_PROFILE names a profile that does not exist"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			s3fake.IsolateAWSEnv(t)
+			fake := s3fake.New(t)
+			c := remoteCacheConfig(t, fake, s3fake.Bucket)
+			t.Setenv(tt.name, tt.value)
+			store, err := c.BuildRemote(context.Background())
+			if err == nil || store != nil {
+				t.Fatalf("BuildRemote = %v, %v; want an error", store, err)
+			}
+			if !strings.HasPrefix(err.Error(), "cache.remote: ") || !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("err = %q, want one containing %q", err, tt.want)
+			}
+			if strings.Contains(err.Error(), "failed to get shared config profile") || strings.Contains(err.Error(), "RootCAs") {
+				t.Errorf("err = %q carries SDK text", err)
+			}
+			if n := len(fake.Requests()); n != 0 {
+				t.Errorf("the fake received %d requests", n)
+			}
+		})
+	}
+}

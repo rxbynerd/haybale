@@ -719,6 +719,58 @@ func TestNewValidatesConfig(t *testing.T) {
 	}
 }
 
+func TestNewRefusesACustomCABundle(t *testing.T) {
+	cases := map[string]struct {
+		setup func(t *testing.T)
+		want  error
+	}{
+		"AWS_CA_BUNDLE": {
+			setup: func(t *testing.T) { t.Setenv("AWS_CA_BUNDLE", filepath.Join(t.TempDir(), "ca.pem")) },
+			want:  errCABundle,
+		},
+		"ca_bundle in the profile": {
+			setup: func(t *testing.T) {
+				bundle := filepath.Join(t.TempDir(), "ca.pem")
+				writeFile(t, bundle, "")
+				writeFile(t, os.Getenv("AWS_CONFIG_FILE"), "[default]\nca_bundle = "+bundle+"\n")
+			},
+			want: errProfileCABundle,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			isolateAWSEnv(t)
+			tc.setup(t)
+			_, err := New(context.Background(), testConfig("http://127.0.0.1:1"))
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("New: err = %v, want %v", err, tc.want)
+			}
+			if !strings.Contains(err.Error(), "system trust store") || strings.Contains(err.Error(), "RootCAs") {
+				t.Errorf("error %q does not give the remedy without SDK text", err)
+			}
+		})
+	}
+}
+
+func TestNewReportsAMissingProfileWithoutSDKText(t *testing.T) {
+	isolateAWSEnv(t)
+	t.Setenv("AWS_PROFILE", "no-such-profile")
+	_, err := New(context.Background(), testConfig("http://127.0.0.1:1"))
+	if !errors.Is(err, errNoProfile) {
+		t.Fatalf("New: err = %v, want %v", err, errNoProfile)
+	}
+	if strings.Contains(err.Error(), "failed to get shared config profile") || strings.Contains(err.Error(), "no-such-profile") {
+		t.Errorf("error %q carries SDK text", err)
+	}
+}
+
+func writeFile(t *testing.T, path, data string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestErrorWhenTheCredentialChainIsEmpty(t *testing.T) {
 	isolateAWSEnv(t)
 	for _, name := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"} {
