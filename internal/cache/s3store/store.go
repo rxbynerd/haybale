@@ -170,14 +170,16 @@ func newHTTPClient() *http.Client {
 }
 
 // Stat returns the size and modification time of key, or an error
-// matching cache.ErrNotFound when it is absent.
+// matching cache.ErrNotFound when it is absent. A HEAD response carries no
+// error body, so Stat also reports a missing bucket as cache.ErrNotFound.
+// Stat makes a single attempt, bounded by the header timeout.
 func (s *Store) Stat(ctx context.Context, key string) (cache.ObjectInfo, error) {
 	reqCtx, headersArrived, release := s.withHeaderTimeout(ctx)
 	defer release()
 	out, err := s.client.HeadObject(reqCtx, &s3.HeadObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(s.prefix + key),
-	})
+	}, singleAttempt)
 	headersArrived()
 	if err != nil {
 		return cache.ObjectInfo{}, wrapError(reqCtx, "stat", key, err)
@@ -193,7 +195,8 @@ func (s *Store) Stat(ctx context.Context, key string) (cache.ObjectInfo, error) 
 // when offset is positive. The returned ObjectInfo carries the whole
 // object's size. Once the response headers arrive the body is governed by
 // ctx alone; the caller must close it. A missing key returns an error
-// matching cache.ErrNotFound.
+// matching cache.ErrNotFound. Get makes a single attempt, so the header
+// timeout bounds it and the caller decides whether to retry.
 func (s *Store) Get(ctx context.Context, key string, offset int64) (io.ReadCloser, cache.ObjectInfo, error) {
 	if offset < 0 {
 		return nil, cache.ObjectInfo{}, fmt.Errorf("s3store: get %s: negative offset %d", key, offset)
@@ -206,7 +209,7 @@ func (s *Store) Get(ctx context.Context, key string, offset int64) (io.ReadClose
 		in.Range = aws.String("bytes=" + strconv.FormatInt(offset, 10) + "-")
 	}
 	reqCtx, headersArrived, release := s.withHeaderTimeout(ctx)
-	out, err := s.client.GetObject(reqCtx, in)
+	out, err := s.client.GetObject(reqCtx, in, singleAttempt)
 	inTime := headersArrived()
 	if err != nil {
 		err = wrapError(reqCtx, "get", key, err)
@@ -228,6 +231,10 @@ func (s *Store) Get(ctx context.Context, key string, offset int64) (io.ReadClose
 	info := cache.ObjectInfo{Key: key, Size: size, ModTime: aws.ToTime(out.LastModified)}
 	return &body{ReadCloser: out.Body, release: release}, info, nil
 }
+
+// singleAttempt disables the SDK's retries for one request. Put, Delete
+// and List keep the SDK's default retryer.
+func singleAttempt(o *s3.Options) { o.RetryMaxAttempts = 1 }
 
 // objectSize returns the full object size from a GetObject response for
 // a read from offset. A ranged read must be answered with a Content-Range

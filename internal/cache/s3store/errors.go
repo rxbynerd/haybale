@@ -139,7 +139,9 @@ func (e *credentialsError) Error() string { return e.err.Error() }
 func (e *credentialsError) Unwrap() error { return e.err }
 
 // isNotFound reports whether e is the service saying the object does not
-// exist. A 404 for a missing bucket is not.
+// exist. An error body names a missing bucket NoSuchBucket, which is not
+// a miss; a HEAD response has no body, so its 404 is a miss whether the
+// key or the bucket is missing.
 func isNotFound(e *Error) bool {
 	switch e.Code {
 	case "NoSuchKey":

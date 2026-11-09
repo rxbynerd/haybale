@@ -719,6 +719,44 @@ func TestNewValidatesConfig(t *testing.T) {
 	}
 }
 
+func TestStatAndGetMakeASingleAttempt(t *testing.T) {
+	isolateAWSEnv(t)
+	if err := os.Unsetenv("AWS_MAX_ATTEMPTS"); err != nil {
+		t.Fatal(err)
+	}
+	fake := s3fake.New(t)
+	s := newStore(t, testConfig(fake.URL()))
+	fake.Intercept(func(w http.ResponseWriter, _ *http.Request) bool {
+		s3fake.WriteError(w, http.StatusServiceUnavailable, "SlowDown", "Please reduce your request rate.")
+		return true
+	})
+	attempts := func(method string) int {
+		n := 0
+		for _, r := range fake.Requests() {
+			if r.Method == method {
+				n++
+			}
+		}
+		return n
+	}
+
+	if _, err := s.Stat(context.Background(), testKey); err == nil {
+		t.Fatal("Stat succeeded against a 503")
+	}
+	if _, _, err := s.Get(context.Background(), testKey, 0); err == nil {
+		t.Fatal("Get succeeded against a 503")
+	}
+	if _, _, err := s.Get(context.Background(), testKey, 10); err == nil {
+		t.Fatal("ranged Get succeeded against a 503")
+	}
+	if got := attempts(http.MethodHead); got != 1 {
+		t.Errorf("HEAD attempts = %d, want 1", got)
+	}
+	if got := attempts(http.MethodGet); got != 2 {
+		t.Errorf("GET attempts = %d, want one per Get", got)
+	}
+}
+
 func TestNewRefusesACustomCABundle(t *testing.T) {
 	cases := map[string]struct {
 		setup func(t *testing.T)
