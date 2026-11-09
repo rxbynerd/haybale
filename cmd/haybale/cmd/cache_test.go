@@ -600,7 +600,7 @@ func TestRunCachePurgeRemoteDeleteFailureStillPurgesLocally(t *testing.T) {
 	})
 	cmd, stdout, _ := newPurgeTestCommand()
 	err := runCachePurge(cmd, f.cfgPath, "github.com/acme/widgets", "", true)
-	if err == nil || !strings.Contains(err.Error(), "--remote: purge the remote tier (1 entry deleted so far)") {
+	if err == nil || !strings.Contains(err.Error(), "--remote: the purge marker was written, but purging the remote tier failed (1 entry deleted so far)") {
 		t.Fatalf("runCachePurge() error = %v, want the remote failure with the count so far", err)
 	}
 	if out := stdout.String(); out != "purged 2 entries\n" {

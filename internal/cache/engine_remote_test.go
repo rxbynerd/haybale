@@ -826,8 +826,9 @@ func TestRemoteBodyFailingVerificationAbortsTheFill(t *testing.T) {
 	lsRefs(t, c, refsFetcher(t))
 	w := newCollectWriter()
 	done := make(chan bool, 1)
+	req, fetcher := fetchRequest(t), packFetcher(pack)
 	go func() {
-		_, _, aborted := serve(c, w, fetchRequest(t), packFetcher(pack))
+		_, _, aborted := serve(c, w, req, fetcher)
 		done <- aborted
 	}()
 	select {
@@ -954,8 +955,9 @@ func TestASlowExpiryDeleteDoesNotDelayTheFallThrough(t *testing.T) {
 	lsRefs(t, c, refsFetcher(t))
 	upstream := packFetcher(pack)
 	done := make(chan Outcome, 1)
+	req := fetchRequest(t)
 	go func() {
-		out, _, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), upstream)
+		out, _, _ := serve(c, httptest.NewRecorder(), req, upstream)
 		done <- out
 	}()
 	select {

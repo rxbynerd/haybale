@@ -122,7 +122,7 @@ func runCachePurge(cmd *cobra.Command, cfgPath, repoArg, groupArg string, remote
 
 	localMissing := false
 	var writeErr error
-	print := func(w io.Writer, format string, args ...any) {
+	report := func(w io.Writer, format string, args ...any) {
 		if _, err := fmt.Fprintf(w, format, args...); err != nil && writeErr == nil {
 			writeErr = err
 		}
@@ -146,16 +146,16 @@ func runCachePurge(cmd *cobra.Command, cfgPath, repoArg, groupArg string, remote
 			switch step {
 			case cache.PurgeStepMarker:
 				if res.MarkerReplaced {
-					print(stderr, "notice: the repository's purge marker failed verification and was replaced\n")
+					report(stderr, "notice: the repository's purge marker failed verification and was replaced\n")
 				}
 			case cache.PurgeStepRemote:
-				print(stdout, "wrote the purge marker and purged %s from the remote tier\n", pluralEntries(res.Remote))
+				report(stdout, "wrote the purge marker and purged %s from the remote tier\n", pluralEntries(res.Remote))
 			case cache.PurgeStepLocal:
 				if localMissing {
-					print(stderr, "notice: cache.dir %q does not exist; there are no local entries to purge\n", cc.Dir)
+					report(stderr, "notice: cache.dir %q does not exist; there are no local entries to purge\n", cc.Dir)
 					return
 				}
-				print(stdout, "purged %s\n", pluralEntries(res.Local))
+				report(stdout, "purged %s\n", pluralEntries(res.Local))
 			}
 		},
 	})
@@ -183,7 +183,7 @@ func purgeCommandError(err error, res cache.PurgeResult) error {
 		case cache.PurgeStepMarker:
 			out = append(out, fmt.Errorf("--remote: write the purge marker (nothing was deleted): %w", pe.Err))
 		case cache.PurgeStepRemote:
-			out = append(out, fmt.Errorf("--remote: purge the remote tier (%s deleted so far): %w", pluralEntries(res.Remote), pe.Err))
+			out = append(out, fmt.Errorf("--remote: the purge marker was written, but purging the remote tier failed (%s deleted so far): %w", pluralEntries(res.Remote), pe.Err))
 		default:
 			out = append(out, fmt.Errorf("purge %s entries (%s purged so far): %w", pe.Group, pluralEntries(res.Local), pe.Err))
 		}

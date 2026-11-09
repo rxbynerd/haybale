@@ -608,8 +608,8 @@ It needs the bucket credentials as well, and the whole run is bounded at five
 minutes. If the marker cannot be written, the command exits non-zero with
 `--remote: write the purge marker (nothing was deleted): ...` and deletes
 nothing. If a deletion from the bucket fails, the command still runs the local
-step, then exits non-zero with `--remote: purge the remote tier (N entries
-deleted so far): ...`. Running the command again is safe in both cases. An
+step, then exits non-zero with `--remote: the purge marker was written, but
+purging the remote tier failed (N entries deleted so far): ...`. Running the command again is safe in both cases. An
 existing marker that fails verification, for example one sealed under another
 key or by a host whose clock ran ahead, is replaced, with `notice: the
 repository's purge marker failed verification and was replaced` on stderr.
