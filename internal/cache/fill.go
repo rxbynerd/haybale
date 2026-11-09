@@ -397,7 +397,7 @@ func (f *fill) commit() {
 	f.stored = true
 	f.c.noteCommit()
 	f.finish(observability.FillResultStored, "", 0)
-	if f.c.remote != nil && f.source == observability.TierUpstream {
+	if f.c.remote != nil && f.source == observability.TierUpstream && f.c.uploadsGroup(f.key.Group) {
 		f.c.enqueueUpload(uploadJob{key: f.key, repo: f.repo, gen: f.gen, createdAt: f.createdAt})
 	}
 }

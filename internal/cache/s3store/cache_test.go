@@ -168,7 +168,8 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-// seedThroughA clones through a first cache so its entries are uploaded.
+// seedThroughA clones through a first cache so its pack is uploaded. At
+// the default refsMaxAge of zero refs entries are not uploaded.
 func seedThroughA(t *testing.T, fake *s3fake.Server, up *upstreamStub) {
 	t.Helper()
 	a := newS3Cache(t, fake)
@@ -176,8 +177,8 @@ func seedThroughA(t *testing.T, fake *s3fake.Server, up *upstreamStub) {
 	if out, _ := serveCache(t, a, cloneRequest(t), up); !out.Stored {
 		t.Fatalf("clone through A = %+v, want a stored miss", out)
 	}
-	waitUntil(t, "A's uploads", func() bool {
-		return len(objectsUnder(fake, "tenant/v1/pack/")) == 1 && len(objectsUnder(fake, "tenant/v1/refs/")) == 1
+	waitUntil(t, "A's pack upload", func() bool {
+		return len(objectsUnder(fake, "tenant/v1/pack/")) == 1
 	})
 }
 
@@ -279,8 +280,8 @@ func TestCachePurgeRemoteWritesAMarkerAndDeletesObjects(t *testing.T) {
 	}
 	store := newStore(t, testConfig(fake.URL()))
 	n, err := cache.PurgeRemote(context.Background(), store, kr, cacheTestRepo, cacheTestBaseURL, []cache.Group{cache.GroupRefs, cache.GroupPack}, time.Now())
-	if err != nil || n != 2 {
-		t.Fatalf("PurgeRemote = %d, %v; want 2 objects deleted", n, err)
+	if err != nil || n != 1 {
+		t.Fatalf("PurgeRemote = %d, %v; want the pack deleted", n, err)
 	}
 	if got := objectsUnder(fake, "tenant/v1/purge/"); len(got) != 1 {
 		t.Errorf("purge markers = %v, want one", got)

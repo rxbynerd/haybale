@@ -55,6 +55,13 @@ var (
 	errRemoteHeaderTimeout = errors.New("cache: remote entry header did not arrive within the header timeout")
 )
 
+// uploadsGroup reports whether committed entries of group are uploaded
+// to the remote tier. Packs always are. Refs are uploaded only when a
+// replica can serve them back, which needs a positive refsMaxAge.
+func (c *Cache) uploadsGroup(group Group) bool {
+	return group == GroupPack || c.opts.RefsMaxAge > 0
+}
+
 // remoteEligible reports whether a fill may be served from the remote
 // tier: the same freshness rules as a disk hit, so a pack needs a recent
 // upstream refs success and a refs entry needs a positive refsMaxAge.

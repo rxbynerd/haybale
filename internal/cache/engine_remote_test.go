@@ -369,20 +369,35 @@ func lsRefs(t *testing.T, c *Cache, refs Fetcher) Outcome {
 }
 
 // seedPeer fills a peer cache with the ls-refs and clone fetch entries
-// and waits until both are uploaded to store.
+// and waits until the pack is uploaded to store.
 func seedPeer(t *testing.T, store *memBlobStore, pack []byte) *Cache {
 	t.Helper()
-	peer, _, _ := newRemoteTestCache(t, store, nil)
+	return seedPeerWith(t, store, pack, nil)
+}
+
+// seedPeerWith is seedPeer for a peer whose options mutate adjusts. With a
+// positive refsMaxAge it also waits for the refs upload.
+func seedPeerWith(t *testing.T, store *memBlobStore, pack []byte, mutate func(*Options)) *Cache {
+	t.Helper()
+	peer, _, _ := newRemoteTestCache(t, store, mutate)
 	lsRefs(t, peer, refsFetcher(t))
 	if out, _, _ := serve(peer, httptest.NewRecorder(), fetchRequest(t), packFetcher(pack)); !out.Stored {
 		t.Fatalf("peer fetch = %+v, want a stored miss", out)
 	}
+	wantRefs := 0
+	if peer.opts.RefsMaxAge > 0 {
+		wantRefs = 1
+	}
 	waitFor(t, "the peer's uploads", func() bool {
-		return len(store.keys(packPrefix)) == 1 && len(store.keys(refsPrefix)) == 1
+		return len(store.keys(packPrefix)) == 1 && len(store.keys(refsPrefix)) == wantRefs
 	})
 	store.forgetCalls()
 	return peer
 }
+
+// withRefsMaxAge sets a positive refsMaxAge, so refs entries are shared
+// and uploaded.
+func withRefsMaxAge(o *Options) { o.RefsMaxAge = time.Minute }
 
 func tierSum(t *testing.T, reader *sdkmetric.ManualReader, name, tier string) int64 {
 	t.Helper()
@@ -432,14 +447,14 @@ func TestRemoteTierServesAPeersEntry(t *testing.T) {
 		t.Errorf("second fetch = %+v, want a disk hit of the same bytes", out)
 	}
 	assertStoreIdle(t, c)
-	// The ls-refs refresh uploads; the entry read from the remote tier
-	// does not.
-	waitFor(t, "the refs refresh upload", func() bool { return store.count("put", refsPrefix) == 1 })
 	if err := c.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if got := store.count("put", packPrefix); got != 0 {
 		t.Errorf("pack uploads = %d, want none for an entry read from the remote tier", got)
+	}
+	if got := store.count("put", refsPrefix); got != 0 {
+		t.Errorf("refs uploads = %d, want none while refsMaxAge is zero", got)
 	}
 }
 
@@ -871,10 +886,10 @@ func TestRemoteEntryPastRetentionIsDeletedAndRefetched(t *testing.T) {
 func TestUploadsSkipPresentPacksAndRefreshRefs(t *testing.T) {
 	store := newMemBlobStore()
 	pack := remotePack(t)
-	seedPeer(t, store, pack)
+	seedPeerWith(t, store, pack, withRefsMaxAge)
 	refsKey := store.keys(refsPrefix)[0]
 
-	c, _, reader := newRemoteTestCache(t, store, nil)
+	c, clock, reader := newRemoteTestCache(t, store, withRefsMaxAge)
 	// Without a refs success the pack is fetched upstream, so its upload
 	// finds the peer's copy.
 	if out, _, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), packFetcher(pack)); !out.Stored {
@@ -883,6 +898,9 @@ func TestUploadsSkipPresentPacksAndRefreshRefs(t *testing.T) {
 	waitFor(t, "the pack upload to be skipped", func() bool {
 		return uploadsWith(t, reader, observability.UploadResultSkipped) == 1
 	})
+	// Past refsMaxAge the peer's refs entry is not served, so ls-refs goes
+	// upstream and its entry replaces the remote copy.
+	clock.Advance(2 * time.Minute)
 	lsRefs(t, c, refsFetcher(t))
 	waitFor(t, "the refs upload", func() bool {
 		return uploadsWith(t, reader, observability.UploadResultUploaded) == 1
@@ -893,6 +911,44 @@ func TestUploadsSkipPresentPacksAndRefreshRefs(t *testing.T) {
 	if got := store.count("put", refsKey); got != 1 {
 		t.Errorf("refs puts = %d, want the refresh", got)
 	}
+}
+
+func TestRefsAreNotUploadedWhileRefsMaxAgeIsZero(t *testing.T) {
+	store := newMemBlobStore()
+	release := make(chan struct{})
+	defer close(release)
+	store.set(func(m *memBlobStore) {
+		m.putHook = func(ctx context.Context, key string) error {
+			if strings.HasPrefix(key, refsPrefix) {
+				select {
+				case <-release:
+				case <-ctx.Done():
+				}
+			}
+			return nil
+		}
+	})
+	c, _, reader := newRemoteTestCache(t, store, nil)
+	refs := refsFetcher(t)
+	for range uploadWorkers + uploadQueueSize {
+		lsRefs(t, c, refs)
+	}
+	if out, _, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), packFetcher(remotePack(t))); !out.Stored {
+		t.Fatalf("fetch = %+v, want a stored miss", out)
+	}
+	waitFor(t, "the pack upload", func() bool { return uploadsWith(t, reader, observability.UploadResultUploaded) == 1 })
+	if got := store.count("put", refsPrefix); got != 0 {
+		t.Errorf("refs puts = %d, want none", got)
+	}
+	if got := uploadsWith(t, reader, observability.UploadResultDropped); got != 0 {
+		t.Errorf("dropped uploads = %d, want none", got)
+	}
+
+	shared, _, sharedReader := newRemoteTestCache(t, newMemBlobStore(), withRefsMaxAge)
+	lsRefs(t, shared, refs)
+	waitFor(t, "the refs upload with a positive refsMaxAge", func() bool {
+		return uploadsWith(t, sharedReader, observability.UploadResultUploaded) == 1
+	})
 }
 
 func TestUploadFailuresAreCountedByResult(t *testing.T) {
@@ -971,7 +1027,7 @@ func TestUploadQueueFullDropsEntries(t *testing.T) {
 
 func TestInvalidateDeletesRemoteRefsEntries(t *testing.T) {
 	store := newMemBlobStore()
-	peer := seedPeer(t, store, remotePack(t))
+	peer := seedPeerWith(t, store, remotePack(t), withRefsMaxAge)
 	peer.Invalidate(context.Background(), testRepo, testBaseURL)
 	waitFor(t, "the remote refs entries to go", func() bool { return len(store.keys(refsPrefix)) == 0 })
 	if got := store.keys(packPrefix); len(got) != 1 {
@@ -992,7 +1048,7 @@ func TestPurgeMarkerMakesAPeerDropOlderEntries(t *testing.T) {
 	purger, purgerClock, _ := newRemoteTestCache(t, store, nil)
 	lsRefs(t, purger, refsFetcher(t))
 	serve(purger, httptest.NewRecorder(), fetchRequest(t), packFetcher(pack))
-	waitFor(t, "the uploads", func() bool { return len(store.keys(packPrefix)) == 1 && len(store.keys(refsPrefix)) == 1 })
+	waitFor(t, "the pack upload", func() bool { return len(store.keys(packPrefix)) == 1 })
 
 	c, clock, _ := newRemoteTestCache(t, store, nil)
 	lsRefs(t, c, refsFetcher(t))
@@ -1000,12 +1056,11 @@ func TestPurgeMarkerMakesAPeerDropOlderEntries(t *testing.T) {
 	if out, _, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), upstream); !out.Stored || upstream.calls.Load() != 0 {
 		t.Fatalf("peer fetch = %+v upstream %d, want a stored remote fill", out, upstream.calls.Load())
 	}
-	waitFor(t, "the peer's refs upload", func() bool { return store.count("put", refsPrefix) == 2 })
 
 	purgerClock.Advance(time.Minute)
 	n, err := purger.Purge(context.Background(), testRepo, testBaseURL, "")
-	if err != nil || n != 4 {
-		t.Fatalf("Purge = %d, %v; want 2 local and 2 remote entries", n, err)
+	if err != nil || n != 3 {
+		t.Fatalf("Purge = %d, %v; want 2 local entries and the remote pack", n, err)
 	}
 	if got := store.keys(purgePrefix); len(got) != 1 {
 		t.Fatalf("purge markers = %v, want one", got)
