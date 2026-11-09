@@ -10,7 +10,8 @@ import (
 )
 
 var (
-	// ErrNotFound is returned by a BlobStore for a key it does not hold.
+	// ErrNotFound is returned by DiskStore.Open and by a BlobStore for a
+	// key the tier does not hold.
 	ErrNotFound = errors.New("cache: object not found")
 	// ErrIntegrity is returned when a stored entry fails verification:
 	// truncation, reordering, relocation under another key, or

@@ -480,13 +480,11 @@ func TestSealedWrongKey(t *testing.T) {
 		t.Fatalf("wrong key under the right id: err = %v, want ErrIntegrity", err)
 	}
 
-	both, err := kr.WithPrevious(testKey(0x43))
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Relabelling the preamble with another key's id fails under that
+	// key too: the preamble is the header's associated data.
 	relabelled := bytes.Clone(entry)
 	copy(relabelled[len(magic)+2:], other.ActiveID())
-	if _, err := NewSealedReader(bytes.NewReader(relabelled), both); !errors.Is(err, ErrIntegrity) {
+	if _, err := NewSealedReader(bytes.NewReader(relabelled), other); !errors.Is(err, ErrIntegrity) {
 		t.Fatalf("key id relabelled: err = %v, want ErrIntegrity", err)
 	}
 }

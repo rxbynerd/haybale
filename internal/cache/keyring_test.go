@@ -71,48 +71,6 @@ func TestEphemeralKeyringsDiffer(t *testing.T) {
 	}
 }
 
-func TestKeyringWithPrevious(t *testing.T) {
-	oldKR, err := NewKeyring(testKey(1))
-	if err != nil {
-		t.Fatal(err)
-	}
-	newKR, err := NewKeyring(testKey(2))
-	if err != nil {
-		t.Fatal(err)
-	}
-	entry := sealBytes(t, oldKR, Header{}, []byte("old entry"))
-
-	if _, err := NewSealedReader(bytes.NewReader(entry), newKR); err == nil {
-		t.Fatal("new key opened an entry sealed under the old key")
-	}
-	rotated, err := newKR.WithPrevious(testKey(1))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rotated.ActiveID() != newKR.ActiveID() {
-		t.Fatalf("WithPrevious changed the active id to %q", rotated.ActiveID())
-	}
-	if got := openBytes(t, rotated, entry); string(got) != "old entry" {
-		t.Fatalf("rotated keyring read %q", got)
-	}
-	if _, ok := newKR.aead(oldKR.ActiveID()); ok {
-		t.Fatal("WithPrevious mutated the receiver")
-	}
-	again, err := rotated.WithPrevious(testKey(2))
-	if err != nil {
-		t.Fatalf("re-adding the active key: %v", err)
-	}
-	if len(again.sealing) != 2 {
-		t.Fatalf("keyring holds %d keys, want 2", len(again.sealing))
-	}
-	if _, err := newKR.WithPrevious(make([]byte, 5)); err == nil {
-		t.Fatal("WithPrevious accepted a short key")
-	}
-	if _, err := (Keyring{}).WithPrevious(testKey(1)); err == nil {
-		t.Fatal("WithPrevious on the zero Keyring succeeded")
-	}
-}
-
 func TestDecode32(t *testing.T) {
 	// 0xfb and 0xff encode to '+' and '/' in the standard alphabet and
 	// '-' and '_' in the URL alphabet.

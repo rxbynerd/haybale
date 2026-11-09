@@ -10,7 +10,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -101,8 +100,10 @@ type entryState struct {
 }
 
 // OpenDiskStore opens the cache directory dir with a budget of budget
-// bytes. dir must exist, be a directory owned by the process user (where
-// the platform reports ownership), and grant no group or other
+// bytes. The directory is created with mode 0700 when it does not exist
+// (its parent must), so an operator can mount a root-owned volume at the
+// parent and point the cache at a child. It must be owned by the process
+// user (where the platform reports ownership) and grant no group or other
 // permissions. Committed entries are indexed for the budget, and temporary
 // files from other processes are deleted. A nil logger discards, nil
 // metrics record nothing, and a nil now uses time.Now.
@@ -118,6 +119,9 @@ func OpenDiskStore(dir string, budget int64, logger *slog.Logger, metrics *obser
 	}
 	if now == nil {
 		now = time.Now
+	}
+	if err := os.Mkdir(dir, entryDirPerm); err != nil && !errors.Is(err, fs.ErrExist) {
+		return nil, fmt.Errorf("cache: create dir %q: %w", dir, err)
 	}
 	root, err := os.OpenRoot(dir)
 	if err != nil {
@@ -184,21 +188,6 @@ func checkCacheDir(dir string, info fs.FileInfo, uid int) error {
 		}
 	}
 	return nil
-}
-
-// fileOwner returns the owning uid recorded in info.Sys() on platforms
-// whose stat structure has a numeric Uid field, and false elsewhere.
-// Reflection keeps this portable without per-platform files.
-func fileOwner(info fs.FileInfo) (uint64, bool) {
-	v := reflect.ValueOf(info.Sys())
-	if v.Kind() != reflect.Pointer || v.IsNil() || v.Elem().Kind() != reflect.Struct {
-		return 0, false
-	}
-	uid := v.Elem().FieldByName("Uid")
-	if !uid.IsValid() || !uid.CanUint() {
-		return 0, false
-	}
-	return uid.Uint(), true
 }
 
 // Entry is an open committed entry. It reads the sealed bytes from a

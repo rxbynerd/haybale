@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hkdf"
@@ -10,7 +11,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
+
+	"github.com/rxbynerd/haybale/internal/gitproto"
 )
 
 // KeySize is the length in bytes of a cache key.
@@ -23,12 +27,14 @@ const keyIDLen = 8
 // the configured cache key, such as the RepoHash HMAC.
 const sealingKeyInfo = "haybale response cache entry sealing v1"
 
-// Keyring holds the active cache key and any previous keys, indexed by key
-// id. Entries are sealed under the active key and opened under whichever
-// key their preamble names. A Keyring is an immutable value and is safe for
-// concurrent use; the zero Keyring holds no keys and seals nothing.
+// Keyring holds the active cache key. Entries are sealed under it and
+// opened only when their preamble names its id; rotating the key is a cold
+// cache. A Keyring is an immutable value and is safe for concurrent use;
+// the zero Keyring holds no key and seals nothing.
 type Keyring struct {
 	active string
+	// key is the raw active cache key, the HMAC key for RepoHash.
+	key []byte
 	// sealing maps a key id to the sealing key derived from that cache key.
 	sealing map[string][KeySize]byte
 }
@@ -40,7 +46,7 @@ func NewKeyring(active []byte) (Keyring, error) {
 	if err != nil {
 		return Keyring{}, err
 	}
-	return Keyring{active: id, sealing: map[string][KeySize]byte{id: sealing}}, nil
+	return Keyring{active: id, key: bytes.Clone(active), sealing: map[string][KeySize]byte{id: sealing}}, nil
 }
 
 // EphemeralKeyring returns a Keyring with a random active key. Entries
@@ -53,35 +59,16 @@ func EphemeralKeyring() (Keyring, error) {
 	return NewKeyring(key)
 }
 
-// WithPrevious returns a copy of k that can also open entries sealed under
-// key, a previous cache key of KeySize bytes. The active key is unchanged.
-// Adding a key already in k is a no-op; a different key whose id collides
-// with one in k is an error.
-func (k Keyring) WithPrevious(key []byte) (Keyring, error) {
-	if k.active == "" {
-		return Keyring{}, errors.New("cache: keyring has no active key")
-	}
-	id, sealing, err := deriveKey(key)
-	if err != nil {
-		return Keyring{}, err
-	}
-	if existing, ok := k.sealing[id]; ok {
-		if existing != sealing {
-			return Keyring{}, fmt.Errorf("cache: previous key's id %s collides with a different key in the keyring", id)
-		}
-		return k, nil
-	}
-	next := Keyring{active: k.active, sealing: make(map[string][KeySize]byte, len(k.sealing)+1)}
-	for kid, sk := range k.sealing {
-		next.sealing[kid] = sk
-	}
-	next.sealing[id] = sealing
-	return next, nil
-}
-
 // ActiveID returns the id of the active key, or "" for the zero Keyring. A
 // key id is the first 8 hex characters of the SHA-256 of the cache key.
 func (k Keyring) ActiveID() string { return k.active }
+
+// RepoHash returns RepoHash under the active cache key, so that every
+// component addressing entries derives the same repository hash from the
+// same configured key. baseURL must not be nil.
+func (k Keyring) RepoHash(baseURL *url.URL, repo gitproto.Repo) [32]byte {
+	return RepoHash(k.key, baseURL, repo)
+}
 
 // aead returns an AES-256-GCM instance for the key with id.
 func (k Keyring) aead(id string) (cipher.AEAD, bool) {

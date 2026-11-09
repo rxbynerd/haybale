@@ -137,13 +137,26 @@ func TestOpenDiskStoreRejectsPermissiveModes(t *testing.T) {
 	}
 }
 
+func TestOpenDiskStoreCreatesLeafDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "cache")
+	s := openStore(t, dir, 1<<20, nil)
+	mustClose(t, s)
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() || info.Mode().Perm() != entryDirPerm {
+		t.Fatalf("created dir mode = %v, want a directory with mode %04o", info.Mode(), entryDirPerm)
+	}
+}
+
 func TestOpenDiskStoreRejectsUnusableDirs(t *testing.T) {
 	dir := cacheDir(t)
 	file := filepath.Join(dir, "file")
 	if err := os.WriteFile(file, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for name, d := range map[string]string{"missing": filepath.Join(dir, "missing"), "file": file} {
+	for name, d := range map[string]string{"missing parent": filepath.Join(dir, "missing", "cache"), "file": file} {
 		if _, err := OpenDiskStore(d, 1<<20, nil, nil, nil); err == nil {
 			t.Errorf("%s: OpenDiskStore succeeded", name)
 		}
@@ -161,26 +174,26 @@ type ownedInfo struct {
 
 func (i ownedInfo) Sys() any { return i.sys }
 
+// ownerCase is one checkCacheDir owner-check case; see ownerCases.
+type ownerCase struct {
+	name    string
+	sys     any
+	uid     int
+	wantErr bool
+}
+
 func TestCheckCacheDirOwner(t *testing.T) {
 	info, err := os.Stat(cacheDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	type statUID struct{ Uid uint32 }
 	type statNoUID struct{ Mode uint32 }
 
-	cases := []struct {
-		name    string
-		sys     any
-		uid     int
-		wantErr bool
-	}{
-		{"same owner", &statUID{Uid: 1000}, 1000, false},
-		{"other owner", &statUID{Uid: 0}, 1000, true},
-		{"no uid field", &statNoUID{}, 1000, false},
+	cases := []ownerCase{
+		{"unknown sys type", &statNoUID{}, 1000, false},
 		{"nil sys", nil, 1000, false},
-		{"platform without uid", &statUID{Uid: 0}, -1, false},
 	}
+	cases = append(cases, ownerCases()...)
 	for _, tc := range cases {
 		err := checkCacheDir("/cache", ownedInfo{FileInfo: info, sys: tc.sys}, tc.uid)
 		if (err != nil) != tc.wantErr {
