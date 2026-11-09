@@ -225,6 +225,7 @@ func TestProbeRemoteClassifiesFailures(t *testing.T) {
 		{"bare 401", probeErr("Unauthorized", 401), true},
 		{"bare 403", probeErr("Forbidden", 403), true},
 		{"no credentials", probeErr("NoCredentials", 0), true},
+		{"credentials temporarily unavailable", probeErr("CredentialsUnavailable", 0), false},
 		{"untrusted certificate", probeErr("TLSVerificationFailed", 0), true},
 		{"dial failure", probeErr("RequestSendFailed", 0), false},
 		{"header timeout", probeErr("HeaderTimeout", 0), false},

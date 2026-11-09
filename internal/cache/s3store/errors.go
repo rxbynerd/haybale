@@ -6,6 +6,8 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
@@ -32,6 +34,7 @@ const (
 	codeRequestFailed = "RequestFailed"
 	codeBadResponse   = "InvalidResponse"
 	codeNoCredentials = "NoCredentials"
+	codeCredsDown     = "CredentialsUnavailable"
 	codeTLSFailed     = "TLSVerificationFailed"
 )
 
@@ -52,11 +55,13 @@ type Error struct {
 	Key string
 	// Code is the S3 error code, such as "NoSuchKey" or "AccessDenied",
 	// or one of "HeaderTimeout", "Canceled", "DeadlineExceeded",
-	// "NoCredentials", "TLSVerificationFailed", "RequestSendFailed",
-	// "RequestFailed" or "InvalidResponse" when the service sent no code.
-	// NoCredentials means the SDK's credential chain produced none; a
-	// TLSVerificationFailed request never reached the service because its
-	// certificate did not verify.
+	// "NoCredentials", "CredentialsUnavailable", "TLSVerificationFailed",
+	// "RequestSendFailed", "RequestFailed" or "InvalidResponse" when the
+	// service sent no code. NoCredentials means the SDK's credential chain
+	// found no provider or was refused; CredentialsUnavailable means a
+	// provider failed in a way that can pass (a timeout, a send failure, a
+	// 5xx or 429). A TLSVerificationFailed request never reached the
+	// service because its certificate did not verify.
 	Code string
 	// Status is the HTTP status of the response, or 0 when none arrived.
 	Status int
@@ -94,6 +99,8 @@ func wrapError(ctx context.Context, op, key string, err error) error {
 		e.Code, e.sentinel = codeDeadline, context.DeadlineExceeded
 	case errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled):
 		e.Code, e.sentinel = codeCanceled, context.Canceled
+	case isCredentialsError(err) && transientCredentialsError(err, e.Status):
+		e.Code, e.Status = codeCredsDown, 0
 	case isCredentialsError(err):
 		e.Code, e.Status = codeNoCredentials, 0
 	case isTLSVerificationError(err):
@@ -119,6 +126,22 @@ func wrapError(ctx context.Context, op, key string, err error) error {
 func isCredentialsError(err error) bool {
 	var ce *credentialsError
 	return errors.As(err, &ce)
+}
+
+// transientCredentialsError reports whether a credential-chain failure
+// with HTTP status (0 when none) can pass: a network timeout, a request
+// that could not be sent, or a provider answering 5xx or 429.
+func transientCredentialsError(err error, status int) bool {
+	var netErr net.Error
+	var sendErr *smithyhttp.RequestSendError
+	switch {
+	case errors.As(err, &netErr) && netErr.Timeout():
+		return true
+	case errors.As(err, &sendErr):
+		return true
+	default:
+		return status >= 500 || status == http.StatusTooManyRequests
+	}
 }
 
 // isTLSVerificationError reports whether err is a server certificate that
