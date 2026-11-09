@@ -204,6 +204,15 @@ func (f *fill) perform() {
 	if f.remoteEligible() && f.fillFromRemote(nil) {
 		return
 	}
+	if f.c.staleEnabled() {
+		held, probe := f.c.gates.admit(f.repo.Host, f.c.now())
+		if probe {
+			defer f.c.gates.endProbe(f.repo.Host)
+		}
+		if held && f.serveStale(upstreamResult{eligible: true, reason: staleReasonHealthGate}, fillOutcome{kind: fillReleased}, "") {
+			return
+		}
+	}
 	// A refs fill from upstream renews the repository's access record, so
 	// the purge marker is checked first, alongside the upstream request.
 	purge := f.startPurgeCheck()
@@ -217,11 +226,13 @@ func (f *fill) perform() {
 		if f.ctx.Err() != nil {
 			res = upstreamResult{}
 		}
+		f.reportHealth(res)
 		f.releaseOrServeStale(res, observability.FillReasonFetchError)
 		return
 	}
 	defer done()
 	res := classifyStatus(upstreamStatus(resp))
+	f.reportHealth(res)
 	body := newIdleReader(resp.Body, f.c.opts.IdleTimeout, f.cancel)
 	defer func() { _ = body.Close() }()
 
@@ -299,6 +310,14 @@ func (f *fill) share(resp *http.Response, body io.Reader, res upstreamResult) {
 	}
 	f.finish(observability.FillResultDiscarded, observability.FillReasonUpstreamStatus, transientCooldown)
 	f.setOutcome(shared)
+}
+
+// reportHealth applies the fill's upstream result to its host's health
+// gate while stale-if-error is enabled.
+func (f *fill) reportHealth(res upstreamResult) {
+	if f.c.staleEnabled() {
+		f.c.gates.report(f.repo.Host, res, f.c.now())
+	}
 }
 
 // releaseOrServeStale answers the fill's subscribers from a stale entry

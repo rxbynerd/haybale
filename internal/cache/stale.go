@@ -28,6 +28,7 @@ const (
 	staleReasonCredentialUnavailable = "credential_unavailable" //nolint:gosec // G101: an event reason, not a credential
 	staleReasonHeaderTimeout         = "header_timeout"
 	staleReasonUpstreamStatus        = "upstream_status"
+	staleReasonHealthGate            = "health_gate"
 )
 
 // tlsHandshakeTimeoutText is the text of net/http's TLS handshake
@@ -35,7 +36,7 @@ const (
 const tlsHandshakeTimeoutText = "net/http: TLS handshake timeout"
 
 // upstreamResult classifies the outcome of a fill's upstream request for
-// stale service.
+// stale service and the health gate.
 type upstreamResult struct {
 	// eligible reports that the request may be answered from a stale
 	// entry.
@@ -44,35 +45,41 @@ type upstreamResult struct {
 	reason string
 	// status is the upstream response status; zero when none arrived.
 	status int
+	// signal is what the result tells the host's health gate.
+	signal gateSignal
 }
 
 // classifyFetchError classifies a Fetcher error. headerTimedOut reports
 // that the fill's response-header timeout cancelled the request. A
-// credential source that could not reach its API, a connection that
-// failed before any request was sent, and a header timeout are eligible.
-// Every other error, including the fill's own cancellation, is not.
+// credential source that could not reach its API, and a connection that
+// failed before any request was sent, are outages: eligible, and they
+// open the health gate. A header timeout is eligible but leaves the gate
+// alone, since a slow repository is not an unreachable host. Every other
+// error, including the fill's own cancellation, is neither.
 func classifyFetchError(err error, headerTimedOut bool) upstreamResult {
 	switch {
 	case headerTimedOut:
 		return upstreamResult{eligible: true, reason: staleReasonHeaderTimeout}
 	case errors.Is(err, upstream.ErrUnavailable):
-		return upstreamResult{eligible: true, reason: staleReasonCredentialUnavailable}
+		return upstreamResult{eligible: true, reason: staleReasonCredentialUnavailable, signal: gateFailure}
 	case connectFailure(err):
-		return upstreamResult{eligible: true, reason: staleReasonConnect}
+		return upstreamResult{eligible: true, reason: staleReasonConnect, signal: gateFailure}
 	default:
 		return upstreamResult{}
 	}
 }
 
 // classifyStatus classifies an upstream response status. 500, 502, 503
-// and 504 are eligible. 401 and 403 (a rejected credential), 429 and the
-// other 4xx are policy signals, never outages.
+// and 504 are eligible; the gate neither opens nor closes on them. Any
+// other status shows the host is reachable and closes the gate; 401 and
+// 403 (a rejected credential), 429 and the other 4xx are policy signals,
+// never outages.
 func classifyStatus(status int) upstreamResult {
 	switch status {
 	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return upstreamResult{eligible: true, reason: staleReasonUpstreamStatus, status: status}
 	default:
-		return upstreamResult{status: status}
+		return upstreamResult{status: status, signal: gateSuccess}
 	}
 }
 
@@ -178,8 +185,10 @@ func (f *fill) staleAcceptable(h entryHeader) bool {
 // eligible result from the newest qualifying entry: the tier-1 entry, or
 // else a copy of the remote tier's entry spooled as a remote fill.
 // fallback is what subscribers receive when they cannot open the tier-1
-// entry after all. It returns false, having settled nothing, when stale
-// service is disabled or no entry qualifies.
+// entry after all. fillReason labels the fill metric of a tier-1 answer;
+// empty records none, for a fill that never contacted upstream. It
+// returns false, having settled nothing, when stale service is disabled
+// or no entry qualifies.
 func (f *fill) serveStale(res upstreamResult, fallback fillOutcome, fillReason string) bool {
 	c := f.c
 	if !res.eligible || !c.staleEnabled() {
@@ -190,7 +199,9 @@ func (f *fill) serveStale(res upstreamResult, fallback fillOutcome, fillReason s
 	if e := c.openStaleEntry(f.key, f.repo, class); e != nil {
 		st.createdAt = e.sr.Header().CreatedAt
 		e.close()
-		f.finish(observability.FillResultDiscarded, fillReason, 0)
+		if fillReason != "" {
+			f.finish(observability.FillResultDiscarded, fillReason, 0)
+		}
 		f.setOutcome(fillOutcome{kind: fillStale, stale: st, fallback: &fallback})
 		return true
 	}

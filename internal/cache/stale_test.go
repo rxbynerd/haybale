@@ -47,19 +47,19 @@ func TestClassifyFetchError(t *testing.T) {
 		headerTimedOut bool
 		want           upstreamResult
 	}{
-		{"credential API unavailable", fmt.Errorf("proxy: credential source: %w", fmt.Errorf("%w: unexpected status 503", upstream.ErrUnavailable)), false, upstreamResult{eligible: true, reason: staleReasonCredentialUnavailable}},
-		{"dial refused", refused, false, upstreamResult{eligible: true, reason: staleReasonConnect}},
-		{"dial timeout", &net.OpError{Op: "dial", Net: "tcp", Err: plainTimeoutError{}}, false, upstreamResult{eligible: true, reason: staleReasonConnect}},
-		{"name resolution in a dial", &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "no such host", Name: "upstream.test", IsNotFound: true}}, false, upstreamResult{eligible: true, reason: staleReasonConnect}},
-		{"name resolution", &net.DNSError{Err: "server misbehaving", Name: "upstream.test"}, false, upstreamResult{eligible: true, reason: staleReasonConnect}},
-		{"TLS record header", tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}, false, upstreamResult{eligible: true, reason: staleReasonConnect}},
-		{"TLS certificate verification", &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}, false, upstreamResult{eligible: true, reason: staleReasonConnect}},
-		{"x509 unknown authority", x509.UnknownAuthorityError{}, false, upstreamResult{eligible: true, reason: staleReasonConnect}},
-		{"x509 hostname", x509.HostnameError{Host: "upstream.test"}, false, upstreamResult{eligible: true, reason: staleReasonConnect}},
-		{"x509 invalid", x509.CertificateInvalidError{Reason: x509.Expired}, false, upstreamResult{eligible: true, reason: staleReasonConnect}},
-		{"TLS alert from the server", &net.OpError{Op: "remote error", Err: errors.New("tls: handshake failure")}, false, upstreamResult{eligible: true, reason: staleReasonConnect}},
-		{"TLS alert sent", &net.OpError{Op: "local error", Err: errors.New("tls: bad certificate")}, false, upstreamResult{eligible: true, reason: staleReasonConnect}},
-		{"TLS handshake timeout", handshakeTimeoutError{}, false, upstreamResult{eligible: true, reason: staleReasonConnect}},
+		{"credential API unavailable", fmt.Errorf("proxy: credential source: %w", fmt.Errorf("%w: unexpected status 503", upstream.ErrUnavailable)), false, upstreamResult{eligible: true, reason: staleReasonCredentialUnavailable, signal: gateFailure}},
+		{"dial refused", refused, false, upstreamResult{eligible: true, reason: staleReasonConnect, signal: gateFailure}},
+		{"dial timeout", &net.OpError{Op: "dial", Net: "tcp", Err: plainTimeoutError{}}, false, upstreamResult{eligible: true, reason: staleReasonConnect, signal: gateFailure}},
+		{"name resolution in a dial", &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "no such host", Name: "upstream.test", IsNotFound: true}}, false, upstreamResult{eligible: true, reason: staleReasonConnect, signal: gateFailure}},
+		{"name resolution", &net.DNSError{Err: "server misbehaving", Name: "upstream.test"}, false, upstreamResult{eligible: true, reason: staleReasonConnect, signal: gateFailure}},
+		{"TLS record header", tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}, false, upstreamResult{eligible: true, reason: staleReasonConnect, signal: gateFailure}},
+		{"TLS certificate verification", &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}, false, upstreamResult{eligible: true, reason: staleReasonConnect, signal: gateFailure}},
+		{"x509 unknown authority", x509.UnknownAuthorityError{}, false, upstreamResult{eligible: true, reason: staleReasonConnect, signal: gateFailure}},
+		{"x509 hostname", x509.HostnameError{Certificate: &x509.Certificate{}, Host: "upstream.test"}, false, upstreamResult{eligible: true, reason: staleReasonConnect, signal: gateFailure}},
+		{"x509 invalid", x509.CertificateInvalidError{Reason: x509.Expired}, false, upstreamResult{eligible: true, reason: staleReasonConnect, signal: gateFailure}},
+		{"TLS alert from the server", &net.OpError{Op: "remote error", Err: errors.New("tls: handshake failure")}, false, upstreamResult{eligible: true, reason: staleReasonConnect, signal: gateFailure}},
+		{"TLS alert sent", &net.OpError{Op: "local error", Err: errors.New("tls: bad certificate")}, false, upstreamResult{eligible: true, reason: staleReasonConnect, signal: gateFailure}},
+		{"TLS handshake timeout", handshakeTimeoutError{}, false, upstreamResult{eligible: true, reason: staleReasonConnect, signal: gateFailure}},
 		{"response header timeout", context.Canceled, true, upstreamResult{eligible: true, reason: staleReasonHeaderTimeout}},
 		{"header timeout wins over a dial error", refused, true, upstreamResult{eligible: true, reason: staleReasonHeaderTimeout}},
 		{"reset after connecting", &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")}, false, upstreamResult{}},
@@ -171,13 +171,13 @@ func TestClassifyFetchErrorOnRealTransportFailures(t *testing.T) {
 
 func TestClassifyStatus(t *testing.T) {
 	for _, status := range []int{500, 502, 503, 504} {
-		if got := classifyStatus(status); !got.eligible || got.reason != staleReasonUpstreamStatus || got.status != status {
-			t.Errorf("classifyStatus(%d) = %+v, want eligible with the status", status, got)
+		if got := classifyStatus(status); !got.eligible || got.reason != staleReasonUpstreamStatus || got.status != status || got.signal != gateNeutral {
+			t.Errorf("classifyStatus(%d) = %+v, want eligible with the status, leaving the gate alone", status, got)
 		}
 	}
 	for _, status := range []int{200, 204, 301, 400, 401, 403, 404, 410, 422, 429, 501, 505} {
-		if got := classifyStatus(status); got.eligible {
-			t.Errorf("classifyStatus(%d) = %+v, want not eligible", status, got)
+		if got := classifyStatus(status); got.eligible || got.signal != gateSuccess {
+			t.Errorf("classifyStatus(%d) = %+v, want not eligible, closing the gate", status, got)
 		}
 	}
 }

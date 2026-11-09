@@ -119,6 +119,7 @@ type Cache struct {
 	access accessRecords
 	marks  uncacheableMarks
 	purges purgeRecords
+	gates  healthGates
 
 	// remote is the remote tier, nil when there is none. Uploads and
 	// remote deletions run under remoteCtx, which Close cancels only once
@@ -212,6 +213,7 @@ func New(opts Options) (*Cache, error) {
 		flushInterval: sealFlushInterval,
 		access:        accessRecords{window: opts.AccessRecheck},
 		purges:        purgeRecords{retention: opts.Retention, interval: markerCheckInterval(opts.AccessRecheck)},
+		gates:         healthGates{logger: logger},
 		remote:        opts.Remote,
 		remoteCtx:     remoteCtx,
 		remoteCancel:  remoteCancel,
