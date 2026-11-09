@@ -63,10 +63,7 @@ const (
 	headerCutNone uint32 = iota
 	// headerCutTimeout: the response-header timeout expired.
 	headerCutTimeout
-	// headerCutProbe: the probe deadline of a gate probe holding a
-	// qualifying stale entry expired.
-	headerCutProbe
-	// headerCutArrived: response headers arrived before either timer.
+	// headerCutArrived: response headers arrived before the timer.
 	headerCutArrived
 )
 
@@ -130,8 +127,9 @@ type fill struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	abandoned atomic.Bool
-	// headerCut records whether response headers arrived or which timer
-	// cancelled the upstream request first; whichever is set first stands.
+	// headerCut records whether response headers arrived or the
+	// response-header timer cancelled the upstream request first;
+	// whichever is set first stands.
 	headerCut atomic.Uint32
 
 	spool       *spool
@@ -162,13 +160,16 @@ type fill struct {
 
 	// Guarded by Cache.mu. pending counts subscribers that have attached
 	// but not yet opened the spool or left; noPending is closed once the
-	// fill has ended and pending is zero.
+	// fill has ended and pending is zero. probing is set while the fill is
+	// its host's health-gate probe, during which it is not abandoned, so
+	// the probe's result always reaches the gate.
 	subscribers   int
 	pending       int
 	ended         bool
 	idle          *time.Timer
 	noPending     chan struct{}
 	pendingClosed bool
+	probing       bool
 
 	// dropEntry marks a committed refs entry that a push superseded. It is
 	// deleted by releaseSpool once pending subscribers have opened it.
@@ -230,34 +231,36 @@ func (f *fill) perform() {
 		}
 		probing = probe
 	}
+	if probing {
+		f.setProbing(true)
+	}
 	// The probe ends once upstream headers or the fetch error arrive, not
 	// when the body has streamed, so a newer failure can admit the next.
 	endProbe := func() {
 		if probing {
 			probing = false
-			f.c.gates.endProbe(f.repo.Host)
+			f.c.gates.endProbe(f.repo.Host, f.c.now())
+			f.setProbing(false)
 		}
 	}
 	defer endProbe()
-	probeDeadline := probing && f.holdsStaleEntry()
-	// A refs fill from upstream renews the repository's access record, so
-	// the purge marker is checked first, alongside the upstream request.
-	purge := f.startPurgeCheck()
+	// A refs fill from upstream renews the repository's access record, and
+	// a probe may answer stale at its deadline, so for both the purge
+	// marker is checked alongside the upstream request.
+	purge := f.startPurgeCheck(probing)
 	f.purge = purge
-	defer purge.wait()
+	if purge != nil {
+		defer purge.wait()
+	}
 	started := f.c.now()
-	resp, done, err := f.fetchHeaders(probeDeadline)
+	resp, done, err := f.fetchHeaders(probing)
 	if err != nil {
 		// The error is not logged: a credential source's error may carry
 		// upstream response bytes.
 		f.logger().Debug("upstream fetch failed")
 		var res upstreamResult
-		switch {
-		case f.ctx.Err() != nil:
-			// A cancelled fill's dial error says nothing about upstream.
-		case f.headerCut.Load() == headerCutProbe:
-			res = upstreamResult{eligible: true, reason: staleReasonHealthGate}
-		default:
+		// A cancelled fill's dial error says nothing about upstream.
+		if f.ctx.Err() == nil {
 			res = classifyFetchError(err, f.headerCut.Load() == headerCutTimeout)
 		}
 		f.reportHealth(res, started)
@@ -303,26 +306,28 @@ func (f *fill) perform() {
 
 // fetchHeaders performs the upstream round trip under a context of its
 // own, cancelled if response headers do not arrive within the
-// response-header timeout or, with probeDeadline set, within the gate's
-// probe interval, whichever expires first; headerCut records which. The
-// timers are stopped once headers arrive so the body is not bounded by
-// them. The caller calls done once it has finished with the body.
-func (f *fill) fetchHeaders(probeDeadline bool) (resp *http.Response, done context.CancelFunc, err error) {
+// response-header timeout; headerCut records whether they did. The timer
+// is stopped once headers arrive so the body is not bounded by it. A
+// probe's round trip runs beside answerAtProbeDeadline, which has returned
+// by the time fetchHeaders does. The caller calls done once it has
+// finished with the body.
+func (f *fill) fetchHeaders(probing bool) (resp *http.Response, done context.CancelFunc, err error) {
 	ctx, cancel := context.WithCancel(f.ctx)
-	cut := func(reason uint32) func() {
-		return func() {
-			if f.headerCut.CompareAndSwap(headerCutNone, reason) {
+	if t := f.c.opts.ResponseHeaderTimeout; t > 0 {
+		timer := time.AfterFunc(t, func() {
+			if f.headerCut.CompareAndSwap(headerCutNone, headerCutTimeout) {
 				cancel()
 			}
-		}
-	}
-	if t := f.c.opts.ResponseHeaderTimeout; t > 0 {
-		timer := time.AfterFunc(t, cut(headerCutTimeout))
+		})
 		defer timer.Stop()
 	}
-	if probeDeadline {
-		timer := time.AfterFunc(f.c.gates.interval, cut(headerCutProbe))
-		defer timer.Stop()
+	if probing {
+		stop, exited := make(chan struct{}), make(chan struct{})
+		go f.answerAtProbeDeadline(stop, exited)
+		defer func() {
+			close(stop)
+			<-exited
+		}()
 	}
 	resp, err = f.fetch.Fetch(ctx, f.req)
 	if err == nil && (resp == nil || resp.Body == nil) {
@@ -333,7 +338,7 @@ func (f *fill) fetchHeaders(probeDeadline bool) (resp *http.Response, done conte
 			h(f.key)
 		}
 		// A timer that fired after Fetch returned has cancelled the body's
-		// context, so the response is treated as cut by that timer.
+		// context, so the response is treated as cut by the timer.
 		if !f.headerCut.CompareAndSwap(headerCutNone, headerCutArrived) {
 			_ = resp.Body.Close()
 			err = context.Canceled
@@ -386,18 +391,58 @@ func (f *fill) reportHealth(res upstreamResult, started time.Time) {
 	}
 }
 
-// holdsStaleEntry reports whether the fill's key has a tier-1 entry that
-// stale service could answer with, the repository's purge state included.
-func (f *fill) holdsStaleEntry() bool {
-	if !f.purgeCurrent() {
-		return false
+// answerAtProbeDeadline runs beside a probe's upstream request until stop
+// is closed, then closes exited. Once the probe interval has passed and
+// the repository's purge state is known current, it answers the fill's
+// subscribers from the key's qualifying tier-1 entry with reason
+// health_gate. The upstream request carries on either way, so its result
+// still reaches the gate and the fill continues as one without
+// subscribers.
+func (f *fill) answerAtProbeDeadline(stop <-chan struct{}, exited chan<- struct{}) {
+	defer close(exited)
+	defer func() {
+		if r := recover(); r != nil {
+			f.c.logger.Error("probe deadline panicked", "class", f.req.Class, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+		}
+	}()
+	timer := time.NewTimer(f.c.gates.interval)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-stop:
+		return
 	}
-	e := f.c.openStaleEntry(f.key, f.repo, string(f.req.Class))
-	if e == nil {
-		return false
+	answered := false
+	if h := f.c.hooks.afterProbeDeadline; h != nil {
+		defer func() { h(f.key, answered) }()
 	}
-	e.close()
-	return true
+	select {
+	case <-f.purge.done:
+	case <-stop:
+		return
+	}
+	released := fillOutcome{kind: fillReleased}
+	st := &staleService{reason: staleReasonHealthGate, fallback: released}
+	if f.purge.current && f.tier1Stale(st) {
+		f.publishStale(st, released)
+		answered = true
+	}
+}
+
+// setProbing records whether the fill is its host's probe. Once the probe
+// ends, a fill that no subscriber holds any longer is cancelled after the
+// idle grace period, as detach would have scheduled.
+func (f *fill) setProbing(on bool) {
+	c := f.c
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	f.probing = on
+	if !on && f.subscribers == 0 && !f.ended {
+		if f.idle != nil {
+			f.idle.Stop()
+		}
+		f.idle = time.AfterFunc(c.idleGrace, f.abandon)
+	}
 }
 
 // releaseOrServeStale answers the fill's subscribers from a stale entry
@@ -748,9 +793,9 @@ func (f *fill) readerOpened() {
 	f.c.mu.Unlock()
 }
 
-// detach removes a subscriber and, when none remain, schedules the fill's
-// cancellation after the idle grace period. opened reports whether the
-// subscriber called readerOpened.
+// detach removes a subscriber and, when none remain and the fill is not
+// its host's probe, schedules the fill's cancellation after the idle grace
+// period. opened reports whether the subscriber called readerOpened.
 func (f *fill) detach(opened bool) {
 	c := f.c
 	c.mu.Lock()
@@ -760,7 +805,7 @@ func (f *fill) detach(opened bool) {
 		f.pending--
 		f.signalPendingLocked()
 	}
-	if f.subscribers == 0 && !f.ended {
+	if f.subscribers == 0 && !f.ended && !f.probing {
 		f.idle = time.AfterFunc(c.idleGrace, f.abandon)
 	}
 }
@@ -775,12 +820,12 @@ func (f *fill) signalPendingLocked() {
 }
 
 // abandon cancels a fill that still has no subscribers when the grace
-// period ends.
+// period ends, unless it has since become its host's probe.
 func (f *fill) abandon() {
 	c := f.c
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if f.subscribers == 0 && !f.ended {
+	if f.subscribers == 0 && !f.ended && !f.probing {
 		f.abandoned.Store(true)
 		f.cancel()
 	}

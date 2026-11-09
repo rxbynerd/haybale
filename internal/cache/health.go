@@ -7,9 +7,9 @@ import (
 )
 
 // healthProbeInterval is how long an open health gate waits after its
-// last probe before it lets another request reach upstream as a probe,
-// and how long a probe that holds a qualifying stale entry waits for
-// upstream response headers.
+// last probe ended before it lets another request reach upstream as a
+// probe, and how long a probe's subscribers wait for upstream response
+// headers before a qualifying stale entry answers them.
 const healthProbeInterval = 5 * time.Second
 
 // gateSignal is what one upstream result tells its host's health gate.
@@ -28,11 +28,12 @@ const (
 // fill for the host cannot connect or the credential source reports its
 // API unavailable, failures a client cannot induce. While it is open, a
 // request with a qualifying stale entry is answered from it without
-// contacting upstream, except for one probe at a time, admitted at most
-// once per interval. Requests without a stale entry still go upstream.
-// Any upstream answer other than an eligible 5xx closes the gate, and a
-// connect failure of an attempt that began before the latest success is
-// ignored. Gates exist only while stale-if-error is enabled.
+// contacting upstream, except for one probe at a time, admitted once the
+// interval has passed since the previous probe ended. Requests without a
+// stale entry still go upstream. Any upstream answer other than an
+// eligible 5xx closes the gate, and a connect failure of an attempt that
+// began before the latest success is ignored. Gates exist only while
+// stale-if-error is enabled.
 type healthGates struct {
 	logger *slog.Logger
 	// interval is the probe interval; New sets it to healthProbeInterval.
@@ -45,7 +46,7 @@ type healthGates struct {
 type healthGate struct {
 	open    bool
 	probing bool
-	// lastProbe is when the gate opened or last admitted a probe.
+	// lastProbe is when the gate opened or its last probe ended.
 	lastProbe time.Time
 	// lastSuccess is when an upstream request for the host last
 	// succeeded.
@@ -65,7 +66,8 @@ func (g *healthGates) held(host string, now time.Time) bool {
 // the gate is open and the fill is not its probe: the fill should answer
 // from a stale entry without contacting upstream. probe is true when the
 // fill is the gate's probe; its caller must call endProbe once upstream
-// response headers or the fetch error have arrived.
+// response headers or the fetch error have arrived, even when the probe's
+// subscribers were already answered stale.
 func (g *healthGates) admit(host string, now time.Time) (held, probe bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -75,19 +77,20 @@ func (g *healthGates) admit(host string, now time.Time) (held, probe bool) {
 		return false, false
 	case !h.probing && now.Sub(h.lastProbe) >= g.interval:
 		h.probing = true
-		h.lastProbe = now
 		return false, true
 	default:
 		return true, false
 	}
 }
 
-// endProbe lets host's gate admit its next probe.
-func (g *healthGates) endProbe(host string) {
+// endProbe ends host's probe at now; the gate admits its next probe once
+// the interval has passed from then.
+func (g *healthGates) endProbe(host string, now time.Time) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if h := g.hosts[host]; h != nil {
 		h.probing = false
+		h.lastProbe = now
 	}
 }
 

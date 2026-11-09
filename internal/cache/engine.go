@@ -175,6 +175,10 @@ type fillHooks struct {
 	// beforeStaleOutcome runs in a fill that has found a qualifying
 	// tier-1 entry, before it tells its subscribers to serve it.
 	beforeStaleOutcome func(key entryKey)
+	// afterProbeDeadline runs beside a probe once its deadline has passed
+	// and the purge state is known, reporting whether its subscribers were
+	// answered stale.
+	afterProbeDeadline func(key entryKey, answered bool)
 }
 
 // New opens the cache directory, indexes its entries, removes entries

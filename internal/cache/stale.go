@@ -209,28 +209,44 @@ func (f *fill) serveStale(res upstreamResult, fallback fillOutcome, fillReason s
 		return false
 	}
 	st := &staleService{reason: res.reason, fwdStatus: res.status, fallback: fallback}
-	class := string(f.req.Class)
-	if e := c.openStaleEntry(f.key, f.repo, class); e != nil {
-		st.createdAt = e.sr.Header().CreatedAt
-		e.close()
+	if f.tier1Stale(st) {
 		if fillReason != "" {
 			f.finish(observability.FillResultDiscarded, fillReason, 0)
 		}
-		if h := c.hooks.beforeStaleOutcome; h != nil {
-			h(f.key)
-		}
-		f.setOutcome(fillOutcome{kind: fillStale, stale: st, fallback: &fallback})
+		f.publishStale(st, fallback)
 		return true
 	}
 	return c.remote != nil && !f.remoteUnavailable && f.fillFromRemote(st)
 }
 
+// tier1Stale reports whether the key's tier-1 entry qualifies for stale
+// service, and records its creation time in st.
+func (f *fill) tier1Stale(st *staleService) bool {
+	e := f.c.openStaleEntry(f.key, f.repo, string(f.req.Class))
+	if e == nil {
+		return false
+	}
+	st.createdAt = e.sr.Header().CreatedAt
+	e.close()
+	return true
+}
+
+// publishStale tells the fill's subscribers to serve the tier-1 entry st
+// describes, or fallback when they cannot open it after all.
+func (f *fill) publishStale(st *staleService, fallback fillOutcome) {
+	if h := f.c.hooks.beforeStaleOutcome; h != nil {
+		h(f.key)
+	}
+	f.setOutcome(fillOutcome{kind: fillStale, stale: st, fallback: &fallback})
+}
+
 // purgeCurrent reports whether the repository's purge state is known
-// current for stale service. A refs fill waits for the check it started
-// beside its upstream request; any other fill checks the marker itself,
-// which a recent successful check answers without a read.
+// current for stale service. A fill that started a check beside its
+// upstream request, a refs fill or a probe, waits for it; any other fill
+// checks the marker itself, which a recent successful check answers
+// without a read.
 func (f *fill) purgeCurrent() bool {
-	if f.purge != nil && f.key.Group == GroupRefs {
+	if f.purge != nil {
 		return f.purge.wait()
 	}
 	return f.c.purgeCurrent(f.ctx, f.repo, f.key.RepoHash)

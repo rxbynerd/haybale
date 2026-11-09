@@ -816,11 +816,14 @@ type purgeCheck struct {
 }
 
 // startPurgeCheck begins checking the repository's purge marker for a
-// refs fill from upstream, when the cache has a remote tier. Without a
-// remote tier, or for a pack fill, the check is immediately current.
-func (f *fill) startPurgeCheck() *purgeCheck {
+// refs fill from upstream or a gate probe, and returns nil for any other
+// fill. Without a remote tier the check is immediately current.
+func (f *fill) startPurgeCheck(probing bool) *purgeCheck {
+	if f.key.Group != GroupRefs && !probing {
+		return nil
+	}
 	pc := &purgeCheck{done: make(chan struct{})}
-	if f.c.remote == nil || f.key.Group != GroupRefs {
+	if f.c.remote == nil {
 		pc.current = true
 		close(pc.done)
 		return pc

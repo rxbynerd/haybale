@@ -50,16 +50,17 @@ func TestHealthGateStateMachine(t *testing.T) {
 	expect(t, "probe in flight", at(healthProbeInterval+time.Second), true, false)
 	expect(t, "probe in flight later", at(3*healthProbeInterval), true, false)
 	g.report("up", refused, at(3*healthProbeInterval), at(3*healthProbeInterval))
-	g.endProbe("up")
-	expect(t, "after a failed probe", at(3*healthProbeInterval), false, true)
-	g.report("up", classifyStatus(http.StatusServiceUnavailable), at(3*healthProbeInterval), at(3*healthProbeInterval))
-	g.endProbe("up")
-	expect(t, "a 5xx probe leaves it open", at(3*healthProbeInterval+time.Second), true, false)
+	g.endProbe("up", at(3*healthProbeInterval))
+	expect(t, "within the interval of the failed probe's end", at(4*healthProbeInterval-time.Second), true, false)
+	expect(t, "an interval after the failed probe ended", at(4*healthProbeInterval), false, true)
+	g.report("up", classifyStatus(http.StatusServiceUnavailable), at(4*healthProbeInterval), at(4*healthProbeInterval))
+	g.endProbe("up", at(4*healthProbeInterval))
+	expect(t, "a 5xx probe leaves it open", at(4*healthProbeInterval+time.Second), true, false)
 
-	g.report("up", classifyStatus(http.StatusOK), at(4*healthProbeInterval), at(4*healthProbeInterval))
-	expect(t, "closed by a success", at(4*healthProbeInterval), false, false)
-	g.report("up", classifyStatus(http.StatusNotFound), at(4*healthProbeInterval), at(4*healthProbeInterval))
-	expect(t, "a success on a closed gate", at(4*healthProbeInterval), false, false)
+	g.report("up", classifyStatus(http.StatusOK), at(5*healthProbeInterval), at(5*healthProbeInterval))
+	expect(t, "closed by a success", at(5*healthProbeInterval), false, false)
+	g.report("up", classifyStatus(http.StatusNotFound), at(5*healthProbeInterval), at(5*healthProbeInterval))
+	expect(t, "a success on a closed gate", at(5*healthProbeInterval), false, false)
 
 	if got := len(logs.records(t, gateOpenedMsg)); got != 1 {
 		t.Errorf("gate opened logs = %d, want 1", got)
@@ -69,8 +70,8 @@ func TestHealthGateStateMachine(t *testing.T) {
 		t.Errorf("gate closed logs = %v, want one at INFO for the host", closed)
 	}
 
-	g.report("up", classifyFetchError(errDialRefused, false), at(5*healthProbeInterval), at(5*healthProbeInterval))
-	expect(t, "reopened", at(5*healthProbeInterval), true, false)
+	g.report("up", classifyFetchError(errDialRefused, false), at(6*healthProbeInterval), at(6*healthProbeInterval))
+	expect(t, "reopened", at(6*healthProbeInterval), true, false)
 }
 
 // TestHealthGateAdmitsOneProbeAtATime races many admits against an open
@@ -133,6 +134,9 @@ func (b *blockingFetch) Fetch(ctx context.Context, _ Request) (*http.Response, e
 // the gate. The phases share one cache and run in order.
 func TestHealthGateServesStaleWithoutContactingUpstream(t *testing.T) {
 	h := newStaleHarness(t, nil)
+	// The probe below holds an entry; an interval this long keeps its
+	// deadline from answering it stale before the test releases upstream.
+	h.c.gates.interval = 30 * time.Minute
 	otherPack := fetchResultBody(t, 2, 50)
 	if out, _, _ := serve(h.c, newCollectWriter(), otherFetchRequest(t), packFetcher(otherPack)); !out.Stored {
 		t.Fatalf("seeding the second key = %+v", out)
@@ -176,7 +180,7 @@ func TestHealthGateServesStaleWithoutContactingUpstream(t *testing.T) {
 	})
 
 	t.Run("one probe while others are held, and its success closes the gate", func(t *testing.T) {
-		h.clock.Advance(healthProbeInterval)
+		h.clock.Advance(h.c.gates.interval)
 		probe := newBlockingFetch(func() *http.Response { return response(200, contentTypeResult, h.pack) })
 		probeReq := fetchRequest(t)
 		probeDone := make(chan Outcome, 1)
@@ -535,10 +539,11 @@ func TestHealthGateProbeEndsAtResponseHeaders(t *testing.T) {
 	assertStoreIdle(t, h.c)
 }
 
-// TestHealthGateAdmitsTheNextProbeAfterAFailedOrAbandonedOne: a probe
-// refused by upstream, and a probe whose client left before headers
-// arrived, both let the next probe through once the interval has passed.
-func TestHealthGateAdmitsTheNextProbeAfterAFailedOrAbandonedOne(t *testing.T) {
+// TestHealthGateAdmitsTheNextProbeAfterAFailedOrLeftOne: a probe refused
+// by upstream, and a probe whose client left before headers arrived,
+// which runs on until upstream answers, both let the next probe through
+// once the interval has passed since they ended.
+func TestHealthGateAdmitsTheNextProbeAfterAFailedOrLeftOne(t *testing.T) {
 	h := newStaleHarness(t, nil)
 	h.c.idleGrace = time.Millisecond
 	h.clock.Advance(10 * time.Minute)
@@ -561,20 +566,28 @@ func TestHealthGateAdmitsTheNextProbeAfterAFailedOrAbandonedOne(t *testing.T) {
 	}()
 	waitFor(t, "the second probe to reach upstream", func() bool { return hang.calls.Load() == 1 })
 	cancel()
-	<-left
+	select {
+	case <-left:
+	case <-time.After(shortly):
+		t.Fatal("the leaving client was never answered")
+	}
 	select {
 	case err := <-hang.cancelled:
-		if !errors.Is(err, context.Canceled) {
-			t.Errorf("abandoned probe's fetch ended with %v, want it cancelled", err)
-		}
-	case <-time.After(shortly):
-		t.Fatal("the abandoned probe's fetch was never cancelled")
+		t.Fatalf("the probe was cancelled once its client left: %v", err)
+	case <-time.After(50 * h.c.idleGrace):
 	}
-	waitFor(t, "the abandoned fill to end", func() bool {
+	if !gateProbing(h.c) {
+		t.Fatal("the probe ended when its client left")
+	}
+	close(hang.release)
+	waitFor(t, "the left probe to end", func() bool {
 		h.c.mu.Lock()
 		defer h.c.mu.Unlock()
 		return len(h.c.fills) == 0
 	})
+	if gateProbing(h.c) {
+		t.Fatal("the gate is still probing after the probe's fill ended")
+	}
 
 	h.clock.Advance(healthProbeInterval)
 	next := &failing{status: 503}
@@ -583,12 +596,40 @@ func TestHealthGateAdmitsTheNextProbeAfterAFailedOrAbandonedOne(t *testing.T) {
 	}
 }
 
-// TestHealthGateProbeDeadline: a probe that holds a qualifying entry
-// waits at most the probe interval for upstream headers, is then answered
-// stale with reason health_gate and leaves the gate open; its upstream
-// attempt is cancelled. A probe whose entry vanished meanwhile is
-// released, a shorter response-header timeout wins with its own reason,
-// and a probe without an entry is not cut.
+// gateProbing reports whether testRepo's host has a probe in flight.
+func gateProbing(c *Cache) bool {
+	c.gates.mu.Lock()
+	defer c.gates.mu.Unlock()
+	g := c.gates.hosts[testRepo.Host]
+	return g != nil && g.probing
+}
+
+// probeDeadlines records, in order, whether each probe deadline of c
+// answered its subscribers stale.
+func probeDeadlines(c *Cache) <-chan bool {
+	ch := make(chan bool, 8)
+	c.hooks.afterProbeDeadline = func(_ entryKey, answered bool) { ch <- answered }
+	return ch
+}
+
+// awaitDeadline waits for the next probe deadline and reports whether it
+// answered the probe's subscribers.
+func awaitDeadline(t *testing.T, deadlines <-chan bool) bool {
+	t.Helper()
+	select {
+	case answered := <-deadlines:
+		return answered
+	case <-time.After(shortly):
+		t.Fatal("the probe deadline never passed")
+		return false
+	}
+}
+
+// TestHealthGateProbeDeadline: a probe's subscribers wait at most the
+// probe interval for upstream headers before a qualifying tier-1 entry
+// answers them stale with reason health_gate. The probe's upstream attempt
+// runs on, so its answer still reaches the gate, and the probe ends only
+// then. Without a qualifying entry the subscribers keep waiting.
 func TestHealthGateProbeDeadline(t *testing.T) {
 	const interval = 50 * time.Millisecond
 	setup := func(t *testing.T, mutate func(*Options)) *staleHarness {
@@ -599,16 +640,26 @@ func TestHealthGateProbeDeadline(t *testing.T) {
 		h.clock.Advance(interval)
 		return h
 	}
+	allFills := func(h *staleHarness) int64 {
+		return sumWhere(t, h.reader, "haybale.response_cache.fills.total", nil)
+	}
 
-	t.Run("served stale at the deadline", func(t *testing.T) {
+	t.Run("a late answer closes the gate after the client was answered stale", func(t *testing.T) {
 		h := setup(t, nil)
-		hang := newHangingFetch()
+		storedBefore := fillsWithReason(t, h.reader, observability.FillResultStored, "")
+		release := make(chan struct{})
+		cancelled := make(chan error, 1)
+		late := fetchFunc(func(ctx context.Context, _ Request) (*http.Response, error) {
+			select {
+			case <-release:
+				return response(http.StatusOK, contentTypeResult, h.pack), nil
+			case <-ctx.Done():
+				cancelled <- ctx.Err()
+				return nil, ctx.Err()
+			}
+		})
 		rec := newCollectWriter()
-		start := time.Now()
-		out, _, _ := serve(h.c, rec, fetchRequest(t), hang)
-		if elapsed := time.Since(start); elapsed > shortly {
-			t.Errorf("probe took %v, want about the %v deadline", elapsed, interval)
-		}
+		out, _, _ := serve(h.c, rec, fetchRequest(t), late)
 		if _, body, _ := rec.result(); out.Result != observability.ResultStale || !bytes.Equal(body, h.pack) {
 			t.Fatalf("probe = %+v, want the stale pack", out)
 		}
@@ -619,45 +670,92 @@ func TestHealthGateProbeDeadline(t *testing.T) {
 		if last := events[len(events)-1]; last["reason"] != staleReasonHealthGate {
 			t.Errorf("event = %v, want reason %s", last, staleReasonHealthGate)
 		}
-		select {
-		case err := <-hang.cancelled:
-			if !errors.Is(err, context.Canceled) {
-				t.Errorf("upstream attempt ended with %v, want it cancelled", err)
-			}
-		case <-time.After(shortly):
-			t.Fatal("the upstream attempt was never cancelled")
+		if !gateProbing(h.c) || len(h.logs.records(t, gateClosedMsg)) != 0 {
+			t.Fatal("the probe ended when its client was answered")
 		}
-		if !h.c.gates.held(testRepo.Host, h.c.now()) || len(h.logs.records(t, gateClosedMsg)) != 0 {
-			t.Error("the probe deadline closed the gate")
+		<-time.After(3 * interval)
+		select {
+		case err := <-cancelled:
+			t.Fatalf("the probe's upstream attempt was cancelled: %v", err)
+		default:
+		}
+		close(release)
+		waitFor(t, "the late answer to close the gate", func() bool { return len(h.logs.records(t, gateClosedMsg)) == 1 })
+		assertStoreIdle(t, h.c)
+		if n := fillsWithReason(t, h.reader, observability.FillResultStored, "") - storedBefore; n != 1 {
+			t.Errorf("stored fills = %d, want the late answer stored once", n)
+		}
+		if h.c.gates.held(testRepo.Host, h.c.now()) {
+			t.Error("the gate still holds requests after the late answer")
+		}
+	})
+
+	t.Run("a sequential client is answered stale while the probe runs", func(t *testing.T) {
+		h := setup(t, nil)
+		release := make(chan struct{})
+		var calls atomic.Int32
+		blackHole := fetchFunc(func(ctx context.Context, _ Request) (*http.Response, error) {
+			calls.Add(1)
+			// The wait for headers outlasts the probe interval.
+			h.clock.Advance(interval)
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+			return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("i/o timeout")}
+		})
+		for i := range 4 {
+			if out, _, _ := serve(h.c, newCollectWriter(), fetchRequest(t), blackHole); out.Result != observability.ResultStale {
+				t.Fatalf("request %d = %+v, want stale", i, out)
+			}
+		}
+		if n := calls.Load(); n != 1 {
+			t.Fatalf("upstream requests while the probe ran = %d, want the probe alone", n)
+		}
+		close(release)
+		waitFor(t, "the probe to end", func() bool { return !gateProbing(h.c) })
+		if out, _, _ := serve(h.c, newCollectWriter(), fetchRequest(t), blackHole); out.Result != observability.ResultStale || calls.Load() != 1 {
+			t.Errorf("request within the interval of the probe's end = %+v upstream requests %d, want it held", out, calls.Load())
 		}
 		h.clock.Advance(interval)
-		next := &failing{status: 503}
-		if out, _, _ := serve(h.c, newCollectWriter(), fetchRequest(t), next); out.Result != observability.ResultStale || next.count() != 1 {
-			t.Errorf("next probe = %+v fetches %d, want it admitted", out, next.count())
+		if out, _, _ := serve(h.c, newCollectWriter(), fetchRequest(t), blackHole); out.Result != observability.ResultStale || calls.Load() != 2 {
+			t.Errorf("request an interval after the probe's end = %+v upstream requests %d, want it admitted as the probe", out, calls.Load())
 		}
 		assertStoreIdle(t, h.c)
 	})
 
-	t.Run("entry gone at the deadline", func(t *testing.T) {
-		h := setup(t, nil)
+	t.Run("the attempt ends at the header timeout and is counted once", func(t *testing.T) {
+		h := setup(t, func(o *Options) { o.ResponseHeaderTimeout = 4 * interval })
+		fillsBefore := allFills(h)
+		fetchErrorsBefore := fillsWithReason(t, h.reader, observability.FillResultDiscarded, observability.FillReasonFetchError)
+		staleBefore := lookups(t, h.reader, observability.ResultStale)
 		hang := newHangingFetch()
-		done := make(chan served, 1)
-		r := fetchRequest(t)
-		go func() {
-			out, handled, _ := serve(h.c, newCollectWriter(), r, hang)
-			done <- served{out: out, handled: handled}
-		}()
-		waitFor(t, "the probe to reach upstream", func() bool { return hang.calls.Load() == 1 })
-		if _, err := h.c.Purge(context.Background(), testRepo, testBaseURL, ""); err != nil {
-			t.Fatal(err)
+		if out, _, _ := serve(h.c, newCollectWriter(), fetchRequest(t), hang); out.Result != observability.ResultStale {
+			t.Fatalf("probe = %+v, want stale", out)
 		}
 		select {
-		case res := <-done:
-			if res.handled || res.out.Result != observability.ResultBypass {
-				t.Errorf("probe after the entry went = %+v handled %v, want a release", res.out, res.handled)
+		case err := <-hang.cancelled:
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("upstream attempt ended with %v, want the header timeout's cancellation", err)
 			}
 		case <-time.After(shortly):
-			t.Fatal("the probe never finished")
+			t.Fatal("the upstream attempt never ended")
+		}
+		assertStoreIdle(t, h.c)
+		if gateProbing(h.c) {
+			t.Error("the probe did not end with its attempt")
+		}
+		if n := allFills(h) - fillsBefore; n != 1 {
+			t.Errorf("fills recorded = %d, want one", n)
+		}
+		if n := fillsWithReason(t, h.reader, observability.FillResultDiscarded, observability.FillReasonFetchError) - fetchErrorsBefore; n != 1 {
+			t.Errorf("fetch_error fills = %d, want one", n)
+		}
+		if n := lookups(t, h.reader, observability.ResultStale) - staleBefore; n != 1 {
+			t.Errorf("stale lookups = %d, want one", n)
+		}
+		if !h.c.gates.held(testRepo.Host, h.c.now()) || len(h.logs.records(t, gateClosedMsg)) != 0 {
+			t.Error("a header timeout closed the gate")
 		}
 	})
 
@@ -675,29 +773,48 @@ func TestHealthGateProbeDeadline(t *testing.T) {
 		}
 	})
 
-	t.Run("a probe without an entry is not cut", func(t *testing.T) {
-		h := setup(t, nil)
-		hang := newHangingFetch()
+	notAnswered := func(t *testing.T, h *staleHarness, r *http.Request, fetch Fetcher, release chan struct{}) {
+		t.Helper()
+		deadlines := probeDeadlines(h.c)
 		done := make(chan served, 1)
-		r := fetchRequestFor(t, 1)
 		go func() {
-			out, handled, _ := serve(h.c, newCollectWriter(), r, hang)
+			out, handled, _ := serve(h.c, newCollectWriter(), r, fetch)
 			done <- served{out: out, handled: handled}
 		}()
-		waitFor(t, "the probe to reach upstream", func() bool { return hang.calls.Load() == 1 })
-		select {
-		case res := <-done:
-			t.Fatalf("probe without an entry finished early: %+v", res.out)
-		case <-time.After(10 * interval):
+		if awaitDeadline(t, deadlines) {
+			t.Fatal("the deadline answered the probe stale")
 		}
-		close(hang.release)
 		select {
 		case res := <-done:
-			if res.handled {
-				t.Errorf("probe without an entry = %+v, want a release", res.out)
+			t.Fatalf("probe finished at the deadline: %+v", res.out)
+		default:
+		}
+		close(release)
+		select {
+		case res := <-done:
+			if res.handled || res.out.Result != observability.ResultBypass {
+				t.Errorf("probe = %+v handled %v, want a release once upstream failed", res.out, res.handled)
 			}
 		case <-time.After(shortly):
 			t.Fatal("the probe never finished")
 		}
+	}
+
+	t.Run("entry gone at the deadline", func(t *testing.T) {
+		h := setup(t, nil)
+		hang := newHangingFetch()
+		purging := fetchFunc(func(ctx context.Context, req Request) (*http.Response, error) {
+			if _, err := h.c.Purge(context.Background(), testRepo, testBaseURL, ""); err != nil {
+				t.Error(err)
+			}
+			return hang.Fetch(ctx, req)
+		})
+		notAnswered(t, h, fetchRequest(t), purging, hang.release)
+	})
+
+	t.Run("a probe without an entry is not answered", func(t *testing.T) {
+		h := setup(t, nil)
+		hang := newHangingFetch()
+		notAnswered(t, h, fetchRequestFor(t, 1), hang, hang.release)
 	})
 }
