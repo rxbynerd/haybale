@@ -283,7 +283,11 @@ upstream until `retention` passes or haybale restarts. `disk_budget` means no
 space was available after eviction. `error_packet`, `sideband_error`, `framing`
 and `truncated` mean the response was not safe to store, and
 `fetch_error` and `upstream_status` mean the upstream did not return a
-cacheable `200`. Clients still receive the response in every case.
+cacheable `200`. Clients still receive the response in every case except
+one: a response of unknown length that outgrows the remaining disk budget
+while it is being spooled cannot be served to the clients sharing it, and
+those clients see the connection closed (below). Keep `maxDiskSize` well
+above `maxConcurrentFills` times `maxEntrySize` to avoid that case.
 
 **Clients see a connection closed mid-clone.** The upstream failed or went
 silent during a fetch (`responseHeaderTimeout`, `idleTimeout`), so haybale
