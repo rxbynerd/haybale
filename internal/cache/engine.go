@@ -200,7 +200,7 @@ func New(opts Options) (*Cache, error) {
 		idleGrace:     fillIdleGrace,
 		flushInterval: sealFlushInterval,
 		access:        accessRecords{window: opts.AccessRecheck},
-		purges:        purgeRecords{retention: opts.Retention},
+		purges:        purgeRecords{retention: opts.Retention, interval: markerCheckInterval(opts.AccessRecheck)},
 		remote:        opts.Remote,
 		remoteCtx:     remoteCtx,
 		remoteCancel:  remoteCancel,

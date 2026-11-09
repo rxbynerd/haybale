@@ -241,16 +241,52 @@ func (e *remoteOpError) Error() string { return e.err.Error() }
 
 func (e *remoteOpError) Unwrap() error { return e.err }
 
+// markerCheckInterval is how long a successful purge marker check stays
+// current: janitorInterval, or accessRecheck when that is shorter, so the
+// marker is read at least as often as a pack hit needs the access record
+// renewed.
+func markerCheckInterval(accessRecheck time.Duration) time.Duration {
+	if accessRecheck > 0 && accessRecheck < janitorInterval {
+		return accessRecheck
+	}
+	return janitorInterval
+}
+
 // purgeRecords remembers, per repository, the purge times this process
-// has seen in purge markers or made itself, and when reading a marker
-// last failed.
+// has seen in purge markers or made itself, when a marker check last
+// succeeded or failed, and the check in flight.
 type purgeRecords struct {
 	retention time.Duration
+	// interval is how long a successful check stays current.
+	interval time.Duration
 
-	mu     sync.Mutex
-	times  map[[32]byte]purgeTimes
-	failed map[[32]byte]time.Time
+	mu       sync.Mutex
+	times    map[[32]byte]purgeTimes
+	checked  map[[32]byte]time.Time
+	failed   map[[32]byte]time.Time
+	inflight map[[32]byte]*markerCheck
 }
+
+// markerCheck is one purge marker read that concurrent refs fills of a
+// repository share. current is valid once done is closed.
+type markerCheck struct {
+	done    chan struct{}
+	current bool
+}
+
+// checkStart says what a refs fill does about the repository's marker.
+type checkStart uint8
+
+const (
+	// checkCurrent: a check succeeded within the interval.
+	checkCurrent checkStart = iota + 1
+	// checkBackoff: a check failed within purgeCheckBackoff.
+	checkBackoff
+	// checkJoin: another fill's check is in flight; wait for it.
+	checkJoin
+	// checkLead: this fill reads the marker and must call finishCheck.
+	checkLead
+)
 
 // covers reports whether an entry at key created at createdAt predates a
 // known purge of its repository and group.
@@ -282,35 +318,65 @@ func (p *purgeRecords) observe(repoHash [32]byte, times purgeTimes, now time.Tim
 	return merged, advanced
 }
 
-// shouldCheck reports whether repoHash's marker may be read at now: not
-// within purgeCheckBackoff of a failed read.
-func (p *purgeRecords) shouldCheck(repoHash [32]byte, now time.Time) bool {
+// beginCheck decides how a refs fill at now learns whether repoHash's
+// purge state is current. For checkJoin and checkLead it returns the
+// shared check.
+func (p *purgeRecords) beginCheck(repoHash [32]byte, now time.Time) (checkStart, *markerCheck) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	t, ok := p.failed[repoHash]
-	if !ok {
-		return true
+	if t, ok := p.checked[repoHash]; ok && now.Sub(t) < p.interval {
+		return checkCurrent, nil
 	}
-	if now.Sub(t) >= purgeCheckBackoff {
+	if t, ok := p.failed[repoHash]; ok {
+		if now.Sub(t) < purgeCheckBackoff {
+			return checkBackoff, nil
+		}
 		delete(p.failed, repoHash)
-		return true
 	}
-	return false
+	if mc := p.inflight[repoHash]; mc != nil {
+		return checkJoin, mc
+	}
+	if p.inflight == nil {
+		p.inflight = make(map[[32]byte]*markerCheck)
+	}
+	mc := &markerCheck{done: make(chan struct{})}
+	p.inflight[repoHash] = mc
+	return checkLead, mc
 }
 
-// checkFailed records a failed marker read for repoHash at now.
-func (p *purgeRecords) checkFailed(repoHash [32]byte, now time.Time) {
+// finishCheck ends the check mc a fill led for repoHash at now: a current
+// result is remembered for the interval, and failed starts the backoff.
+// A check that is neither, cut short by its fill's end, records nothing.
+func (p *purgeRecords) finishCheck(repoHash [32]byte, mc *markerCheck, current, failed bool, now time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.failed == nil {
-		p.failed = make(map[[32]byte]time.Time)
+	if p.inflight[repoHash] == mc {
+		delete(p.inflight, repoHash)
 	}
-	if len(p.failed) >= pruneThreshold {
-		for h, t := range p.failed {
-			if now.Sub(t) >= purgeCheckBackoff {
-				delete(p.failed, h)
+	switch {
+	case current:
+		p.checked = remember(p.checked, repoHash, now, p.interval)
+	case failed:
+		delete(p.checked, repoHash)
+		p.failed = remember(p.failed, repoHash, now, purgeCheckBackoff)
+	}
+	mc.current = current
+	close(mc.done)
+}
+
+// remember sets m[repoHash] to now, first pruning entries older than keep
+// once the map is large. It returns the map, made if nil.
+func remember(m map[[32]byte]time.Time, repoHash [32]byte, now time.Time, keep time.Duration) map[[32]byte]time.Time {
+	if m == nil {
+		m = make(map[[32]byte]time.Time)
+	}
+	if len(m) >= pruneThreshold {
+		for h, t := range m {
+			if now.Sub(t) >= keep {
+				delete(m, h)
 			}
 		}
 	}
-	p.failed[repoHash] = now
+	m[repoHash] = now
+	return m
 }

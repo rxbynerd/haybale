@@ -583,39 +583,62 @@ func (c *Cache) remoteError(operation string, err error) {
 	c.logger.Warn("remote cache tier operation failed", "operation", operation, "error", err)
 }
 
-// checkPurgeMarker reads repoHash's purge marker and, when it records a
-// purge this process has not seen, deletes the local entries it covers.
-// A read that fails is logged and counted, and the marker is not read
-// again for purgeCheckBackoff.
-func (c *Cache) checkPurgeMarker(ctx context.Context, repo gitproto.Repo, repoHash [32]byte) {
+// checkPurgeMarker brings repoHash's purge state up to date with its
+// purge marker and reports whether that state is known current: the
+// marker was read and verified or confirmed absent, now or within the
+// check interval. A marker that records a purge this process has not
+// seen deletes the local entries it covers. Concurrent fills of one
+// repository share one read. A read that fails, or a marker that fails
+// verification, is logged and counted and starts purgeCheckBackoff, during
+// which the state is not current.
+func (c *Cache) checkPurgeMarker(ctx context.Context, repo gitproto.Repo, repoHash [32]byte) bool {
 	now := c.now()
-	if !c.purges.shouldCheck(repoHash, now) {
-		return
+	start, mc := c.purges.beginCheck(repoHash, now)
+	switch start {
+	case checkCurrent:
+		return true
+	case checkBackoff:
+		return false
+	case checkJoin:
+		select {
+		case <-mc.done:
+			return mc.current
+		case <-ctx.Done():
+			return false
+		}
 	}
+	current, failed := c.readMarker(ctx, repo, repoHash, now)
+	c.purges.finishCheck(repoHash, mc, current, failed, now)
+	return current
+}
+
+// readMarker reads and applies repoHash's purge marker for
+// checkPurgeMarker. failed reports a read or verification failure, as
+// opposed to a read cut short because ctx ended.
+func (c *Cache) readMarker(ctx context.Context, repo gitproto.Repo, repoHash [32]byte, now time.Time) (current, failed bool) {
 	ctx, cancel := context.WithTimeout(ctx, purgeMarkerTimeout)
 	defer cancel()
 	times, found, err := readPurgeMarker(ctx, c.remote, c.keyring, repoHash, now)
 	switch {
 	case errors.Is(err, ErrIntegrity):
-		c.purges.checkFailed(repoHash, now)
 		c.metrics.RecordResponseCacheStoreError(context.Background(), observability.TierRemote, observability.OperationGet)
 		security.Log(c.logger, security.EventCacheIntegrityFailed, "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "class", string(groupPurge), "tier", observability.TierRemote)
-		return
+		return false, true
 	case err != nil:
-		if ctx.Err() == nil || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			c.purges.checkFailed(repoHash, now)
-			c.remoteError(observability.OperationGet, err)
+		if ctx.Err() != nil && !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return false, false
 		}
-		return
+		c.remoteError(observability.OperationGet, err)
+		return false, true
 	case !found:
-		return
+		return true, false
 	}
 	merged, advanced := c.purges.observe(repoHash, times, now)
-	if !advanced {
-		return
+	if advanced {
+		n := c.dropPurged(repoHash, merged)
+		c.logger.Info("cache: removed entries older than the repository's purge marker", "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "entries", n)
 	}
-	n := c.dropPurged(repoHash, merged)
-	c.logger.Info("cache: removed entries older than the repository's purge marker", "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "entries", n)
+	return true, false
 }
 
 // dropPurged deletes repoHash's local entries created before the purge
@@ -644,17 +667,20 @@ func (c *Cache) dropPurged(repoHash [32]byte, times purgeTimes) int {
 	return n
 }
 
-// purgeCheck is a purge marker read running alongside a refs fill.
+// purgeCheck is a purge marker check running alongside a refs fill.
+// current is valid once done is closed.
 type purgeCheck struct {
-	done chan struct{}
+	done    chan struct{}
+	current bool
 }
 
-// startPurgeCheck begins reading the repository's purge marker for a refs
-// fill from upstream, when the cache has a remote tier. wait blocks until
-// the read has finished; it may be called any number of times.
+// startPurgeCheck begins checking the repository's purge marker for a
+// refs fill from upstream, when the cache has a remote tier. Without a
+// remote tier, or for a pack fill, the check is immediately current.
 func (f *fill) startPurgeCheck() *purgeCheck {
 	pc := &purgeCheck{done: make(chan struct{})}
 	if f.c.remote == nil || f.key.Group != GroupRefs {
+		pc.current = true
 		close(pc.done)
 		return pc
 	}
@@ -665,9 +691,15 @@ func (f *fill) startPurgeCheck() *purgeCheck {
 				f.c.logger.Error("purge marker check panicked", "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
 			}
 		}()
-		f.c.checkPurgeMarker(f.ctx, f.repo, f.key.RepoHash)
+		pc.current = f.c.checkPurgeMarker(f.ctx, f.repo, f.key.RepoHash)
 	}()
 	return pc
 }
 
-func (pc *purgeCheck) wait() { <-pc.done }
+// wait blocks until the check has finished and reports whether the
+// repository's purge state is known current. It may be called any number
+// of times.
+func (pc *purgeCheck) wait() bool {
+	<-pc.done
+	return pc.current
+}

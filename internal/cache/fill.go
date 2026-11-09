@@ -193,7 +193,7 @@ func (f *fill) perform() {
 		return
 	}
 	// A refs fill from upstream renews the repository's access record, so
-	// the purge marker is read first, alongside the upstream request.
+	// the purge marker is checked first, alongside the upstream request.
 	purge := f.startPurgeCheck()
 	defer purge.wait()
 	resp, err := f.fetchHeaders()
@@ -216,8 +216,9 @@ func (f *fill) perform() {
 		return
 	}
 	now := f.c.now()
-	if f.key.Group == GroupRefs {
-		purge.wait()
+	// While the purge state is not known current, pack hits lapse within
+	// accessRecheck rather than outlive a purge on another replica.
+	if f.key.Group == GroupRefs && purge.wait() {
 		f.c.access.record(f.key.RepoHash, now)
 	}
 	if !f.openSpool(resp.ContentLength, now) {

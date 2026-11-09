@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,7 +33,10 @@ const remotePrefix = "e2e/"
 // replica is one haybale proxy with its own cache directory, sharing the
 // remote tier with its peers.
 type replica struct {
-	cache    *cache.Cache
+	cache *cache.Cache
+	// skew is how far, in nanoseconds, the replica's clock runs ahead of
+	// the real one.
+	skew     *atomic.Int64
 	cacheDir string
 	metrics  *sdkmetric.ManualReader
 	statuses *statusRecorder
@@ -85,6 +89,7 @@ func newReplica(t *testing.T, upstreamURL *url.URL, creds map[string]upstream.Cr
 	}
 	metrics, reader := observability.NewTestMetrics()
 	dir := filepath.Join(t.TempDir(), "cache")
+	skew := new(atomic.Int64)
 	c, err := cache.New(cache.Options{
 		Dir:                   dir,
 		Keyring:               kr,
@@ -100,6 +105,7 @@ func newReplica(t *testing.T, upstreamURL *url.URL, creds map[string]upstream.Cr
 		Remote:                store,
 		Logger:                discardLogger(),
 		Metrics:               metrics,
+		Now:                   func() time.Time { return time.Now().Add(time.Duration(skew.Load())) },
 	})
 	if err != nil {
 		t.Fatalf("cache.New(): %v", err)
@@ -120,6 +126,7 @@ func newReplica(t *testing.T, upstreamURL *url.URL, creds map[string]upstream.Cr
 	t.Cleanup(srv.Close)
 	return &replica{
 		cache:    c,
+		skew:     skew,
 		cacheDir: dir,
 		metrics:  reader,
 		statuses: statuses,
@@ -261,6 +268,9 @@ func TestRemoteTierSharesEntriesBetweenReplicas(t *testing.T) {
 		t.Fatalf("remote pack objects after the purge = %v", got)
 	}
 
+	// B reads the marker again once its last successful check is a minute
+	// old.
+	b.skew.Add(int64(time.Minute + time.Second))
 	if sha := b.clone(t, gitPath); sha != headSHA {
 		t.Fatalf("clone through B after the purge HEAD = %s, want %s", sha, headSHA)
 	}

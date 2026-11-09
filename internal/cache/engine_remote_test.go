@@ -1078,7 +1078,7 @@ func TestForgedPurgeMarkersAreRejected(t *testing.T) {
 			store := newMemBlobStore()
 			pack := remotePack(t)
 			logger, logs := newLogCapture()
-			c, _, _ := newRemoteTestCache(t, store, func(o *Options) { o.Logger = logger })
+			c, clock, _ := newRemoteTestCache(t, store, func(o *Options) { o.Logger = logger })
 			lsRefs(t, c, refsFetcher(t))
 			serve(c, httptest.NewRecorder(), fetchRequest(t), packFetcher(pack))
 
@@ -1087,6 +1087,7 @@ func TestForgedPurgeMarkersAreRejected(t *testing.T) {
 				t.Fatal(err)
 			}
 			store.store(purgeMarkerPath(repoHash), marker)
+			clock.Advance(janitorInterval)
 			lsRefs(t, c, refsFetcher(t))
 			if got := logs.securityEvents(t, security.EventCacheIntegrityFailed); len(got) != 1 {
 				t.Errorf("integrity events = %d, want 1", len(got))
