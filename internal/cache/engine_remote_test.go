@@ -883,13 +883,66 @@ func TestRemoteEntryPastRetentionIsDeletedAndRefetched(t *testing.T) {
 	if out, _, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), upstream); !out.Stored || upstream.calls.Load() != 1 {
 		t.Fatalf("fetch = %+v upstream %d, want a stored miss from upstream", out, upstream.calls.Load())
 	}
-	if store.count("delete", key) != 1 {
-		t.Error("the expired remote object was not deleted")
-	}
-	waitFor(t, "the fresh upload", func() bool {
+	// The background delete races the upload of the fresh entry, so only
+	// the old object's removal is certain.
+	waitFor(t, "the expired remote object to be replaced or deleted", func() bool {
 		data, ok := store.object(key)
-		return ok && !bytes.Equal(data, old)
+		return store.count("delete", key) == 1 && (!ok || !bytes.Equal(data, old))
 	})
+}
+
+func TestASlowExpiryDeleteDoesNotDelayTheFallThrough(t *testing.T) {
+	store := newMemBlobStore()
+	pack := remotePack(t)
+	seedPeer(t, store, pack)
+	release := make(chan struct{})
+	store.set(func(m *memBlobStore) {
+		m.deleteHook = func(ctx context.Context, _ string) error {
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+			return nil
+		}
+	})
+	c, clock, _ := newRemoteTestCache(t, store, nil)
+	clock.Advance(25 * time.Hour)
+	lsRefs(t, c, refsFetcher(t))
+	upstream := packFetcher(pack)
+	done := make(chan Outcome, 1)
+	go func() {
+		out, _, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), upstream)
+		done <- out
+	}()
+	select {
+	case out := <-done:
+		if !out.Stored || upstream.calls.Load() != 1 {
+			t.Errorf("fetch = %+v upstream %d, want a stored miss from upstream", out, upstream.calls.Load())
+		}
+	case <-time.After(shortly):
+		t.Fatal("the fall-through waited for the remote delete")
+	}
+	close(release)
+}
+
+func TestBackgroundRemoteTasksAreBounded(t *testing.T) {
+	c, _, _ := newRemoteTestCache(t, newMemBlobStore(), nil)
+	release := make(chan struct{})
+	var running, ran atomic.Int32
+	for range 3 * maxRemoteTasks {
+		c.goRemote(func(context.Context) {
+			running.Add(1)
+			ran.Add(1)
+			<-release
+			running.Add(-1)
+		})
+	}
+	waitFor(t, "the tasks to start", func() bool { return running.Load() == maxRemoteTasks })
+	close(release)
+	waitFor(t, "the tasks to finish", func() bool { return running.Load() == 0 })
+	if got := ran.Load(); got != maxRemoteTasks {
+		t.Errorf("tasks run = %d, want %d with the rest dropped", got, maxRemoteTasks)
+	}
 }
 
 func TestUploadsSkipPresentPacksAndRefreshRefs(t *testing.T) {

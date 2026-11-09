@@ -117,12 +117,14 @@ type Cache struct {
 	// remote is the remote tier, nil when there is none. Uploads and
 	// remote deletions run under remoteCtx, which Close cancels only once
 	// they have been flushed or its deadline has passed; remoteWG counts
-	// the upload workers and background remote tasks.
+	// the upload workers and background remote tasks, of which
+	// remoteTasks bounds how many run at once.
 	remote       BlobStore
 	remoteCtx    context.Context
 	remoteCancel context.CancelFunc
 	remoteWG     sync.WaitGroup
 	uploads      chan uploadJob
+	remoteTasks  chan struct{}
 
 	// mu orders fill attach, detach, start and teardown, so a request
 	// never joins a fill that is ending. remoteClosed, set by Close under
@@ -213,6 +215,7 @@ func New(opts Options) (*Cache, error) {
 	}()
 	if c.remote != nil {
 		c.uploads = make(chan uploadJob, uploadQueueSize)
+		c.remoteTasks = make(chan struct{}, maxRemoteTasks)
 		c.remoteWG.Add(uploadWorkers)
 		for range uploadWorkers {
 			go c.runUploads()

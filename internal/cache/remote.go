@@ -27,6 +27,9 @@ const (
 	// remoteMaintenanceTimeout bounds one background deletion pass on the
 	// remote tier.
 	remoteMaintenanceTimeout = time.Minute
+	// maxRemoteTasks bounds the background remote tasks running at once; a
+	// task started beyond it is dropped.
+	maxRemoteTasks = 8
 	// maxRemoteResumes is how many ranged Gets a remote fill issues after
 	// its body read fails before the fill cannot continue.
 	maxRemoteResumes = 3
@@ -162,13 +165,22 @@ func (f *fill) checkRemoteHeader(h entryHeader) error {
 // remoteFresh applies the hit freshness rules to a remote entry, and
 // misses a refs entry created before this process's last push to the
 // repository. An entry past retention or older than the repository's last
-// purge is deleted from the remote tier.
+// purge is deleted from the remote tier in the background.
 func (f *fill) remoteFresh(h entryHeader) bool {
 	c := f.c
 	age := c.now().Sub(h.CreatedAt)
 	switch {
 	case age > c.opts.Retention || c.purges.covers(f.key, h.CreatedAt):
-		c.deleteRemote(f.key.Path())
+		// Deleted in the background so a slow bucket does not delay the
+		// fall-through. It can race the upload that follows, which then
+		// finds the old object, skips, and leaves the key absent until a
+		// later miss uploads it.
+		path := f.key.Path()
+		c.goRemote(func(ctx context.Context) {
+			if err := c.remote.Delete(ctx, path); err != nil {
+				c.remoteError(observability.OperationDelete, err)
+			}
+		})
 		return false
 	case f.key.Group == GroupRefs && age > c.opts.RefsMaxAge:
 		return false
@@ -550,19 +562,29 @@ func (c *Cache) upload(ctx context.Context, job uploadJob) string {
 	return observability.UploadResultUploaded
 }
 
-// goRemote runs fn in the background with the remote tier's context. Close
-// waits for it with the uploads. fn is not run once Close has begun
-// flushing.
+// goRemote runs fn in the background with the remote tier's context,
+// bounded by remoteMaintenanceTimeout. Close waits for it with the
+// uploads. fn is not run once Close has begun flushing, nor when
+// maxRemoteTasks are already running; it is then dropped without
+// blocking the caller.
 func (c *Cache) goRemote(fn func(ctx context.Context)) {
 	c.mu.Lock()
 	if c.remoteClosed {
 		c.mu.Unlock()
 		return
 	}
+	select {
+	case c.remoteTasks <- struct{}{}:
+	default:
+		c.mu.Unlock()
+		c.logger.Debug("remote tier task limit reached; the task is dropped")
+		return
+	}
 	c.remoteWG.Add(1)
 	c.mu.Unlock()
 	go func() {
 		defer c.remoteWG.Done()
+		defer func() { <-c.remoteTasks }()
 		defer func() {
 			if r := recover(); r != nil {
 				c.logger.Error("remote tier task panicked", "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
