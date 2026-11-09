@@ -3,6 +3,8 @@ package cache
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -250,10 +252,23 @@ func plantEntry(t *testing.T, c *Cache, key entryKey, class Class, createdAt tim
 		Protocol:    "version=2",
 	}
 	path := filepath.Join(c.opts.Dir, filepath.FromSlash(key.Path()))
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	data := sealBytes(t, c.keyring, hdr, body)
+	// The janitor prunes empty entry directories concurrently, so the
+	// directory created here can vanish before the file lands; retry
+	// until the write succeeds.
+	var err error
+	for range 50 {
+		if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			break
+		}
+		err = os.WriteFile(path, data, 0o600) //nolint:gosec // path is within the test's own cache directory
+		if !errors.Is(err, fs.ErrNotExist) {
+			break
+		}
+	}
+	if err != nil {
 		t.Fatal(err)
 	}
-	writeEntry(t, path, sealBytes(t, c.keyring, hdr, body))
 	c.store.sweep(c.opts.Retention)
 	return path
 }
