@@ -689,9 +689,11 @@ refuses three environments with a fixed message that carries no SDK text:
 
 The purge command prefixes these messages with `--remote: `.
 
-**Startup probe.** When `haybale serve` starts, it reads the object
-`v1/.probe` under the prefix, within 30 seconds. haybale never writes that
-object, so a "not found" answer (`NoSuchKey`) means the bucket is usable. The
+**Startup probe.** When `haybale serve` starts, it reads a random key under
+`v1/.probe/` in the prefix (`v1/.probe/` followed by 32 hex characters, new at
+every start), within 30 seconds. haybale never writes such an object, so a "not
+found" answer (`NoSuchKey`) means the bucket is usable, and a bucket writer
+cannot plant the key in advance. The
 probe makes one attempt, and its result decides whether startup continues.
 
 Startup fails when:
@@ -699,10 +701,10 @@ Startup fails when:
 - the SDK's default credential chain finds no credentials, with `cache.remote:
   no AWS credentials were found in the SDK's default chain; configure IRSA, EKS
   Pod Identity, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or a shared
-  profile: s3store: get v1/.probe: NoCredentials`;
-- the probe reads `v1/.probe` successfully, with `cache.remote: the startup
-  probe read v1/.probe, which haybale never writes, so the endpoint is not
-  behaving as S3-compatible storage`; or
+  profile: s3store: get v1/.probe/<random>: NoCredentials`;
+- the probe reads its random key successfully, with `cache.remote: the startup
+  probe read a random key under v1/.probe/, which haybale never writes, so the
+  endpoint is not behaving as S3-compatible storage`; or
 - the store's certificate does not verify (`TLSVerificationFailed`), the store
   answers with a redirect (any 3xx, such as `PermanentRedirect` for a bucket in
   another region), or it answers with any 4xx other than a 404 `NoSuchKey`, 408
@@ -712,7 +714,7 @@ Startup fails when:
   responses.
 
 These fail with `cache.remote: the bucket cannot be used with these credentials
-and settings: s3store: get v1/.probe: <code> (HTTP <status>)`. The status part
+and settings: s3store: get v1/.probe/<random>: <code> (HTTP <status>)`. The status part
 is left out when no response arrived, as for a certificate failure. Without
 `s3:ListBucket`, S3 answers a missing key with 403 `AccessDenied` instead of
 404, so an identity that lacks it fails the probe.

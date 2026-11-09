@@ -873,8 +873,9 @@ continues, so a bucket outage cannot stop haybale from starting.
 > `BuildCache(ctx, logger, metrics)` takes no upstream list. An explicit zero
 > size or count selects the default. Validation also requires `maxEntrySize`
 > not above half of `maxDiskSize`, and `remote.region` is always required. The
-> startup probe is a `Get` of `v1/.probe` rather than a `Stat`, because a HEAD
-> response has no body to tell a missing bucket from a missing object.
+> startup probe is a `Get` of a random key under `v1/.probe/`, new at every
+> start so a bucket writer cannot plant it, rather than a `Stat`, because a
+> HEAD response has no body to tell a missing bucket from a missing object.
 
 ## Operational notes
 

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -49,7 +50,7 @@ func remoteCacheConfig(t *testing.T, fake *s3fake.Server, bucket string) CacheCo
 func probeRequests(fake *s3fake.Server) int {
 	n := 0
 	for _, r := range fake.Requests() {
-		if r.Method == http.MethodGet && r.Key == "tenant/v1/.probe" && r.Signed {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.Key, "tenant/v1/.probe/") && r.Signed {
 			n++
 		}
 	}
@@ -302,7 +303,53 @@ func TestBuildCacheFailsAgainstAnUntrustedCertificate(t *testing.T) {
 		closeCache(t, got)
 		t.Fatal("BuildCache succeeded against an untrusted certificate")
 	}
-	if want := "cache.remote: the bucket cannot be used with these credentials and settings: s3store: get v1/.probe: TLSVerificationFailed"; err.Error() != want {
-		t.Errorf("err = %q, want %q", err, want)
+	want := regexp.MustCompile(`^cache\.remote: the bucket cannot be used with these credentials and settings: s3store: get v1/\.probe/[0-9a-f]{32}: TLSVerificationFailed$`)
+	if !want.MatchString(err.Error()) {
+		t.Errorf("err = %q, want one matching %s", err, want)
+	}
+}
+
+func TestAPlantedProbeObjectDoesNotStopStartup(t *testing.T) {
+	s3fake.IsolateAWSEnv(t)
+	fake := s3fake.New(t)
+	fake.PutObject("tenant/v1/.probe", []byte("planted"))
+	fake.PutObject("tenant/v1/.probe/00000000000000000000000000000000", []byte("planted"))
+	c := remoteCacheConfig(t, fake, s3fake.Bucket)
+	for range 2 {
+		got, err := c.BuildCache(context.Background(), slog.New(slog.DiscardHandler), observability.NewNoopMetrics())
+		if err != nil {
+			t.Fatalf("BuildCache with a planted probe object: %v", err)
+		}
+		closeCache(t, got)
+	}
+	var keys []string
+	for _, r := range fake.Requests() {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.Key, "tenant/v1/.probe/") {
+			keys = append(keys, r.Key)
+		}
+	}
+	if len(keys) != 2 || keys[0] == keys[1] || !regexp.MustCompile(`^tenant/v1/\.probe/[0-9a-f]{32}$`).MatchString(keys[0]) {
+		t.Errorf("probe keys = %v, want a new random key per start", keys)
+	}
+}
+
+func TestBuildCacheFailsWhenEveryProbeKeyExists(t *testing.T) {
+	s3fake.IsolateAWSEnv(t)
+	fake := s3fake.New(t)
+	fake.Intercept(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method != http.MethodGet {
+			return false
+		}
+		w.WriteHeader(http.StatusOK)
+		return true
+	})
+	c := remoteCacheConfig(t, fake, s3fake.Bucket)
+	got, err := c.BuildCache(context.Background(), slog.New(slog.DiscardHandler), observability.NewNoopMetrics())
+	if err == nil {
+		closeCache(t, got)
+		t.Fatal("BuildCache succeeded against an endpoint that answers 200 to every key")
+	}
+	if !errors.Is(err, errProbeKeyFound) {
+		t.Errorf("err = %v, want errProbeKeyFound", err)
 	}
 }

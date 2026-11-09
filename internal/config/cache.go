@@ -2,6 +2,8 @@ package config
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -48,10 +50,11 @@ const (
 )
 
 const (
-	// remoteProbeKey is the object BuildCache reads to check that the
-	// bucket is usable. It is never written, so a healthy bucket answers
-	// "not found".
-	remoteProbeKey = "v1/.probe"
+	// remoteProbePrefix holds the objects BuildCache reads to check that
+	// the bucket is usable: a random key per start, never written, so a
+	// healthy bucket answers "not found" and a bucket writer cannot plant
+	// the key in advance.
+	remoteProbePrefix = "v1/.probe/"
 	// remoteProbeTimeout bounds the startup probe of the remote tier.
 	remoteProbeTimeout = 30 * time.Second
 )
@@ -589,13 +592,20 @@ func (c CacheConfig) BuildRemote(ctx context.Context) (cache.BlobStore, error) {
 	return store, nil
 }
 
-// errProbeKeyFound reports a probe GET that succeeded. haybale never
-// writes remoteProbeKey, so the endpoint is not behaving as S3.
-var errProbeKeyFound = errors.New("cache.remote: the startup probe read " + remoteProbeKey +
+// errProbeKeyFound reports a probe GET that succeeded. The key is random
+// and never written, so the endpoint is not behaving as S3.
+var errProbeKeyFound = errors.New("cache.remote: the startup probe read a random key under " + remoteProbePrefix +
 	", which haybale never writes, so the endpoint is not behaving as S3-compatible storage")
 
-// probeRemote reads remoteProbeKey to check that the remote tier is
-// usable. Not found is healthy. A failure that will not resolve itself
+// newProbeKey returns a fresh random key under remoteProbePrefix.
+func newProbeKey() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:]) // crypto/rand.Read never returns an error
+	return remoteProbePrefix + hex.EncodeToString(b[:])
+}
+
+// probeRemote reads a new random key under remoteProbePrefix to check
+// that the remote tier is usable. Not found is healthy. A failure that will not resolve itself
 // fails startup: missing credentials, a certificate that does not verify,
 // a redirect, or any 4xx other than 408 and 429, such as AccessDenied,
 // NoSuchBucket or ExpiredToken. A probe GET that succeeds fails startup
@@ -607,7 +617,7 @@ var errProbeKeyFound = errors.New("cache.remote: the startup probe read " + remo
 func probeRemote(ctx context.Context, store cache.BlobStore, logger *slog.Logger) error {
 	ctx, cancel := context.WithTimeout(ctx, remoteProbeTimeout)
 	defer cancel()
-	rc, _, err := store.Get(ctx, remoteProbeKey, 0)
+	rc, _, err := store.Get(ctx, newProbeKey(), 0)
 	switch {
 	case err == nil:
 		_ = rc.Close()
