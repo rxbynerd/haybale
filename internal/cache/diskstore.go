@@ -319,47 +319,83 @@ func (s *DiskStore) DeletePrefix(prefix string) (int, error) {
 	}
 	defer s.reportLocked()
 
-	names, err := fs.ReadDir(s.root.FS(), dir)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+	removed, err := deleteRepoDir(s.root, dir, func(path string) {
+		if es, ok := s.entries[path]; ok {
+			s.dropLocked(es)
+		}
+	})
+	if err != nil {
 		s.storeError("delete", err)
+	}
+	for path, es := range s.entries {
+		if strings.HasPrefix(path, prefix) {
+			if _, statErr := s.root.Lstat(path); errors.Is(statErr, fs.ErrNotExist) {
+				s.dropLocked(es)
+			}
+		}
+	}
+	return removed, err
+}
+
+// PurgeDiskPrefix deletes every entry under prefix ("v1/<group>/<repoHash
+// hex>/") in the cache directory dir without opening a DiskStore, and
+// returns the number of files removed. It is for a separate process, such
+// as `haybale cache purge`, while a server may be using the directory: it
+// applies the same directory checks as OpenDiskStore but touches no
+// temporary file and no name outside the entry pattern. The server treats
+// a purged entry as a miss and corrects its accounting on its next sweep.
+func PurgeDiskPrefix(dir, prefix string) (n int, err error) {
+	repoDir, ok := strings.CutSuffix(prefix, "/")
+	if !ok || !validRepoDir(repoDir) {
+		return 0, fmt.Errorf("%w prefix %q", errInvalidPath, prefix)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return 0, fmt.Errorf("cache: open dir %q: %w", dir, err)
+	}
+	defer func() { err = errors.Join(err, root.Close()) }()
+	info, err := root.Stat(".")
+	if err != nil {
+		return 0, fmt.Errorf("cache: stat dir %q: %w", dir, err)
+	}
+	if err := checkCacheDir(dir, info, os.Getuid()); err != nil {
 		return 0, err
 	}
-	removed := 0
+	return deleteRepoDir(root, repoDir, func(string) {})
+}
+
+// deleteRepoDir removes every entry file in the repository directory dir,
+// calling removed for each, then the directory itself if it is empty. It
+// returns the number removed and the first error other than a missing
+// file.
+func deleteRepoDir(root *os.Root, dir string, removed func(path string)) (int, error) {
+	names, err := fs.ReadDir(root.FS(), dir)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return 0, err
+	}
+	n := 0
 	var firstErr error
 	for _, d := range names {
 		path := dir + "/" + d.Name()
 		if !validEntryPath(path) {
 			continue
 		}
-		if err := s.root.Remove(path); err != nil {
-			if !errors.Is(err, fs.ErrNotExist) {
-				s.storeError("delete", err)
-				if firstErr == nil {
-					firstErr = err
-				}
+		if err := root.Remove(path); err != nil {
+			if !errors.Is(err, fs.ErrNotExist) && firstErr == nil {
+				firstErr = err
 			}
 			continue
 		}
-		removed++
-		if es, ok := s.entries[path]; ok {
-			s.dropLocked(es)
-		}
+		n++
+		removed(path)
 	}
-	for path, es := range s.entries {
-		if strings.HasPrefix(path, prefix) {
-			if _, err := s.root.Lstat(path); errors.Is(err, fs.ErrNotExist) {
-				s.dropLocked(es)
-			}
-		}
-	}
-	// Removing the repository directory fails harmlessly if anything is
-	// left in it.
-	_ = s.root.Remove(dir)
-	return removed, firstErr
+	// Fails harmlessly if anything is left in the directory.
+	_ = root.Remove(dir)
+	return n, firstErr
 }
 
 // Usage returns the bytes held by committed entries, reserved by live
-// spools, and pinned by readers of removed entries or aborted spools.
+// spools, and pinned by readers of removed entries or ended spools.
 func (s *DiskStore) Usage() (committed, inflight, pinned int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

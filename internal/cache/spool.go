@@ -15,6 +15,7 @@ var (
 	errSpoolCommitted    = errors.New("cache: spool is committed; open the entry instead")
 	errOverReservation   = errors.New("cache: spool write exceeds its reservation")
 	errSpoolReaderClosed = errors.New("cache: spool reader is closed")
+	errSpoolDiscarded    = errors.New("cache: spool is discarded")
 )
 
 type spoolState uint8
@@ -22,13 +23,15 @@ type spoolState uint8
 const (
 	spoolOpen spoolState = iota
 	spoolCommitted
+	spoolDiscarded
 	spoolFailed
 )
 
 // Spool is an entry being written: a temporary file in the cache
 // directory that readers can follow while it grows. It has a single
-// writer; Write, Reserve and Commit must not be called concurrently with
-// each other. Abort, Fail and NewReader may be called from any goroutine.
+// writer; Write, Reserve, Commit and Discard must not be called
+// concurrently with each other. Abort, Fail and NewReader may be called
+// from any goroutine.
 type Spool struct {
 	store *DiskStore
 	path  string
@@ -40,7 +43,7 @@ type Spool struct {
 	// Guarded by store.mu.
 	readers int
 	entry   *entryState // the committed entry, after Commit
-	pinned  int64       // bytes held by readers after failure
+	pinned  int64       // bytes held by readers after Discard or failure
 
 	mu      sync.Mutex
 	cond    *sync.Cond
@@ -93,7 +96,7 @@ func (sp *Spool) Write(p []byte) (int, error) {
 	switch state {
 	case spoolCommitted:
 		return 0, errSpoolCommitted
-	case spoolFailed:
+	case spoolDiscarded, spoolFailed:
 		return 0, err
 	}
 	if reserved := sp.reserved.Load(); written+int64(len(p)) > reserved {
@@ -229,16 +232,32 @@ func (sp *Spool) failCommitLocked(err error) error {
 	return err
 }
 
-// failLocked moves an open spool to the failed state, removes its file and
-// releases its reservation. Bytes already written stay pinned until its
-// readers close.
-func (s *DiskStore) failLocked(sp *Spool, err error) {
+// Discard ends the spool without committing it: readers receive every byte
+// already written and then io.EOF, and the file is removed and the
+// reservation released. Call it after the last Write. The written bytes
+// stay pinned until its readers close. Discarding a finished spool does
+// nothing.
+func (sp *Spool) Discard() {
+	s := sp.store
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.endLocked(sp, spoolDiscarded, errSpoolDiscarded)
+}
+
+// failLocked moves an open spool to the failed state; see endLocked.
+func (s *DiskStore) failLocked(sp *Spool, err error) { s.endLocked(sp, spoolFailed, err) }
+
+// endLocked moves an open spool to state, which is spoolDiscarded or
+// spoolFailed, removes its file and releases its reservation. err is what
+// later spool operations return. Bytes already written stay pinned until
+// its readers close.
+func (s *DiskStore) endLocked(sp *Spool, state spoolState, err error) {
 	sp.mu.Lock()
 	if sp.state != spoolOpen {
 		sp.mu.Unlock()
 		return
 	}
-	sp.state = spoolFailed
+	sp.state = state
 	sp.err = err
 	written := sp.written
 	sp.cond.Broadcast()
@@ -263,7 +282,7 @@ func (sp *Spool) openErr() error {
 	switch sp.state {
 	case spoolCommitted:
 		return errSpoolCommitted
-	case spoolFailed:
+	case spoolDiscarded, spoolFailed:
 		return sp.err
 	}
 	return nil
@@ -280,8 +299,8 @@ type SpoolReader struct {
 }
 
 // Read returns written bytes, blocking until more are written. After the
-// spool is committed it returns io.EOF once every byte has been read;
-// after Abort or Fail it returns the failure error immediately.
+// spool is committed or discarded it returns io.EOF once every byte has
+// been read; after Abort or Fail it returns the failure error immediately.
 func (r *SpoolReader) Read(p []byte) (int, error) {
 	sp := r.sp
 	sp.mu.Lock()
@@ -299,7 +318,7 @@ func (r *SpoolReader) Read(p []byte) (int, error) {
 		if avail = sp.written - r.off; avail > 0 {
 			break
 		}
-		if sp.state == spoolCommitted {
+		if sp.state == spoolCommitted || sp.state == spoolDiscarded {
 			sp.mu.Unlock()
 			return 0, io.EOF
 		}
@@ -347,7 +366,7 @@ func (r *SpoolReader) Close() error {
 	switch state {
 	case spoolCommitted:
 		s.releaseLocked(sp.entry)
-	case spoolFailed:
+	case spoolDiscarded, spoolFailed:
 		if sp.readers == 0 {
 			s.pinned -= sp.pinned
 			sp.pinned = 0

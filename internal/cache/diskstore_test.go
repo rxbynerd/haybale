@@ -1007,3 +1007,156 @@ func stressRead(s *DiskStore, p string) (err error) {
 	}
 	return nil
 }
+
+func TestSpoolDiscardDrainsReaders(t *testing.T) {
+	dir := cacheDir(t)
+	s := openStore(t, dir, 1<<20, nil)
+	p := entryPath(GroupPack, 1, 1)
+	sp, err := s.Create(p, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ahead, err := sp.NewReader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	behind, err := sp.NewReader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sp.Write([]byte("complete response")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(ahead, make([]byte, 17)); err != nil {
+		t.Fatal(err)
+	}
+	done := readAsync(ahead)
+	assertBlocked(t, done)
+
+	sp.Discard()
+	if res := <-done; res.err != nil || len(res.data) != 0 {
+		t.Fatalf("reader at the end after Discard: %q, %v", res.data, res.err)
+	}
+	if got, err := io.ReadAll(behind); err != nil || string(got) != "complete response" {
+		t.Fatalf("lagging reader after Discard: %q, %v", got, err)
+	}
+	assertUsage(t, s, 0, 0, 17)
+	if _, err := sp.Write([]byte("x")); !errors.Is(err, errSpoolDiscarded) {
+		t.Fatalf("Write after Discard: err = %v", err)
+	}
+	if _, err := sp.NewReader(); !errors.Is(err, errSpoolDiscarded) {
+		t.Fatalf("NewReader after Discard: err = %v", err)
+	}
+	if err := sp.Commit(); !errors.Is(err, errSpoolDiscarded) {
+		t.Fatalf("Commit after Discard: err = %v", err)
+	}
+	mustClose(t, ahead)
+	mustClose(t, behind)
+	assertUsage(t, s, 0, 0, 0)
+	if _, err := s.Open(p); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("discarded entry is visible: err = %v", err)
+	}
+	if names, _ := os.ReadDir(dir); len(names) != 0 {
+		t.Fatalf("cache dir still holds %v", names)
+	}
+}
+
+// TestSealedEntryThroughSpool writes a sealed entry into a spool while a
+// SealedReader follows it, for both ways a fill can end cleanly.
+func TestSealedEntryThroughSpool(t *testing.T) {
+	kr := testKeyring(t)
+	body := randomBody(t, 3*SegmentSize+99)
+	for name, end := range map[string]func(*Spool) error{
+		"commit":  (*Spool).Commit,
+		"discard": func(sp *Spool) error { sp.Discard(); return nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := openStore(t, cacheDir(t), 1<<24, nil)
+			sp, err := s.Create(entryPath(GroupPack, 1, 1), SealedSize(int64(len(body)))+segmentOverhead)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := sp.NewReader()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mustClose(t, r)
+
+			read := make(chan readResult, 1)
+			go func() {
+				sr, err := NewSealedReader(r, kr)
+				if err != nil {
+					read <- readResult{nil, err}
+					return
+				}
+				data, err := io.ReadAll(sr)
+				read <- readResult{data, err}
+			}()
+
+			w, err := NewSealedWriter(sp, kr, testHeader())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Write(body[:10]); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Write(body[10:]); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := end(sp); err != nil {
+				t.Fatal(err)
+			}
+			res := <-read
+			if res.err != nil || !bytes.Equal(res.data, body) {
+				t.Fatalf("read %d bytes, err %v", len(res.data), res.err)
+			}
+		})
+	}
+}
+
+func TestPurgeDiskPrefixLeavesLiveServerAlone(t *testing.T) {
+	dir := cacheDir(t)
+	s := openStore(t, dir, 1<<20, nil)
+	for k := byte(1); k <= 2; k++ {
+		commitEntry(t, s, entryPath(GroupRefs, 1, k), []byte("refs"))
+	}
+	commitEntry(t, s, entryPath(GroupPack, 1, 1), []byte("pack"))
+	live, err := s.Create(entryPath(GroupRefs, 1, 3), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := live.Write([]byte("live")); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := PurgeDiskPrefix(dir, "v1/refs/"+hex64(1)+"/")
+	if err != nil || n != 2 {
+		t.Fatalf("PurgeDiskPrefix = %d, %v; want 2", n, err)
+	}
+	if _, err := s.Open(entryPath(GroupRefs, 1, 1)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("server Open of a purged entry: err = %v", err)
+	}
+	s.sweep(time.Hour)
+	assertUsage(t, s, 4, 10, 0)
+	if err := live.Commit(); err != nil {
+		t.Fatalf("live spool broken by purge: %v", err)
+	}
+	readStoreEntry(t, s, entryPath(GroupPack, 1, 1))
+
+	if _, err := PurgeDiskPrefix(dir, "v1/refs/"+hex64(1)); !errors.Is(err, errInvalidPath) {
+		t.Fatalf("invalid prefix: err = %v", err)
+	}
+	loose := filepath.Join(t.TempDir(), "loose")
+	if err := os.Mkdir(loose, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PurgeDiskPrefix(loose, "v1/refs/"+hex64(1)+"/"); err == nil {
+		t.Fatal("PurgeDiskPrefix accepted a group-accessible directory")
+	}
+}
