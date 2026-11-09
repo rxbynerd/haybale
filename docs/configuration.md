@@ -494,8 +494,8 @@ the block is rejected as an unknown field.
 | `responseHeaderTimeout` | `60s`    | Go duration string bounding how long haybale waits for the upstream's response headers on a cache fill. `0s` applies no bound. Does not affect requests that bypass the cache. |
 | `idleTimeout`           | `2m`     | Go duration string bounding the gap between body bytes from the upstream during a cache fill. `0s` leaves the gap unbounded. Does not affect requests that bypass the cache. |
 | `exposeStatus`          | `false`  | Emits a `Cache-Status` response header describing how the cache handled the request. See [Cache-Status](security.md#cache-status-disclosure). |
-| `remote`                | (unset)  | Reserved for a later release; fails startup if set. See "Reserved fields".                               |
-| `staleIfErrorFor`       | (unset)  | Reserved for a later release; fails startup unless empty or `0s`. See "Reserved fields".                 |
+| `remote`                | (unset)  | Optional remote tier that replicas share, in an S3-compatible bucket. Requires `keyEnv`. See "Remote tier". |
+| `staleIfErrorFor`       | (unset)  | Reserved for a later release; fails startup unless empty or `0s`. See "Reserved field".                  |
 
 ### Sizes and durations
 
@@ -517,8 +517,9 @@ or `24h` and must not be negative.
 Validation of the `cache` block is structural: it checks that no key is
 unknown, the syntax of every size and duration, that `dir` is set, that
 `retention` is greater than zero, that `maxEntrySize` does not exceed half of
-`maxDiskSize`, and that `refsMaxAge` is less than `accessRecheck` when both are
-non-zero. An explicit `0` for `maxDiskSize`, `maxEntrySize`,
+`maxDiskSize`, that `refsMaxAge` is less than `accessRecheck` when both are
+non-zero, and, when `remote` is set, the remote fields and that `keyEnv` is set
+(see "Remote tier"). An explicit `0` for `maxDiskSize`, `maxEntrySize`,
 `maxConcurrentFills` or `maxRequestBody` is replaced by the default before
 validation. Negative and malformed values fail startup.
 
@@ -531,8 +532,8 @@ would stop being served while refs were still cached.
 
 Validation does not touch the filesystem, the network or the environment, so
 `haybale policy check` stays offline when a cache block is present, with or
-without the cache key or directory. The directory and key are checked when
-`haybale serve` starts.
+without the cache key, directory or bucket. The directory, the key and the
+bucket are checked when `haybale serve` starts.
 
 ### Cache directory
 
@@ -591,8 +592,10 @@ credential's `tokenEnv`, the key is never written inline in the config file.
 Protect it like a credential; the [security model](security.md#sealed-entries)
 describes what it protects.
 
-`keyEnv` is optional while only the local disk tier exists. When it is left
-empty, haybale generates a key at startup and discards it on exit. At the next
+`keyEnv` is optional for a cache without a remote tier, and required with
+`remote`, because replicas must seal and address entries under the same key.
+When it is left empty, haybale generates a key at startup and discards it on
+exit. At the next
 start it deletes every entry in the directory, because none can be read, so the
 cache is empty after every restart. `haybale cache purge` cannot address
 entries sealed under an ephemeral key. Set `keyEnv` to keep the cache across
@@ -613,20 +616,90 @@ states what retention and purging do and do not guarantee, and
 [Access recheck](security.md#access-recheck) states how revoked upstream access
 becomes visible.
 
-### Reserved fields
+### Remote tier
 
-Two fields are reserved for later releases and **fail startup if set** in this
-release:
+```yaml
+cache:
+  enabled: true
+  dir: /var/cache/haybale/data
+  keyEnv: HAYBALE_CACHE_KEY        # required with remote
+  remote:
+    type: s3                       # required; the only type
+    bucket: haybale-cache          # required
+    prefix: prod/                  # optional; must end with "/"
+    region: us-east-1              # required
+    endpoint: ""                   # optional; https, or http for a loopback host
+    forcePathStyle: false          # optional, default shown
+    headerTimeout: 10s             # optional, default shown
+    sse: ""                        # optional: AES256 or aws:kms
+    kmsKeyID: ""                   # optional; only with sse: aws:kms
+```
 
-- `remote`: an optional shared remote tier in object storage. Any non-empty
-  value under `cache.remote` is rejected with `cache: remote is not supported in
-  this release; remove the remote block`. The planned fields are `type`,
-  `bucket`, `prefix`, `region`, `endpoint`, `forcePathStyle`, `headerTimeout`,
-  `sse` and `kmsKeyID`.
-- `staleIfErrorFor`: serving an older entry when the upstream is unavailable.
-  Only an empty value or a zero duration such as `0s` is accepted; any other
-  value is rejected with `cache: staleIfErrorFor is not supported in this
-  release (got "..."); leave it empty or "0s"`.
+`remote` adds a second tier that every replica shares: a prefix of an
+S3-compatible bucket. An entry stored on one replica's disk is uploaded to the
+bucket, and a replica that misses on its own disk reads the entry from the
+bucket before it asks the upstream. The [caching guide](caching.md#remote-tier)
+explains how the two tiers interact and which stores work.
+
+| Field            | Default | Notes |
+|------------------|---------|-------|
+| `type`           | (unset) | Required. `s3` is the only type. |
+| `bucket`         | (unset) | Required. |
+| `prefix`         | (unset) | Prepended to every object key. Empty, or ending with `/`; directory buckets require the slash. Replicas that share a prefix share entries, so one prefix is one trust domain. |
+| `region`         | (unset) | Required. The signing region, and the region of the AWS endpoint when `endpoint` is empty. It is never read from `AWS_REGION` or the shared AWS configuration. |
+| `endpoint`       | (unset) | Service base URL. Must be `https`; `http` is accepted only for a loopback host. It must not carry credentials, a query or a fragment. Empty selects `https://s3.<region>.amazonaws.com`. |
+| `forcePathStyle` | `false` | Addresses the bucket in the URL path (`https://<endpoint>/<bucket>/<key>`) instead of the host name. Most self-hosted stores need it. |
+| `headerTimeout`  | `10s`   | Go duration string: time to first byte of a remote read on the request path, and of each remote existence check, listing and deletion. Uploads and the body of a read are not bounded by it; a read's body falls under `idleTimeout`. `0s` applies no bound. |
+| `sse`            | (unset) | Server-side encryption requested on upload: `AES256` or `aws:kms`. Optional, because entries are already sealed. |
+| `kmsKeyID`       | (unset) | KMS key for `sse: aws:kms`; rejected with any other `sse`. Empty uses the bucket's default KMS key. |
+
+Validation requires `keyEnv` whenever `remote` is set: under an ephemeral key no
+replica could read another's entries. Like the rest of the block, validation is
+structural and offline. When `haybale serve` starts, it reads the object
+`v1/.probe` under the prefix, which haybale never writes, so a "not found"
+answer means the bucket is usable. An authorization or bucket error (HTTP 401
+or 403, `AccessDenied`, `InvalidAccessKeyId`, `SignatureDoesNotMatch` or
+`NoSuchBucket`) fails startup. Any other failure, such as a network error or a
+5xx response, is logged as a warning and startup continues, so a bucket outage
+cannot stop haybale from starting.
+
+**Endpoint.** haybale always sets the endpoint itself, so `AWS_ENDPOINT_URL`,
+`AWS_ENDPOINT_URL_S3` and `endpoint_url` in the shared AWS configuration are
+ignored. Leave `endpoint` empty only for an AWS S3 general-purpose bucket outside
+the China partitions. Set it for an S3 Express One Zone directory bucket (its
+zonal endpoint, `https://s3express-<zone id>.<region>.amazonaws.com`), for the
+China partitions (`https://s3.<region>.amazonaws.com.cn`), and for any other
+store: Cloudflare R2, Ceph RGW or the Google Cloud Storage interoperability
+endpoint. The S3 client uses its own HTTP transport, so `AWS_CA_BUNDLE` is not
+supported: a store whose certificate is issued by a private authority needs
+that authority in the system trust store. Proxy environment variables are not
+used for the bucket either.
+
+**Credentials.** Credentials come from the AWS SDK's default chain: the
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` environment variables, the
+shared credentials and configuration files, web identity (IRSA), the EKS Pod
+Identity agent, the ECS container endpoint, and EC2 instance metadata. On
+Kubernetes, prefer workload identity (IRSA or Pod Identity) to static keys, and
+on EC2 nodes require IMDSv2 with a hop limit of 1, so pods cannot use the node's
+instance role. The identity needs `s3:GetObject`, `s3:PutObject` and
+`s3:DeleteObject` on `<bucket>/<prefix>*` and `s3:ListBucket` on the bucket for
+the prefix, plus `kms:GenerateDataKey` and `kms:Decrypt` on the key when `sse`
+is `aws:kms`.
+
+**Bucket.** Keep the bucket private. Add a lifecycle rule that expires objects
+under the prefix after `retention` plus a margin, for example two days for the
+default `24h`. haybale judges an entry's age from the time sealed into it, so
+the rule is only garbage collection, and lifecycle expiry is day-granular on
+every store. Server-side encryption is optional defence in depth: the entries
+are already encrypted and authenticated under the cache key.
+
+### Reserved field
+
+`staleIfErrorFor` is reserved for a later release and **fails startup if set**
+in this release. It will serve an older entry when the upstream is unavailable.
+Only an empty value or a zero duration such as `0s` is accepted; any other value
+is rejected with `cache: staleIfErrorFor is not supported in this release (got
+"..."); leave it empty or "0s"`.
 
 ## Worked example
 

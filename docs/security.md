@@ -225,7 +225,8 @@ end-to-end headers continue to follow reverse-proxy forwarding rules.
 ## Response cache
 
 The optional [response cache](caching.md) serves the pack transfer of repeated
-identical clones and fetches from local disk. It is off by default. This
+identical clones and fetches from local disk and, when a remote tier is
+configured, from a bucket shared by replicas. It is off by default. This
 section describes what it changes about haybale's security properties; the
 properties above hold for every request, cached or not. Stale-if-error is
 reserved for a later release and is not available.
@@ -324,7 +325,7 @@ the repository name.
 An entry's age is the creation time authenticated in its header, not the file
 modification time, so changing a file's time does not extend its life.
 
-The key protects a cache directory (or, in a later release, a bucket) against
+The key protects a cache directory, and the remote tier's bucket, against
 someone who can read or write it but does not hold the key: such a party cannot
 read repository contents or names and cannot forge, alter or move an entry,
 although it can restore an earlier valid copy of one until `retention` ends. It
@@ -347,6 +348,48 @@ Handle the key as a credential:
 When `keyEnv` is unset, haybale generates a key at startup and discards it on
 exit. At the next start it deletes every entry in the directory, because none
 can be read, so the cache is empty after every restart.
+
+### Remote tier
+
+With `cache.remote` set, replicas upload their sealed entries to an
+S3-compatible bucket and read each other's. The bucket holds exactly the sealed
+bytes the disk holds, so the properties of [sealed entries](#sealed-entries)
+carry over: whoever can write to the bucket without the cache key cannot read
+repository contents or names and cannot forge an entry, alter one, or move one
+to another key. Every entry read from the bucket is verified segment by segment
+before any byte reaches a client. An entry that fails is deleted from the
+bucket, a `cache_integrity_failed` event with `tier=remote` is logged, and the
+request is answered from the upstream if no byte had been sent. A bucket writer
+can still delete entries, which costs upstream fetches, and restore an earlier
+valid copy of an entry until its `retention` ends. Object names reveal what a
+directory listing does: the group, which entries share a repository, and each
+entry's size and time.
+
+The cache key and the bucket credentials are separate secrets. The bucket
+credentials come from the AWS SDK's default credential chain; prefer workload
+identity (IRSA or EKS Pod Identity) to static keys, and on EC2 nodes require
+IMDSv2 with a hop limit of 1 so that pods cannot use the node's role. Keep the
+bucket private. One prefix is one trust domain: every replica that can write it
+can make the others serve what it stored, so share a prefix only between
+replicas with the same key, upstreams and policy.
+
+The client for the bucket always uses the configured endpoint
+(`AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_S3` and shared-config endpoints are
+ignored), requires `https` except for a loopback host, uses TLS 1.2 or later,
+uses no proxy from the environment, and does not follow redirects, so a signed
+request is never sent to a host the configuration did not name. A failed
+bucket operation is logged as its operation, object key (a hashed path), S3
+error code and HTTP status only: never the SDK's error text, request ids or
+credentials.
+
+A purge with `--remote` writes a purge marker, an object sealed under the cache
+key that records when each group of the repository was purged. Replicas read it
+alongside each upstream refs request for the repository, and drop local entries
+created before it. A marker sealed under another key or for another repository
+is rejected with a `cache_integrity_failed` event, so a bucket writer cannot
+purge a repository. A bucket writer can delete a marker before the replicas
+read it, in which case their older local entries stay servable until
+`retention`, as they would without the marker.
 
 ### Entries are shared across identities
 
@@ -381,9 +424,12 @@ rewrite; lower it where that window is too long.
 
 To end the exposure immediately, run `haybale cache purge` for the repository
 (see [Purging a repository](caching.md#purging-a-repository)). The command
-works on one cache directory. In this release every replica has its own
+works on one cache directory. Without a remote tier every replica has its own
 directory, so run the purge on every replica, or restart every replica that has
-no `keyEnv`, which empties its cache.
+no `keyEnv`, which empties its cache. With a remote tier, `--remote` also
+deletes the repository's entries from the bucket and writes the purge marker
+described under [Remote tier](#remote-tier); each replica then honours the
+purge at its next upstream refs request for the repository.
 
 Rewrite the history upstream first and purge afterwards. Some hosts, GitHub
 among them, keep serving unreachable objects by id until garbage collection, so
@@ -445,8 +491,10 @@ by a scrubber that redacts:
 - Basic and Bearer authorization values;
 - credentials in URL userinfo;
 - compact JWTs;
-- known GitHub token prefixes; and
-- PEM private-key headers.
+- known GitHub token prefixes;
+- PEM private-key headers; and
+- AWS access key ids (`AKIA` and `ASIA` followed by 16 characters) and the
+  value of an `x-amz-security-token` header or query parameter.
 
 The scrubber applies to log messages, string attributes, error attributes, and
 grouped values before records reach stderr or OTLP. It is defense in depth, not
@@ -464,9 +512,10 @@ haybale emits warning-level structured events for:
 - `policy_denied`
 - `upstream_auth_failed`
 - `token_minted`
-- `cache_integrity_failed`: a stored cache entry failed verification, was
-  relocated, or carried an implausible creation time. It carries the host,
-  owner, repository and request class and never key material.
+- `cache_integrity_failed`: a stored cache entry or purge marker failed
+  verification, was relocated, or carried an implausible creation time. It
+  carries the host, owner, repository and request class, and `tier=remote` when
+  the entry came from the remote tier, and never key material.
 
 Monitor repeated authentication failures, policy probes, upstream credential
 failures, token-mint spikes, JWKS refresh warnings, and any

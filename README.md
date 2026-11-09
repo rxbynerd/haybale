@@ -20,7 +20,8 @@ client.
 - streaming Git smart-HTTP proxying with no pack-size limit
 - an optional, encrypted on-disk response cache that serves the pack transfer
   of repeated identical clones and fetches from disk instead of fetching it
-  from the upstream again
+  from the upstream again, and can share entries between replicas through an
+  S3-compatible bucket
 - TLS, graceful draining, structured security logs, and optional OpenTelemetry
   traces, metrics, and logs
 
@@ -110,7 +111,7 @@ See the [configuration reference](docs/configuration.md) for complete examples.
 ```text
 haybale serve [--config haybale.yaml]
 haybale policy check --config haybale.yaml --id ID --repo HOST/OWNER/REPO --verb read|write
-haybale cache purge --config haybale.yaml --repo HOST/OWNER/REPO [--group refs|pack]
+haybale cache purge --config haybale.yaml --repo HOST/OWNER/REPO [--group refs|pack] [--remote]
 haybale version
 ```
 

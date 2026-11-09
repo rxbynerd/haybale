@@ -1,8 +1,9 @@
 # Response cache
 
 haybale can cache the responses to Git clone and fetch requests on local disk,
-so that a fleet of workloads cloning the same repository costs one upstream
-pack transfer instead of one per clone. The cache is optional and off by default.
+and optionally share them between replicas through an S3-compatible bucket, so
+that a fleet of workloads cloning the same repository costs one upstream pack
+transfer instead of one per clone. The cache is optional and off by default.
 This guide explains what it does, how to size and deploy it, and how to operate
 it. The field reference is in [`configuration.md`](configuration.md#cache), the
 security properties are in [`security.md`](security.md#response-cache), and the
@@ -30,8 +31,8 @@ The cache does not:
 - serve incremental fetches, which send `have` lines and always go upstream;
 - serve reads while the upstream is down: stale-if-error is planned, not
   available;
-- share entries between haybale processes: each process has its own directory
-  and its own copy; or
+- share entries between haybale processes unless a [remote tier](#remote-tier)
+  is configured: each process has its own directory and its own copy; or
 - change what clients receive. A cached response is the upstream's own bytes for
   the same request.
 
@@ -103,7 +104,9 @@ and contained no in-band error. A response that does not qualify is not stored,
 and in most cases is still delivered to the clients; the exceptions are listed
 under [Troubleshooting](#some-fills-are-discarded). A push ends with the
 repository's cached refs entries being deleted, even when the pusher
-disconnects before the response completes.
+disconnects before the response completes. With a [remote tier](#remote-tier),
+a fill first looks for the entry in the bucket and asks the upstream only when
+the bucket has no usable copy.
 
 If the upstream answers a fill's request with something other than a cacheable
 `200`, for example a `404` or `503`, haybale buffers up to 64KiB of that
@@ -249,6 +252,85 @@ writable volume at a parent directory and point `cache.dir` at a child of it, as
 in the Kubernetes example. The haybale user (UID 65532) must be able to write to
 the volume, and creates the child with mode `0700`.
 
+## Remote tier
+
+With [`cache.remote`](configuration.md#remote-tier) set, replicas share entries
+through a prefix of an S3-compatible bucket. Each replica keeps its own disk
+tier, and the bucket is a second tier behind it. All replicas sharing a prefix
+must use the same `keyEnv` key and the same upstreams.
+
+How the two tiers interact:
+
+- After a fill stores an entry on disk, the replica uploads it in the
+  background. Four uploads run at a time and up to 256 wait; when the queue is
+  full the entry is not uploaded, and `uploads.total` counts it with
+  `result=dropped`. A pack entry the bucket already holds is not uploaded again
+  (`result=skipped`), because its content is fixed by its request. A refs
+  entry always replaces the bucket's copy, so peers see the latest tips.
+- On a disk miss, a replica reads the entry from the bucket before it asks the
+  upstream, under the same freshness rules as a disk hit: a pack needs a recent
+  upstream refs success on this replica (`accessRecheck`), and a refs entry is
+  used only while `refsMaxAge` is above `0s` and the entry is younger than it.
+  Requests for the same key join that read as they would join an upstream fill,
+  and the entry is stored on this replica's disk too. The request is reported
+  as a miss (`fwd=miss` in `Cache-Status`, `cache=miss` with `cacheStored` in
+  the request log), and its bytes are counted with `tier=remote`.
+- If the bucket has no copy, or the read fails before any byte reaches a
+  client, the same fill asks the upstream. If the read fails or stalls for
+  `idleTimeout` after bytes were sent, haybale resumes it from where it stopped,
+  up to three times, and otherwise closes the clients' connections.
+- Every entry read from the bucket is verified with the cache key before a
+  client receives any of it. An entry that fails verification is deleted from
+  the bucket and logged as a `cache_integrity_failed` security event with
+  `tier=remote`; the request is answered from the upstream when no bytes had
+  been sent.
+- A push also deletes the repository's refs entries from the bucket, in the
+  background.
+- At shutdown, `haybale serve` waits for queued uploads within the same bound it
+  gives fills in progress, then abandons the rest.
+
+Behind a load balancer without client affinity, a clone's `ls-refs` and `fetch`
+can reach different replicas. The `fetch` then misses on the second replica's
+disk, and is served from the bucket if that replica has itself seen a recent
+refs success for the repository, or from the upstream otherwise.
+
+### Supported stores
+
+| Store | Settings |
+|-------|----------|
+| AWS S3, general-purpose bucket | `region`; no `endpoint`, except in the China partitions (`https://s3.<region>.amazonaws.com.cn`). |
+| AWS S3 Express One Zone directory bucket | `endpoint` set to the zonal endpoint (`https://s3express-<zone id>.<region>.amazonaws.com`); a `prefix` ending with `/`. Suits replicas in that Availability Zone. |
+| Cloudflare R2 | `endpoint: https://<account id>.r2.cloudflarestorage.com`, `region: auto`, no `sse`. R2 charges no egress, which suits replicas spread across clouds. |
+| Ceph RGW | `endpoint` set to the gateway URL, `forcePathStyle: true` unless the gateway serves bucket host names, and `region` set to the zonegroup's API name. |
+| Google Cloud Storage | The interoperability endpoint, `endpoint: https://storage.googleapis.com`, with an HMAC key supplied as `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; `region` set to the bucket's location or `auto`; no `sse`. |
+
+The MinIO server's community repository is archived, so MinIO is not
+recommended for new deployments. An existing MinIO installation works like any
+S3-compatible store with `forcePathStyle: true`.
+
+### Sizing the bucket
+
+The bucket holds one copy of each entry any replica stored, until the lifecycle
+rule removes it. Its size is roughly the distinct pack entries the fleet creates
+within `retention` plus the lifecycle margin; refs entries are kilobytes.
+Entries over 5GiB are never uploaded, which the default `maxEntrySize` of 1GiB
+already guarantees. Request volume is one read per eligible disk miss, one
+small read of the purge marker per upstream refs response, and one upload per
+stored entry (plus an existence check for a pack). Every read of the bucket
+leaves the store's network, so egress pricing matters when replicas run outside
+the bucket's region or cloud.
+
+### Bucket hygiene
+
+Keep the bucket private and add a lifecycle rule that expires objects under the
+prefix after `retention` plus a margin, for example two days for the default
+`24h`. haybale judges an entry's age from the time sealed into it, so the rule
+is garbage collection only, and lifecycle expiry is day-granular on every
+store. Server-side encryption (`sse`) is optional, because the entries are
+already sealed. Keep the hosts' clocks synchronised: a purge compares the
+purging host's clock with the creation time each replica sealed into its
+entries.
+
 ## Observing the cache
 
 The metrics are described in [`observability.md`](observability.md). To judge the
@@ -257,15 +339,18 @@ cache:
 - hit rate: `haybale.response_cache.lookups.total` with `result=hit` over all
   lookups of `class=fetch`. Judge the `fetch` class: with the default
   `refsMaxAge`, ref requests are always recorded as misses by design;
-- bytes saved: `served_bytes.total` with `tier=disk`, against `fill_bytes.total`,
-  which is what the fills fetched from the upstream, including discarded fills
-  and refs fills (its `tier` is always `upstream`);
+- bytes saved: `served_bytes.total` with `tier=disk`, against `fill_bytes.total`
+  with `tier=upstream`, which is what the fills fetched from the upstream,
+  including discarded fills and refs fills. With a remote tier,
+  `fill_bytes.total` and `served_bytes.total` with `tier=remote` count what
+  replicas read from the bucket instead of the upstream;
+- uploads to the remote tier: `uploads.total` by `result`;
 - coalescing: `collapsed.total` counts requests that joined a fill already in
   flight;
 - fills that were not stored: `fills.total` with `result=discarded` and its
   `reason`; and
-- storage health: `store_errors.total` by `operation`, and the `disk_bytes`
-  up/down counter (read it as a gauge) against `maxDiskSize`.
+- storage health: `store_errors.total` by `tier` and `operation`, and the
+  `disk_bytes` up/down counter (read it as a gauge) against `maxDiskSize`.
 
 Each `proxied request` log line of a read carries a `cache` field (`hit`,
 `miss` or `bypass`), plus `cacheCollapsed` and `cacheStored` on a miss. To see
@@ -303,7 +388,14 @@ Log lines to alert on, all at Warn unless noted:
 - `invalidating refs entries after a push failed`: the push's cached refs
   entries could not be deleted. With `refsMaxAge` above `0s`, later reads can
   receive the tips from before the push until the entries expire.
-- `response cache did not close cleanly`: shutdown left fills running.
+- `response cache did not close cleanly`: shutdown left fills running or
+  uploads pending.
+- `remote cache tier operation failed`: a read, upload, existence check,
+  listing or deletion against the bucket failed. The `operation` field names
+  it and the `error` field carries the operation, the S3 error code and the
+  HTTP status, never the SDK's message.
+- `cache.remote: the startup probe of the bucket failed; continuing, and remote
+  operations retry on use`: the bucket could not be reached at startup.
 
 Lines of lower value, all at Warn except where noted:
 
@@ -323,11 +415,15 @@ Lines of lower value, all at Warn except where noted:
 
 Informational lines to expect, at Info, in start-up order: the ephemeral-key
 notice (when `keyEnv` is unset), `removed cache entries sealed under another key`
-(after a key change), and `response cache enabled` (with `dir`, `keyMode` and the
-sizes); and `response cache closed` at shutdown.
+(after a key change), `response cache enabled` (with `dir`, `keyMode` and the
+sizes) and `response cache remote tier enabled` (with the bucket, prefix, region
+and endpoint); `cache: removed entries older than the repository's purge marker`
+after a purge with `--remote` on another replica; and `response cache closed` at
+shutdown.
 
 Metrics to alert on: any increase of `store_errors.total`; a sustained rate of
-`fills.total` with `reason` of `store_error`, `disk_budget` or `encoding`; and
+`fills.total` with `reason` of `store_error`, `disk_budget` or `encoding`;
+`uploads.total` with `result` of `failed` or `dropped`; and
 `lookups.total` bypass rates that rise without a change in traffic. Bypass
 reasons appear only in the debug-level `bypass` log line (see [Clones always
 miss](#clones-always-miss)).
@@ -377,7 +473,7 @@ command cannot tell these apart.
 The command fails with an error when the cache is not enabled, when `keyEnv` is
 not set in the config (an ephemeral key cannot address entries), when the
 variable `keyEnv` names is unset or malformed, when the host is not a configured
-upstream, when `--remote` is given (not supported in this release), or when
+upstream, when `--remote` is given without a `cache.remote` block, or when
 `--group` is not `refs` or `pack`.
 
 It works while the server runs: the server treats a removed entry as a miss. The
@@ -387,8 +483,31 @@ interrupted and can still store an entry afterwards, so run the purge after the
 upstream change, and run it again once clones that were in flight have finished
 if the content must not be served at all.
 
-Each replica has its own directory, so purge on every replica. On Kubernetes,
-run the command inside each pod, where the container already has the key:
+With a remote tier, add `--remote`:
+
+```sh
+haybale cache purge --config /etc/haybale/haybale.yaml \
+  --repo github.com/acme/widgets --remote
+```
+
+After the local purge, the command records the purge in the repository's purge
+marker in the bucket (`v1/purge/<repoHash>` under the prefix), then deletes the
+repository's entries from the bucket, and prints `purged N entries from the
+remote tier and wrote the purge marker`. It needs the bucket credentials as
+well. The marker is sealed under the cache key and records the purge time of
+each group. Every replica reads it alongside each upstream refs request for the
+repository, and drops its local entries created before the purge time; until
+then those entries are still served. Because a pack hit needs a recent refs
+success, a replica that reads the marker on a clone's `ls-refs` also misses that
+clone's `fetch`. A replica therefore honours a purge at its next upstream refs
+request for the repository. If reading the marker fails, the replica does not
+try again for a minute, so the delay is then one minute plus that request. With
+`refsMaxAge` above `0s`, a refs hit does not read the marker, so cached refs
+entries can be served for up to `refsMaxAge` after the purge.
+
+Without a remote tier each replica has its own directory, so purge on every
+replica. On Kubernetes, run the command inside each pod, where the container
+already has the key:
 
 ```sh
 for pod in $(kubectl get pods -l app=haybale -o name); do
@@ -399,8 +518,9 @@ done
 
 Rotating the key is a cold cache. At the next start haybale deletes every entry
 sealed under the previous key. To remove a repository's entries before then, run
-the purge with the previous key still set. `--remote` is rejected: purging a
-remote tier is not supported in this release.
+the purge with the previous key still set. In the bucket, entries under the
+previous key are addressed by different names, are never read again, and age
+out through the lifecycle rule.
 
 ## Troubleshooting
 
@@ -436,7 +556,10 @@ remote tier is not supported in this release.
 - A fill that was discarded marks its key uncacheable for one minute, or for
   `retention` after an oversize response (`too_large`), so clones for that key
   miss until the mark expires.
-- With several replicas behind a load balancer, each replica has its own cache.
+- With several replicas behind a load balancer, each replica has its own cache
+  unless they share a [remote tier](#remote-tier). With a remote tier, check
+  `uploads.total` for `failed` or `dropped` results and `store_errors.total`
+  with `tier=remote`.
 
 ### Hits are rare after a restart
 
@@ -468,8 +591,9 @@ The `reason` on `fills.total` says why, and what clients see depends on it:
   clients that had received bytes lose the connection.
 - `encoding`: the upstream answered with a content encoding. The waiting
   requests go to the upstream directly.
-- `store_error`: the disk failed, or the fill panicked. If the entry could not
-  be committed after the whole body was received and sealed, clients still
+- `store_error`: the disk failed, the fill panicked, or a read from the remote
+  tier failed past its resumes or did not verify. If the entry could not be
+  committed after the whole body was received and sealed, clients still
   receive the response. If the disk failed earlier, including while writing the
   entry's trailer, requests that had received bytes lose the connection, and
   requests that had not go to the upstream directly.
@@ -491,8 +615,9 @@ length, so a pack that outgrows `maxEntrySize` while the budget is full (the
 The connection is closed without a clean ending only after bytes were sent: the
 upstream failed or went silent mid-response, the disk failed or its budget ran
 out mid-response (including a response that outgrew `maxEntrySize` with no free
-budget left), or a stored entry failed its integrity check while it was being
-read. If the upstream does not send response headers within
+budget left), a stored entry failed its integrity check while it was being
+read, or a read from the remote tier failed after three resumes or failed its
+integrity check. If the upstream does not send response headers within
 `responseHeaderTimeout`, waiting requests are instead sent to the upstream
 directly, and clients see only the delay. After a failed fill, requests for the
 same key go straight to the upstream for one minute, or for `retention` after an
@@ -503,32 +628,32 @@ oversize response.
 The directory is not owned by the process user or grants group or other access
 (for example the root of a freshly mounted volume); `keyEnv` names a variable
 that is unset or does not hold 32 base64-encoded bytes; `refsMaxAge` is not less
-than `accessRecheck`; or `maxEntrySize` exceeds half of `maxDiskSize`. The error
-names which.
+than `accessRecheck`; `maxEntrySize` exceeds half of `maxDiskSize`; or the
+bucket of the remote tier rejected the startup probe with an authorization or
+bucket error. The error names which.
 
 ### A replica serves ref tips from before a push
 
 A push deletes the repository's cached refs entries on the replica that handled
-it. Other replicas keep theirs until `refsMaxAge` passes, which matters only
-when `refsMaxAge` is above `0s`.
+it, and in the remote tier. Other replicas keep their local copies until
+`refsMaxAge` passes, which matters only when `refsMaxAge` is above `0s`.
 
 ## Limits and roadmap
 
 In this release:
 
 - only `git-upload-pack` reads of the shapes above are cached;
-- the cache is local to one process; replicas do not share entries;
-- rotating the cache key empties the local cache at the next start;
+- replicas share entries only through an S3-compatible remote tier; Azure Blob
+  Storage and native Google Cloud Storage are not supported;
+- rotating the cache key empties the local cache at the next start, and leaves
+  the remote tier's entries unreadable until the lifecycle rule removes them;
 - stored content can be older than the upstream's by up to `retention`, and
   shallow clones can miss newer annotated tags for the same time; and
 - when the upstream is unavailable, requests fail as they do without the cache.
 
-Planned for later releases, and rejected by the configuration until then:
-
-- a shared remote tier in object storage (`cache.remote`), so replicas share
-  entries and `haybale cache purge --remote` reaches them; and
-- serving a recently stored response when the upstream is unavailable
-  (`cache.staleIfErrorFor`), as an explicit operator opt-in.
+Planned for a later release, and rejected by the configuration until then:
+serving a recently stored response when the upstream is unavailable
+(`cache.staleIfErrorFor`), as an explicit operator opt-in.
 
 When haybale shuts down, fills still running after in-flight requests have
 drained are cancelled.

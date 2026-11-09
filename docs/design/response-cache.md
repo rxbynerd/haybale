@@ -1,13 +1,13 @@
 # Design: response cache for Git smart HTTP reads
 
 Status: accepted; the first pull request implements Decisions 1 to 7 and 9
-(tier 1 only); Decision 6's remote tier and Decision 8 follow in later pull
-requests. Revised 2026-11-09 after design review (pressure test,
-security threat model, API design review, adversarial document review)
-and a research survey of prior art. This document records the design
+(tier 1 only), the second pull request implements the remote tier, and
+Decision 8 follows in a later pull request. Revised 2026-11-09 after
+design review (pressure test, security threat model, API design review,
+adversarial document review) and a research survey of prior art. This document records the design
 decisions behind haybale's optional response cache so that future changes
 can be checked against the reasoning, not only the code. Paragraphs marked
-"Implemented as" record where the first pull request differs from the
+"Implemented as" record where the implementation differs from the
 decision text.
 
 ## Problem
@@ -572,6 +572,20 @@ zero-egress vendor-neutral option. Azure Blob Storage and native Google
 Cloud Storage are future `BlobStore` implementations; the MinIO server is
 archived and is not recommended for new deployments.
 
+> Implemented as: The upload pool is four workers behind a queue of 256
+> entries; an entry committed while the queue is full is not uploaded and is
+> counted as `dropped`. Entries filled from tier 2 are not uploaded again. A
+> refs upload is skipped once a push has bumped the repository's generation,
+> and any upload is skipped once a purge marker covers it. Tier 2 is consulted
+> only under the tier-1 hit rules: a pack needs a recent upstream refs success
+> (`accessRecheck`), and a refs entry needs a positive `refsMaxAge`. A resume
+> is a ranged `Get` from the current offset, up to three times, and is refused
+> when the object's size or modification time has changed. A tier-2 entry that
+> fails verification, has passed `retention`, or predates a purge is deleted
+> from tier 2 before the fill falls through to upstream. A tier-2 fill is
+> reported to the client as `fwd=miss`, like any fill. Push invalidation
+> deletes the repository's tier-2 refs entries in the background.
+
 Memcached and Redis were rejected as the remote tier: packs are routinely
 hundreds of megabytes, memcached's item limit is 1 MiB by default, and
 Redis would hold every pack in RAM. OCI registries were rejected: entries
@@ -706,8 +720,13 @@ miss and is deleted. Without a remote tier, the procedure is to run the
 purge in every replica (or restart every replica when the key is
 ephemeral), and the documentation says so.
 
-> Implemented as: `haybale cache purge --remote` and the purge marker are
-> planned with the remote tier. This release rejects `--remote`.
+> Implemented as: The marker is sealed in the entry format and records the
+> purge time of each group, so purging one group keeps the other group's time.
+> A replica reads it alongside every upstream refs fill for the repository,
+> before renewing the access record that pack hits depend on, so it honours a
+> purge at its next upstream refs request; after a failed read it does not read
+> the marker again for one minute. Entries read from tier 2 are checked against
+> the marker as well.
 
 ## Observability
 
@@ -795,10 +814,12 @@ configuration error fails startup (matching the fail-fast JWKS
 behaviour), and a transient network or 5xx error logs a warning and
 continues, so a bucket outage cannot stop haybale from starting.
 
-> Implemented as: This release rejects `remote` and a non-zero
-> `staleIfErrorFor` outright. `BuildCache(logger, metrics)` takes no context
-> or upstream list. An explicit zero size or count selects the default.
-> Validation also requires `maxEntrySize` not above half of `maxDiskSize`.
+> Implemented as: This release rejects a non-zero `staleIfErrorFor` outright.
+> `BuildCache(ctx, logger, metrics)` takes no upstream list. An explicit zero
+> size or count selects the default. Validation also requires `maxEntrySize`
+> not above half of `maxDiskSize`, and `remote.region` is always required. The
+> startup probe is a `Get` of `v1/.probe` rather than a `Stat`, because a HEAD
+> response has no body to tell a missing bucket from a missing object.
 
 ## Operational notes
 
