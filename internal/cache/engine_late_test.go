@@ -262,44 +262,49 @@ func TestRefsRequestAfterAPushDoesNotJoinAStaleFill(t *testing.T) {
 	assertStoreIdle(t, c)
 }
 
-// breakRepoDir makes the next commit into repoDir fail and returns a
-// function that undoes it.
-type breakRepoDir func(t *testing.T, repoDir string) (restore func())
+// commitFault makes the next commit into a repository directory fail.
+// breakDir runs in the beforeCommit hook on the fill goroutine, where t
+// must not be used, so it reports failure as an error.
+type commitFault struct {
+	needsNonRoot bool // root ignores directory permissions
+	breakDir     func(repoDir string) (restore func(), err error)
+}
 
 func TestCommitFailureAfterTheTrailerIsADiscard(t *testing.T) {
-	cases := map[string]breakRepoDir{
-		"a file where the repository directory belongs": func(t *testing.T, repoDir string) func() {
-			t.Helper()
+	cases := map[string]commitFault{
+		"a file where the repository directory belongs": {breakDir: func(repoDir string) (func(), error) {
 			if err := os.MkdirAll(filepath.Dir(repoDir), 0o700); err != nil {
-				t.Fatal(err)
+				return nil, err
 			}
-			writeEntry(t, repoDir, []byte("in the way"))
-			return func() { _ = os.Remove(repoDir) }
-		},
-		"repository directory made read-only": func(t *testing.T, repoDir string) func() {
-			t.Helper()
-			if os.Geteuid() == 0 {
-				t.Skip("root ignores directory permissions")
+			if err := os.WriteFile(repoDir, []byte("in the way"), 0o600); err != nil {
+				return nil, err
 			}
+			return func() { _ = os.Remove(repoDir) }, nil
+		}},
+		"repository directory made read-only": {needsNonRoot: true, breakDir: func(repoDir string) (func(), error) {
 			if err := os.MkdirAll(repoDir, 0o700); err != nil {
-				t.Fatal(err)
+				return nil, err
 			}
 			if err := os.Chmod(repoDir, 0o500); err != nil { //nolint:gosec // G302: a read-only directory is the fault under test
-				t.Fatal(err)
+				return nil, err
 			}
-			return func() { _ = os.Chmod(repoDir, 0o700) } //nolint:gosec // G302: restores the store's own directory mode
-		},
+			return func() { _ = os.Chmod(repoDir, 0o700) }, nil //nolint:gosec // G302: restores the store's own directory mode
+		}},
 	}
-	for name, breakDir := range cases {
+	for name, fault := range cases {
 		t.Run(name, func(t *testing.T) {
+			if fault.needsNonRoot && os.Geteuid() == 0 {
+				t.Skip("root ignores directory permissions")
+			}
 			m, reader := observability.NewTestMetrics()
 			c, clock := newTestCache(t, func(o *Options) { o.AccessRecheck = 0; o.Metrics = m })
 			key := entryKeyFor(t, c, fetchRequest(t))
 			repoDir := filepath.Join(c.opts.Dir, filepath.FromSlash(RepoPrefix(GroupPack, key.RepoHash)))
 			var restore func()
+			var breakErr error
 			c.hooks.beforeCommit = func(k entryKey) {
-				if k == key && restore == nil {
-					restore = breakDir(t, repoDir)
+				if k == key && restore == nil && breakErr == nil {
+					restore, breakErr = fault.breakDir(repoDir)
 				}
 			}
 			t.Cleanup(func() {
@@ -339,6 +344,9 @@ func TestCommitFailureAfterTheTrailerIsADiscard(t *testing.T) {
 			_ = pw.Close()
 			wg.Wait()
 
+			if breakErr != nil {
+				t.Fatalf("breaking the repository directory: %v", breakErr)
+			}
 			if leaderAborted || followerAborted {
 				t.Fatal("a commit failure aborted a subscriber that had the complete body")
 			}
