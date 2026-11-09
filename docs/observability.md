@@ -178,5 +178,6 @@ the request joined a fill already in flight rather than starting its own, and
 when the cache is disabled and on writes. With `cache.exposeStatus` the
 `Cache-Status` response header carries the same `hit`, `miss` and `bypass`
 values in RFC 9211 form (`hit`, `fwd=miss`, `fwd=bypass`) and adds `collapsed`
-for a request that joined an in-flight fill. The header is written before a fill
+for a request that joined an in-flight fill. A read the cache passed through
+unserved carries `fwd=bypass`. The header is written before a fill
 ends, so it never says whether the entry was stored; only the log does.

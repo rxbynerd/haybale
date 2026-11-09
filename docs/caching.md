@@ -99,11 +99,11 @@ With the default settings, fifty concurrent clones of one repository cost one
 hundred small upstream requests (the advertisement and `ls-refs` of each clone)
 and one pack transfer.
 
-To absorb bursts of ref lookups as well, set `refsMaxAge` to a few seconds. Clients
-then receive tips up to that old. Keep `refsMaxAge` well below `accessRecheck`:
-a refs response served from the cache does not renew the upstream access check,
-so packs stop being served from the cache once `accessRecheck` has passed since
-the last refs response that came from the upstream.
+To absorb bursts of ref lookups as well, set `refsMaxAge` to a few seconds.
+Clients then receive tips up to that old. `refsMaxAge` must be less than
+`accessRecheck` (when both are non-zero), because a refs response served from the
+cache does not renew the upstream access check that cached packs depend on;
+`haybale serve` refuses to start otherwise.
 
 ## Sizing and volumes
 
@@ -115,26 +115,30 @@ without a length. Size the three values together:
 maxDiskSize  >=  maxConcurrentFills x maxEntrySize  +  space for stored entries
 ```
 
-The defaults (8 fills, 1GiB entries, 10GiB budget) leave only about 2GiB for
-stored entries while eight fills are running. Set `maxEntrySize` to a small
-multiple of the largest repository clone that should be cached, and raise
-`maxDiskSize` to match. A request that cannot obtain a fetch slot or space is
+With the defaults (4 fills, 1GiB entries, 10GiB budget) fetches reserve at most
+4GiB, leaving 6GiB for stored entries. Set `maxEntrySize` to a small multiple of
+the largest repository clone that should be cached, and raise `maxDiskSize` to
+match the formula. A request that cannot obtain a fetch slot or space is
 proxied without the cache, so undersizing costs hit rate and never correctness.
 
 Each haybale process needs its own cache directory. Do not mount one volume into
 several replicas: a starting process deletes the temporary files of any other
 process in the directory.
 
-The directory must exist, be owned by the haybale user and have mode `0700`.
-`haybale serve` refuses to start otherwise. A freshly mounted volume is usually
-owned by root with open permissions, so prepare it first.
+haybale creates the last element of `cache.dir` with mode `0700` when it is
+missing; the parent must exist. An existing directory must be owned by the
+haybale user and have mode `0700`, and `haybale serve` refuses to start
+otherwise. A freshly mounted volume is usually owned by root with open
+permissions, so do not use its mount point as `cache.dir`: mount the volume at a
+parent and point `cache.dir` at a subdirectory.
 
 ### Kubernetes
 
 Use an `emptyDir` volume per pod with a `sizeLimit` above `maxDiskSize`, so a
 full cache can never evict unrelated pods from the node, and deliver the cache
-key from a Secret. An init container fixes the directory's owner and mode for
-the image's `nonroot` user (UID and GID 65532):
+key from a Secret. Mount the volume at `/var/cache/haybale` and set `cache.dir`
+to `/var/cache/haybale/data`, which haybale creates with the right owner and
+mode:
 
 ```yaml
 apiVersion: apps/v1
@@ -149,17 +153,6 @@ spec:
     metadata:
       labels: { app: haybale }
     spec:
-      initContainers:
-        - name: cache-dir
-          image: busybox:stable
-          command: ["sh", "-c", "chown 65532:65532 /cache && chmod 0700 /cache"]
-          securityContext:
-            runAsUser: 0
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities: { drop: ["ALL"], add: ["CHOWN", "FOWNER"] }
-          volumeMounts:
-            - { name: cache, mountPath: /cache }
       containers:
         - name: haybale
           image: ghcr.io/rxbynerd/haybale:sha-<full-commit-sha>
@@ -182,7 +175,7 @@ spec:
           configMap: { name: haybale-config }
 ```
 
-With `cache.dir: /var/cache/haybale`, `cache.keyEnv: HAYBALE_CACHE_KEY` and
+With `cache.dir: /var/cache/haybale/data`, `cache.keyEnv: HAYBALE_CACHE_KEY` and
 `maxDiskSize: 10GiB` in the config. Create the key once and share it with every
 replica, so the Secret holds one value:
 
@@ -280,9 +273,6 @@ rotation, supply the old key once if such entries must go before they expire.
   entry.
 - With several replicas behind a load balancer, each replica has its own cache.
 
-**Packs stop being served from the cache while refs are cached.** `refsMaxAge`
-is at or above `accessRecheck`. Lower `refsMaxAge`, or raise `accessRecheck`.
-
 **Hits are rare after a restart.** A process records upstream access in memory
 and, without `keyEnv`, loses its entries as well. After a restart the first refs
 request for a repository renews the record, and `keyEnv` keeps the entries.
@@ -301,10 +291,11 @@ closed the connection without a clean ending. The client sees an unexpected
 disconnect rather than a truncated pack, and retries. Requests for that key go
 straight to the upstream for a short time.
 
-**`haybale serve` refuses to start.** The directory does not exist, is not owned
-by the process user, or grants group or other access; or `keyEnv` names a
-variable that is unset or does not hold 32 base64-encoded bytes. The error names
-which.
+**`haybale serve` refuses to start.** The directory is not owned by the process
+user or grants group or other access (for example the root of a freshly mounted
+volume); `keyEnv` names a variable that is unset or does not hold 32
+base64-encoded bytes; or `refsMaxAge` is not less than `accessRecheck`. The error
+names which.
 
 **A replica serves ref tips from before a push.** A push deletes the
 repository's cached refs entries on the replica that handled it. Other replicas

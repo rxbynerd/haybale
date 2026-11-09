@@ -355,7 +355,8 @@ purge afterwards, so no entry is refilled with the old content.
 ### Cache-Status disclosure
 
 With `cache.exposeStatus` set to `true`, responses carry an RFC 9211
-`Cache-Status` header. It is off by default because, within a repository that
+`Cache-Status` header, including `fwd=bypass` on reads the cache passed
+through. It is off by default because, within a repository that
 several tenants may read, `hit` tells a client that another identity made the
 identical request recently. Response timing can also differ between a hit and a
 miss, so enable the header only where that disclosure is acceptable. The `cache`

@@ -448,7 +448,7 @@ cache:
   keyEnv: HAYBALE_CACHE_KEY        # optional, env var holding the cache key
   maxDiskSize: 10GiB               # optional, default shown
   maxEntrySize: 1GiB               # optional, default shown
-  maxConcurrentFills: 8            # optional, default shown
+  maxConcurrentFills: 4            # optional, default shown
   maxRequestBody: 1MiB             # optional, default shown
   retention: 24h                   # optional, default shown
   refsMaxAge: 0s                   # optional, default shown
@@ -478,13 +478,13 @@ field can never silently fall back to its default.
 | `keyEnv`                | (unset)  | Name of an env var holding the 32-byte, base64-encoded key entries are sealed under. See "Cache key".    |
 | `maxDiskSize`           | `10GiB`  | Disk budget for the cache: stored entries plus space reserved for fills in progress. Least recently used entries are evicted past it. See "Sizing". |
 | `maxEntrySize`          | `1GiB`   | Largest response that is stored. A larger response is streamed to the client without being stored. Must not exceed `maxDiskSize`. |
-| `maxConcurrentFills`    | `8`      | Maximum number of responses being fetched into the cache at once. A request that finds no free slot is proxied without the cache. Must be at least `1`. |
+| `maxConcurrentFills`    | `4`      | Maximum number of responses being fetched into the cache at once. A request that finds no free slot is proxied without the cache. Must be at least `1`. |
 | `maxRequestBody`        | `1MiB`   | Largest decoded request body the cache will inspect. A read with a larger body bypasses the cache. Must be greater than zero. |
 | `retention`             | `24h`    | Go duration string: the maximum age of any entry, after which it is not served. Must be greater than zero. See "Retention". |
-| `refsMaxAge`            | `0s`     | Go duration string: how long a stored ref advertisement is reused without asking the upstream. `0s` always revalidates. |
-| `accessRecheck`         | `5m`     | Go duration string: how long a cached pack is served after the last successful upstream refs response before the upstream is asked again. `0s` disables the check. |
+| `refsMaxAge`            | `0s`     | Go duration string: how long a stored ref advertisement is reused without asking the upstream. `0s` always revalidates. When both are non-zero it must be less than `accessRecheck`. |
+| `accessRecheck`         | `5m`     | Go duration string: how long a cached pack is served after the last successful upstream refs response before the upstream is asked again. `0s` disables the check. See "Validation" for its relation to `refsMaxAge`. |
 | `responseHeaderTimeout` | `60s`    | Go duration string bounding how long haybale waits for the upstream's response headers on a cache fill. `0s` applies no bound. Does not affect requests that bypass the cache. |
-| `idleTimeout`           | `2m`     | Go duration string bounding the gap between body bytes from the upstream during a cache fill. `0s` applies no bound. Does not affect requests that bypass the cache. |
+| `idleTimeout`           | `2m`     | Go duration string bounding the gap between body bytes from the upstream during a cache fill. `0s` leaves the gap unbounded. Does not affect requests that bypass the cache. |
 | `exposeStatus`          | `false`  | Emits a `Cache-Status` response header describing how the cache handled the request. See [Cache-Status](security.md#cache-status-disclosure). |
 | `remote`                | (unset)  | Reserved for a later release; fails startup if set. See "Reserved fields".                               |
 | `staleIfErrorFor`       | (unset)  | Reserved for a later release; fails startup unless empty or `0s`. See "Reserved fields".                 |
@@ -508,17 +508,22 @@ or `24h` and must not be negative.
 Validation of the `cache` block is structural: it checks that no key is
 unknown, the syntax of every size and duration, that `dir` is set, that
 `retention` is greater than zero, that `maxEntrySize` does not exceed
-`maxDiskSize`, that `maxConcurrentFills` is at least `1` and that
-`maxRequestBody` is greater than zero. It does not touch the filesystem, the
+`maxDiskSize`, that `maxConcurrentFills` is at least `1`, that
+`maxRequestBody` is greater than zero, and that `refsMaxAge` is less than
+`accessRecheck` when both are non-zero. The last rule exists because a refs
+response served from the cache does not renew the upstream access check that
+cached packs depend on; with `refsMaxAge` at or above `accessRecheck`, packs
+would stop being served while refs were still cached. Validation does not touch the filesystem, the
 network or the environment, so `haybale policy check` stays offline when a
 cache block is present, with or without the cache key or directory. The
 directory and key are checked when `haybale serve` starts.
 
 ### Cache directory
 
-`dir` holds repository contents. It must exist, be owned by the haybale process
-user and be inaccessible to group and other (mode `0700`); `haybale serve`
-refuses to start otherwise. Mount the volume only into the haybale container;
+`dir` holds repository contents. The final path element is created with mode
+`0700` when it is missing, but its parent must exist. An existing directory must
+be owned by the haybale process user and be inaccessible to group and other
+(mode `0700`); `haybale serve` refuses to start otherwise. Mount the volume only into the haybale container;
 any sidecar sharing it runs with the same UID and can read every entry.
 
 Each `haybale serve` process needs its own cache directory. At startup the
@@ -531,8 +536,10 @@ On Kubernetes, back `dir` with an `emptyDir` volume whose `sizeLimit` is above
 `emptyDir` is wiped when the pod is rescheduled, which is acceptable because
 the cache holds nothing that cannot be fetched again. A freshly mounted
 `emptyDir` is owned by root with open permissions, which fails the ownership
-and mode check, so an init container must `chown` and `chmod 0700` it first;
-the [caching guide](caching.md#kubernetes) has a complete example.
+and mode check, so mount it at a parent such as `/var/cache/haybale` and set
+`dir` to a subdirectory of it such as `/var/cache/haybale/data`, which haybale
+creates itself; the [caching guide](caching.md#kubernetes) has a complete
+example.
 
 ### Sizing
 
@@ -541,11 +548,10 @@ A fill reserves space before it starts: the upstream's `Content-Length` when
 the upstream sends one, and `maxEntrySize` otherwise, which is the usual case
 for a pack. `maxConcurrentFills` times `maxEntrySize` is therefore the space
 that concurrent fills can hold at once, and `maxDiskSize` should exceed it by
-the space wanted for stored entries. The defaults reserve up to 8GiB for fills
-out of a 10GiB budget, which leaves little room for stored entries while eight
-fills are running. For a fleet that clones repositories well below the default
+the space wanted for stored entries. With the defaults, fills reserve at most 4GiB of the
+10GiB budget. For a fleet that clones repositories well below the default
 `maxEntrySize`, lowering `maxEntrySize` to a small multiple of the largest
-repository is the simplest way to leave room.
+repository reduces the reservation further.
 
 A fill that cannot reserve space after evicting stored entries is proxied
 without the cache and is not stored. An entry larger than `maxEntrySize` is
