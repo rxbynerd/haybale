@@ -6,7 +6,9 @@ requests. Revised 2026-11-09 after design review (pressure test,
 security threat model, API design review, adversarial document review)
 and a research survey of prior art. This document records the design
 decisions behind haybale's optional response cache so that future changes
-can be checked against the reasoning, not only the code.
+can be checked against the reasoning, not only the code. Paragraphs marked
+"Implemented as" record where the first pull request differs from the
+decision text.
 
 ## Problem
 
@@ -52,9 +54,16 @@ the implementation:
 - haybale scans the pkt-line *framing* of a read response to decide
   whether it is safe to store.
 
+> Implemented as: At most 128 request bodies are classified at once. Beyond
+> that limit, a read passes through unclassified. The slot is held while the
+> captured body is retained.
+
 It still never buffers a response body in memory, never interprets pack
 contents, and never reads a push body. Bypassed and write requests take
 exactly today's passthrough path.
+
+> Implemented as: A non-200 upstream response is buffered up to 64 KiB so it
+> can be shared (Decision 4). No other response body is held in memory.
 
 Standards note: by the definition in RFC 9111 haybale with the cache
 enabled is a shared cache, and the Git smart-HTTP specification forbids
@@ -276,6 +285,20 @@ no effect on cache behaviour.
   commit. Replicas that did not see the push keep their tier-1 refs
   entries until they age out, which matters only when `refsMaxAge > 0`.
 
+> Implemented as: Refs entries are written and counted against the disk
+> budget. At the default `refsMaxAge` of `0s` they are never served;
+> stale-if-error is their consumer.
+
+> Implemented as: Retention and `refsMaxAge` are decided from the creation
+> time authenticated in the entry header, not the file modification time.
+> The janitor uses the modification time for garbage collection only. A
+> creation time more than five minutes in the future is an integrity
+> failure.
+
+> Implemented as: The invalidation is deferred until the push handler
+> returns, so it runs once per push even when the client disconnects during
+> the response.
+
 With the defaults, fifty concurrent v2 clones cost one hundred small
 upstream requests (advertisement and `ls-refs` per clone) and one pack
 transfer, with no staleness.
@@ -345,6 +368,28 @@ Lifecycle:
   fills reserve at most 4 GiB of the 10 GiB budget, leaving the rest for
   stored entries; operators size the three values together.
 
+> Implemented as: A subscriber that attaches after the fill committed is
+> served from the committed entry. A subscriber that attaches after a
+> discard decision is served from the spool, which stays readable until
+> every attached subscriber has opened a reader.
+
+> Implemented as: A response with a known `Content-Length` over
+> `maxEntrySize` is spooled and served to completion without committing when
+> the reservation can be made from free space, so concurrent requests still
+> coalesce. Otherwise the waiting requests are released to passthrough.
+> Either way the key is marked for `retention`. Budget exhaustion mid-fill
+> aborts the subscribers and marks the key for `retention`. A shared non-200
+> response marks the key for one minute. A commit failure after a fully
+> spooled body is a discard: subscribers are served to completion.
+
+> Implemented as: A pack fill reserves the sealed size of the upstream
+> `Content-Length`, or of `maxEntrySize` when the length is unknown, plus a
+> small allowance, rather than reserving only its first segment. Refs fills
+> do not take a pack slot. They are capped at 64, each reserving 1 MiB. A
+> reservation that cannot be made, after evicting unopened entries, releases
+> the request to passthrough. Growth past `SealedSize(maxEntrySize)` uses
+> free space only. `maxEntrySize` must not exceed half of `maxDiskSize`.
+
 A fill that completes the storability checks (Decision 5) commits the
 spool by rename and becomes a normal entry.
 
@@ -369,6 +414,10 @@ An entry is committed only when all of the following hold:
    or above 65520), and no unexpected section order; and
 6. the per-repository invalidation generation is unchanged since the
    upstream request began (refs only).
+
+> Implemented as: A `200` with any content encoding other than identity
+> releases the waiting requests to passthrough and is never stored. The fill
+> reason is `encoding`.
 
 The scanner is a streaming state machine over pkt-line lengths and the
 first byte of each sideband frame. It treats lengths as skip counts,
@@ -402,19 +451,30 @@ relocation under another key, and modification all fail verification.
 Verification failure is a miss plus a store-error metric; if bytes were
 already sent, the connection is aborted.
 
+> Implemented as: The sealed header is a fixed 4096-byte block. The preamble
+> carries a 16-byte random salt. Each entry is sealed under a key derived
+> from the cache key and that salt with HKDF-SHA256, with the nonce
+> construction unchanged. Format version 1 is used because no earlier format
+> shipped.
+
+> Implemented as: The entry is deleted before the connection is aborted, and
+> a `cache_integrity_failed` security event is logged with the host, owner,
+> repository and class.
+
 The sealing key comes from the environment variable named by
 `cache.keyEnv` (32 bytes, base64), matching every other haybale secret.
 It is optional when only tier 1 is configured: haybale then generates an
-ephemeral key at startup and discards entries sealed under any other key
-id, so a local-only cache does not survive a process restart. It is
-required when `cache.remote` is set, because replicas must read each
-other's entries. The key is distinct from any storage credential; whoever
+ephemeral key at startup, so a local-only cache does not survive a process
+restart. It is required when `cache.remote` is set, because replicas must read
+each other's entries. The key is distinct from any storage credential; whoever
 can write to the bucket still cannot forge or relocate an entry
 (the security review's highest-severity finding). Rotating the key is a
 cold cache: `repoHash` is keyed, so entries under the previous key are
-unreachable and age out through the janitor and bucket lifecycle. The key
-id in the preamble exists so a reader can reject such entries cleanly,
-not to support dual-key operation.
+unreachable. Tier 1 deletes entries sealed under any other key id at startup,
+both with an ephemeral key and after a key change. Tier 2 entries under the
+previous key age out through the bucket lifecycle. The key id in the preamble
+exists so a reader can reject such entries cleanly, not to support dual-key
+operation.
 
 **Tier 1, local disk (`cache.dir`), required when the cache is enabled.**
 It is the spool for in-flight fills, the read path for every subscriber,
@@ -430,13 +490,16 @@ created `0600`, written to a temporary name under the directory, synced,
 and renamed into place; a partially written entry is never visible.
 Temporary names carry a per-process prefix, so the startup sweep removes
 every temporary file from earlier processes without an age heuristic and
-the janitor never touches a live spool. A disk budget (`cache.maxDiskSize`, default `10GiB`) counts committed
-bytes, in-flight spool reservations, and evicted-but-still-open bytes;
-a fill that cannot reserve its first segment bypasses. A janitor evicts
-least-recently-used entries past the budget, removes expired entries and
-orphaned temporary files, and only ever deletes names matching the entry
-pattern. Operators deploy an `emptyDir` with `sizeLimit` above
-`maxDiskSize` so a full cache can never evict unrelated pods.
+the janitor never touches a live spool. A disk budget (`cache.maxDiskSize`,
+default `10GiB`) counts committed bytes, in-flight spool reservations, and
+evicted-but-still-open bytes; a fill that cannot reserve its first segment
+bypasses. A janitor evicts least-recently-used entries past the budget, removes
+expired entries and orphaned temporary files, and only ever deletes names
+matching the entry pattern. Operators deploy an `emptyDir` with `sizeLimit`
+above `maxDiskSize` so a full cache can never evict unrelated pods.
+
+> Implemented as: The reservation covers the whole fill, as described under
+> Decision 4.
 
 **Tier 2, remote object storage (`cache.remote`), optional.** After a
 tier-1 commit, the sealed file is uploaded by a bounded worker pool from
@@ -537,6 +600,11 @@ wrap transport failures and upstream-API 5xx responses in a new sentinel,
 installation removed, repository not in installation, rate limiting)
 remains opaque and is never treated as an outage.
 
+> Implemented as: A credential mint failure inside a fill releases the
+> request to passthrough, which re-mints and answers `502`. The cache path
+> always requests `<base>/<owner>/<repo>.git/<endpoint>`, where passthrough
+> keeps the client's path form.
+
 Existing tests for `Authorization` replacement, `X-Forwarded`
 suppression, no upstream `traceparent`, and 401/403-to-502 become
 table-driven over both paths.
@@ -604,6 +672,14 @@ default because within a repository that several tenants may read, a
 `hit` reveals that another identity made the identical request recently.
 The request log's `cache` field carries the same values for operators.
 
+> Implemented as: Responses served through the cache path carry
+> `Cache-Control: no-cache, max-age=0, must-revalidate`, `Pragma: no-cache`
+> and an `Expires` date in 1980, as upstream sends. A shared non-200
+> response relays the upstream headers other than hop-by-hop headers, with
+> `Content-Length` recomputed. The `fwd=bypass` `Cache-Status` is written by
+> the cache when it declines a request, not by the proxy. The stale form is
+> not implemented.
+
 ## Operator controls
 
 `haybale cache purge --config haybale.yaml --repo HOST/OWNER/REPO [--group refs|pack]`
@@ -621,6 +697,9 @@ time) that every replica reads when it refreshes the repository's
 miss and is deleted. Without a remote tier, the procedure is to run the
 purge in every replica (or restart every replica when the key is
 ephemeral), and the documentation says so.
+
+> Implemented as: `haybale cache purge --remote` and the purge marker are
+> planned with the remote tier. This release rejects `--remote`.
 
 ## Observability
 
@@ -643,11 +722,17 @@ Metrics (host and class only, never owner or repository), under the
 Spans `haybale.response_cache.lookup` and `haybale.response_cache.fill`
 nest under the request span; the fill span is linked from, not parented
 to, the first subscriber's span because the fill outlives it. The request
-log gains a `cache` field. Security events: `cache_stale_served`
-(warning). Hits keep `outcome=proxied` on the existing request metrics so
-current dashboards and SLOs include them; the documented meaning of
-`proxied` widens to "answered on the client's behalf", and upstream-load
-panels should use the fill metrics instead.
+log gains a `cache` field. Security events: `cache_stale_served` and
+`cache_integrity_failed` (warning). Hits keep `outcome=proxied` on the existing
+request metrics so current dashboards and SLOs include them; the documented
+meaning of `proxied` widens to "answered on the client's behalf", and
+upstream-load panels should use the fill metrics instead.
+
+> Implemented as: The spans `haybale.response_cache.lookup` and
+> `haybale.response_cache.fill` are not implemented. The request span
+> carries `haybale.cache.result`, `haybale.cache.collapsed` and
+> `haybale.cache.stored`. A fill's upstream request is a root span because
+> the fill outlives its first subscriber.
 
 ## Configuration
 
@@ -701,6 +786,11 @@ bound to the SIGTERM context. `BuildCache` probes the bucket with a
 configuration error fails startup (matching the fail-fast JWKS
 behaviour), and a transient network or 5xx error logs a warning and
 continues, so a bucket outage cannot stop haybale from starting.
+
+> Implemented as: This release rejects `remote` and a non-zero
+> `staleIfErrorFor` outright. `BuildCache(logger, metrics)` takes no context
+> or upstream list. An explicit zero size or count selects the default.
+> Validation also requires `maxEntrySize` not above half of `maxDiskSize`.
 
 ## Operational notes
 
