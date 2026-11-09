@@ -61,9 +61,11 @@ var byteSizePattern = regexp.MustCompile(`^([0-9]+(?:\.[0-9]+)?) ?(KiB|MiB|GiB|T
 
 // ByteSize is a size in bytes that unmarshals from a YAML string of the
 // form "<number><unit>" with IEC units only: KiB, MiB, GiB, TiB (for
-// example "512MiB" or "1.5GiB"). A bare integer, an SI unit (KB, MB, GB),
-// a negative value or any other form is rejected, so a configured size
-// can never be misread by a factor of 1024 or silently taken as bytes.
+// example "512MiB" or "1.5GiB"). The literal "0", with no unit, is also
+// accepted as zero bytes so that an explicit zero selects the default. Any
+// other bare integer, an SI unit (KB, MB, GB), a negative value or any
+// other form is rejected, so a configured size can never be misread by a
+// factor of 1024 or silently taken as bytes.
 type ByteSize int64
 
 // UnmarshalYAML parses a scalar node into a ByteSize. A number that does
@@ -73,6 +75,10 @@ type ByteSize int64
 func (b *ByteSize) UnmarshalYAML(value *yaml.Node) error {
 	if value.Kind != yaml.ScalarNode {
 		return fmt.Errorf("line %d: size must be a string such as \"10GiB\"", value.Line)
+	}
+	if value.Value == "0" {
+		*b = 0
+		return nil
 	}
 	match := byteSizePattern.FindStringSubmatch(value.Value)
 	if match == nil {

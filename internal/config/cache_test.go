@@ -28,11 +28,15 @@ func TestByteSizeUnmarshalYAML(t *testing.T) {
 		{name: "decimal KiB", in: "0.5KiB", want: 512},
 		{name: "single space before unit", in: "10 GiB", want: 10 * gib},
 		{name: "zero", in: "0GiB", want: 0},
+		{name: "bare zero", in: "0", want: 0},
+		{name: "quoted bare zero", in: `"0"`, want: 0},
 		{name: "overflow", in: "8388608TiB", wantErr: "too large"},
 		{name: "fraction that is not whole bytes", in: "1.0001KiB", wantErr: "whole number of bytes"},
 
 		{name: "bare integer", in: "1073741824", wantErr: "want <number><unit>"},
-		{name: "bare zero", in: "0", wantErr: "want <number><unit>"},
+		{name: "bare zero with a decimal point", in: "0.0", wantErr: "want <number><unit>"},
+		{name: "bare zero with a sign", in: "-0", wantErr: "want <number><unit>"},
+		{name: "bare zero with a leading zero", in: `"00"`, wantErr: "want <number><unit>"},
 		{name: "SI KB", in: "10KB", wantErr: "want <number><unit>"},
 		{name: "SI MB", in: "10MB", wantErr: "want <number><unit>"},
 		{name: "SI GB", in: "10GB", wantErr: "want <number><unit>"},
@@ -494,7 +498,7 @@ cache:
   dir: /var/cache/haybale
   maxConcurrentFills: 0
   maxRequestBody: 0MiB
-  maxDiskSize: 0GiB
+  maxDiskSize: 0
   maxEntrySize: 0GiB
 `)
 	if err != nil {
