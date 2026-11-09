@@ -675,8 +675,11 @@ func (c *Cache) checkPurgeMarker(ctx context.Context, repo gitproto.Repo, repoHa
 			return false
 		}
 	}
-	current, failed := c.readMarker(ctx, repo, repoHash, now)
-	c.purges.finishCheck(repoHash, mc, current, failed, now)
+	// A read that panics finishes as failed, so the joiners wake and the
+	// backoff starts.
+	current, failed := false, true
+	defer func() { c.purges.finishCheck(repoHash, mc, current, failed, now) }()
+	current, failed = c.readMarker(ctx, repo, repoHash, now)
 	return current
 }
 

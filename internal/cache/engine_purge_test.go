@@ -474,3 +474,36 @@ func TestEntriesOlderThanAKnownPurgeAreNotServedFromTheBucket(t *testing.T) {
 		}
 	})
 }
+
+func TestAPanickingMarkerReadDoesNotBlockLaterRefsFills(t *testing.T) {
+	store := newMemBlobStore()
+	store.set(func(m *memBlobStore) {
+		m.getHook = func(key string, _ int64) error {
+			if strings.HasPrefix(key, purgePrefix) {
+				panic("memblob: injected panic")
+			}
+			return nil
+		}
+	})
+	c, _, _ := newRemoteTestCache(t, store, nil)
+	refs := refsFetcher(t)
+	lsRefs(t, c, refs)
+	done := make(chan struct{})
+	req := postV2(lsRefsBody(t))
+	go func() {
+		defer close(done)
+		serve(c, httptest.NewRecorder(), req, refs)
+	}()
+	select {
+	case <-done:
+	case <-time.After(shortly):
+		t.Fatal("the refs fill after a panicking marker read is blocked")
+	}
+	if got := store.count("get", purgePrefix); got != 1 {
+		t.Errorf("marker reads = %d, want 1: the panic starts the backoff", got)
+	}
+	repoHash := c.keyring.RepoHash(testBaseURL, testRepo)
+	if start, _ := c.purges.beginCheck(repoHash, c.now()); start != checkBackoff {
+		t.Errorf("check after the panic = %d, want checkBackoff", start)
+	}
+}
