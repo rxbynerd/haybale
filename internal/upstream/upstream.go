@@ -11,9 +11,21 @@ package upstream
 
 import (
 	"context"
+	"errors"
 
 	"github.com/rxbynerd/haybale/internal/gitproto"
 )
+
+// ErrUnavailable is wrapped (with %w) by a CredentialSource only when a
+// failure indicates the upstream credential API is unreachable or
+// failing: a network or dial error, the source's own request timeout, or
+// an HTTP 5xx response. Callers detect it with errors.Is.
+//
+// It is never wrapped for a response that indicates misconfiguration,
+// revocation or rate limiting (401, 403, 404, 422, 429), for an
+// unparseable response, or for the caller's own context ending. Those
+// errors stay opaque so they are never mistaken for an outage.
+var ErrUnavailable = errors.New("upstream: credential source unavailable")
 
 // BasicAuth is the HTTP Basic-auth credential a CredentialSource mints
 // for the upstream leg of a proxied request. Password is the secret —
@@ -37,9 +49,17 @@ type BasicAuth struct {
 // re-prompting it would only hang the client on a credential it cannot
 // produce.
 //
+// An error that wraps ErrUnavailable additionally tells the caller the
+// credential API itself could not answer, as opposed to refusing to mint
+// a credential; callers may test for it with errors.Is(err,
+// ErrUnavailable). The proxy still maps both cases to 502. An
+// implementation wraps ErrUnavailable only as ErrUnavailable's doc
+// comment describes.
+//
 // Credentials must be safe to call concurrently from multiple
-// goroutines: the proxy invokes it once per in-flight request with no
-// external synchronization.
+// goroutines: the proxy invokes it at most once per in-flight request,
+// and not at all when a response is served from the response cache, with
+// no external synchronization.
 //
 // Implementations are responsible for enforcing their own
 // timeout/deadline on Credentials. The proxy passes the inbound

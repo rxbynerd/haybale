@@ -778,3 +778,208 @@ func TestInstallationLookupSingleflightDoesNotCollapseDifferentKeys(t *testing.T
 		t.Fatalf("distinct lookup paths = %d, want %d", len(seenPaths), len(keys))
 	}
 }
+
+// TestCredentialsClassifiesAPIStatusAsUnavailable asserts which GitHub API
+// responses wrap ErrUnavailable: 5xx on either the installation lookup or
+// the mint is an outage; 401, 403, 404, 422 and 429 mean misconfiguration,
+// revocation or rate limiting and must stay opaque.
+func TestCredentialsClassifiesAPIStatusAsUnavailable(t *testing.T) {
+	tests := []struct {
+		name            string
+		installStatus   int
+		mintStatus      int
+		wantUnavailable bool
+	}{
+		{name: "mint 500", mintStatus: http.StatusInternalServerError, wantUnavailable: true},
+		{name: "mint 502", mintStatus: http.StatusBadGateway, wantUnavailable: true},
+		{name: "mint 503", mintStatus: http.StatusServiceUnavailable, wantUnavailable: true},
+		{name: "mint 504", mintStatus: http.StatusGatewayTimeout, wantUnavailable: true},
+		{name: "installation 500", installStatus: http.StatusInternalServerError, wantUnavailable: true},
+		{name: "installation 503", installStatus: http.StatusServiceUnavailable, wantUnavailable: true},
+		{name: "mint 401", mintStatus: http.StatusUnauthorized},
+		{name: "mint 403", mintStatus: http.StatusForbidden},
+		{name: "mint 404", mintStatus: http.StatusNotFound},
+		{name: "mint 422", mintStatus: http.StatusUnprocessableEntity},
+		{name: "mint 429", mintStatus: http.StatusTooManyRequests},
+		{name: "installation 401", installStatus: http.StatusUnauthorized},
+		{name: "installation 403", installStatus: http.StatusForbidden},
+		{name: "installation 404", installStatus: http.StatusNotFound},
+		{name: "installation 422", installStatus: http.StatusUnprocessableEntity},
+		{name: "installation 429", installStatus: http.StatusTooManyRequests},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := newGitHubFake(1)
+			fake.installationStatus = tt.installStatus
+			fake.mintStatus = tt.mintStatus
+			src := newTestSource(t, fake)
+
+			_, err := src.Credentials(context.Background(), gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}, gitproto.Read)
+			if err == nil {
+				t.Fatal("Credentials() = nil error, want a failure")
+			}
+			if got := errors.Is(err, ErrUnavailable); got != tt.wantUnavailable {
+				t.Errorf("errors.Is(err, ErrUnavailable) = %v, want %v (err: %v)", got, tt.wantUnavailable, err)
+			}
+		})
+	}
+}
+
+// TestCredentialsClassifiesUnparseableResponseAsOpaque asserts a 2xx
+// response that cannot be decoded is a parse error, never an outage.
+func TestCredentialsClassifiesUnparseableResponseAsOpaque(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(f *githubFake)
+	}{
+		{name: "installation body", setup: func(f *githubFake) { f.installationBody = []byte(`not json`) }},
+		{name: "installation body truncated", setup: func(f *githubFake) { f.installationBody = []byte(`{"id":`) }},
+		{name: "mint body", setup: func(f *githubFake) { f.mintBody = []byte(`not json`) }},
+		{name: "mint body truncated", setup: func(f *githubFake) { f.mintBody = []byte(`{"token":`) }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := newGitHubFake(1)
+			tt.setup(fake)
+			src := newTestSource(t, fake)
+
+			_, err := src.Credentials(context.Background(), gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}, gitproto.Read)
+			if err == nil {
+				t.Fatal("Credentials() = nil error, want a decode failure")
+			}
+			if errors.Is(err, ErrUnavailable) {
+				t.Errorf("errors.Is(err, ErrUnavailable) = true, want false for a parse error (err: %v)", err)
+			}
+		})
+	}
+}
+
+// TestCredentialsClassifiesDialErrorAsUnavailable asserts a refused
+// connection (nothing listening at the API base URL) wraps ErrUnavailable.
+func TestCredentialsClassifiesDialErrorAsUnavailable(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	baseURL := srv.URL
+	srv.Close()
+
+	src, err := NewGitHubAppSource(GitHubAppConfig{AppID: 12345, PrivateKeyPEM: testRSAKeyPEM(), APIBaseURL: baseURL})
+	if err != nil {
+		t.Fatalf("NewGitHubAppSource() unexpected error: %v", err)
+	}
+
+	_, err = src.Credentials(context.Background(), gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}, gitproto.Read)
+	if !errors.Is(err, ErrUnavailable) {
+		t.Errorf("errors.Is(err, ErrUnavailable) = false, want true for a refused connection (err: %v)", err)
+	}
+}
+
+// TestCredentialsClassifiesDroppedConnectionAsUnavailable asserts a
+// connection closed before any response is sent wraps ErrUnavailable.
+func TestCredentialsClassifiesDroppedConnectionAsUnavailable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+	}))
+	t.Cleanup(srv.Close)
+
+	src, err := NewGitHubAppSource(GitHubAppConfig{AppID: 12345, PrivateKeyPEM: testRSAKeyPEM(), APIBaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("NewGitHubAppSource() unexpected error: %v", err)
+	}
+
+	_, err = src.Credentials(context.Background(), gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}, gitproto.Read)
+	if !errors.Is(err, ErrUnavailable) {
+		t.Errorf("errors.Is(err, ErrUnavailable) = false, want true for a dropped connection (err: %v)", err)
+	}
+}
+
+// TestCredentialsClassifiesClientTimeoutAsUnavailable asserts the source's
+// own request timeout, with no caller deadline, wraps ErrUnavailable.
+func TestCredentialsClassifiesClientTimeoutAsUnavailable(t *testing.T) {
+	orig := appHTTPClientTimeout
+	appHTTPClientTimeout = 100 * time.Millisecond
+	defer func() { appHTTPClientTimeout = orig }()
+
+	fake := newGitHubFake(1)
+	fake.mintDelay = 2 * time.Second
+	src := newTestSource(t, fake)
+
+	_, err := src.Credentials(context.Background(), gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}, gitproto.Read)
+	if !errors.Is(err, ErrUnavailable) {
+		t.Errorf("errors.Is(err, ErrUnavailable) = false, want true for the client timeout (err: %v)", err)
+	}
+}
+
+// TestCredentialsCallerContextEndingIsNotUnavailable asserts a caller that
+// cancels or hits its own deadline is not reported as an API outage.
+func TestCredentialsCallerContextEndingIsNotUnavailable(t *testing.T) {
+	repo := gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}
+
+	t.Run("deadline", func(t *testing.T) {
+		fake := newGitHubFake(1)
+		fake.mintDelay = 2 * time.Second
+		src := newTestSource(t, fake)
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+
+		_, err := src.Credentials(ctx, repo, gitproto.Read)
+		if err == nil {
+			t.Fatal("Credentials() = nil error, want a deadline error")
+		}
+		if errors.Is(err, ErrUnavailable) {
+			t.Errorf("errors.Is(err, ErrUnavailable) = true, want false for the caller's own deadline (err: %v)", err)
+		}
+	})
+
+	t.Run("cancellation", func(t *testing.T) {
+		fake := newGitHubFake(1)
+		fake.mintDelay = 2 * time.Second
+		src := newTestSource(t, fake)
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(50*time.Millisecond, cancel)
+
+		_, err := src.Credentials(ctx, repo, gitproto.Read)
+		if err == nil {
+			t.Fatal("Credentials() = nil error, want a cancellation error")
+		}
+		if errors.Is(err, ErrUnavailable) {
+			t.Errorf("errors.Is(err, ErrUnavailable) = true, want false for a cancelled caller (err: %v)", err)
+		}
+	})
+}
+
+// TestCredentialsMalformedAPIBaseURLIsNotUnavailable asserts a request that
+// could never be sent because of a misconfigured API base URL is opaque,
+// not an outage.
+func TestCredentialsMalformedAPIBaseURLIsNotUnavailable(t *testing.T) {
+	src, err := NewGitHubAppSource(GitHubAppConfig{AppID: 12345, PrivateKeyPEM: testRSAKeyPEM(), APIBaseURL: "api.github.invalid"})
+	if err != nil {
+		t.Fatalf("NewGitHubAppSource() unexpected error: %v", err)
+	}
+
+	_, err = src.Credentials(context.Background(), gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}, gitproto.Read)
+	if err == nil {
+		t.Fatal("Credentials() = nil error, want a failure")
+	}
+	if errors.Is(err, ErrUnavailable) {
+		t.Errorf("errors.Is(err, ErrUnavailable) = true, want false for a malformed base URL (err: %v)", err)
+	}
+}
+
+// TestErrUnavailableKeepsUnderlyingCause asserts wrapping ErrUnavailable
+// does not hide the original error from the caller.
+func TestErrUnavailableKeepsUnderlyingCause(t *testing.T) {
+	fake := newGitHubFake(1)
+	fake.mintStatus = http.StatusServiceUnavailable
+	src := newTestSource(t, fake)
+
+	_, err := src.Credentials(context.Background(), gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}, gitproto.Read)
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("errors.Is(err, ErrUnavailable) = false, want true (err: %v)", err)
+	}
+	if !strings.Contains(err.Error(), "unexpected status 503") {
+		t.Errorf("Credentials() error = %q, want it to keep the underlying status", err.Error())
+	}
+}
