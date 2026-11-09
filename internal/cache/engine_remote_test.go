@@ -770,6 +770,31 @@ func TestUploadsSkipPresentPacksAndRefreshRefs(t *testing.T) {
 	}
 }
 
+func TestUploadFailuresAreCountedByResult(t *testing.T) {
+	cases := map[string]struct {
+		err        error
+		result     string
+		storeError int64
+	}{
+		"over the store's limit": {fmt.Errorf("memblob: %w", ErrTooLarge), observability.UploadResultTooLarge, 0},
+		"rejected by the store":  {errors.New("memblob: 403 AccessDenied"), observability.UploadResultFailed, 1},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			store := newMemBlobStore()
+			store.set(func(m *memBlobStore) {
+				m.putHook = func(context.Context, string) error { return tc.err }
+			})
+			c, _, reader := newRemoteTestCache(t, store, nil)
+			serve(c, httptest.NewRecorder(), fetchRequest(t), packFetcher(remotePack(t)))
+			waitFor(t, "the upload result", func() bool { return uploadsWith(t, reader, tc.result) == 1 })
+			if got := remoteStoreErrors(t, reader, observability.OperationPut); got != tc.storeError {
+				t.Errorf("store_errors{tier=remote,operation=put} = %d, want %d", got, tc.storeError)
+			}
+		})
+	}
+}
+
 func TestUploadOfARefsEntryAfterAPushIsSkipped(t *testing.T) {
 	store := newMemBlobStore()
 	c, _, _ := newRemoteTestCache(t, store, nil)
