@@ -326,25 +326,88 @@ func TestCacheConfigValidate(t *testing.T) {
 		{name: "negative concurrent fills", mutate: func(c *CacheConfig) { c.MaxConcurrentFills = -3 }, wantErr: "cache: maxConcurrentFills"},
 		{name: "zero request body", mutate: func(c *CacheConfig) { c.MaxRequestBody = 0 }, wantErr: "cache: maxRequestBody"},
 		{name: "negative request body", mutate: func(c *CacheConfig) { c.MaxRequestBody = -1 }, wantErr: "cache: maxRequestBody"},
+		{name: "remote s3", mutate: withRemote(nil)},
+		{name: "remote with an https endpoint and path style", mutate: withRemote(func(r *RemoteCacheConfig) {
+			r.Endpoint, r.ForcePathStyle = "https://account.r2.cloudflarestorage.com", true
+		})},
+		{name: "remote with a loopback http endpoint", mutate: withRemote(func(r *RemoteCacheConfig) { r.Endpoint = "http://127.0.0.1:9000" })},
+		{name: "remote with SSE-S3", mutate: withRemote(func(r *RemoteCacheConfig) { r.SSE = "AES256" })},
+		{name: "remote with SSE-KMS and a key", mutate: withRemote(func(r *RemoteCacheConfig) { r.SSE, r.KMSKeyID = "aws:kms", "alias/haybale" })},
+		{name: "remote with an unbounded header timeout", mutate: withRemote(func(r *RemoteCacheConfig) { r.HeaderTimeout = "0s" })},
 		{
-			name:    "remote type set",
-			mutate:  func(c *CacheConfig) { c.Remote.Type = "s3" },
-			wantErr: "cache: remote is not supported in this release",
+			name:    "remote without keyEnv",
+			mutate:  func(c *CacheConfig) { withRemote(nil)(c); c.KeyEnv = "" },
+			wantErr: "cache: keyEnv is required when cache.remote is set",
 		},
 		{
-			name:    "remote bucket set",
-			mutate:  func(c *CacheConfig) { c.Remote.Bucket = "haybale-cache" },
-			wantErr: "cache: remote is not supported in this release",
+			name:    "remote without a type",
+			mutate:  withRemote(func(r *RemoteCacheConfig) { r.Type = "" }),
+			wantErr: `cache.remote: type is required (want "s3")`,
 		},
 		{
-			name:    "remote forcePathStyle set",
-			mutate:  func(c *CacheConfig) { c.Remote.ForcePathStyle = true },
-			wantErr: "cache: remote is not supported in this release",
+			name:    "remote of an unsupported type",
+			mutate:  withRemote(func(r *RemoteCacheConfig) { r.Type = "gcs" }),
+			wantErr: `cache.remote: type "gcs" is not supported`,
 		},
 		{
-			name:    "remote kmsKeyID set",
-			mutate:  func(c *CacheConfig) { c.Remote.KMSKeyID = "alias/haybale" },
-			wantErr: "cache: remote is not supported in this release",
+			name:    "remote block with only forcePathStyle",
+			mutate:  func(c *CacheConfig) { c.KeyEnv = "K"; c.Remote.ForcePathStyle = true },
+			wantErr: "cache.remote: type is required",
+		},
+		{
+			name:    "remote without a bucket",
+			mutate:  withRemote(func(r *RemoteCacheConfig) { r.Bucket = "" }),
+			wantErr: "cache.remote: bucket is required",
+		},
+		{
+			name:    "remote prefix without a trailing slash",
+			mutate:  withRemote(func(r *RemoteCacheConfig) { r.Prefix = "prod" }),
+			wantErr: `cache.remote: prefix "prod" must end with "/"`,
+		},
+		{
+			name:    "remote without a region",
+			mutate:  withRemote(func(r *RemoteCacheConfig) { r.Region = "" }),
+			wantErr: "cache.remote: region is required",
+		},
+		{
+			name:    "remote http endpoint",
+			mutate:  withRemote(func(r *RemoteCacheConfig) { r.Endpoint = "http://minio.internal:9000" }),
+			wantErr: "cache.remote: endpoint \"http://minio.internal:9000\" must use https",
+		},
+		{
+			name:    "remote relative endpoint",
+			mutate:  withRemote(func(r *RemoteCacheConfig) { r.Endpoint = "s3.example.com" }),
+			wantErr: "cache.remote: endpoint",
+		},
+		{
+			name:    "remote endpoint with credentials",
+			mutate:  withRemote(func(r *RemoteCacheConfig) { r.Endpoint = "https://key:secret@s3.example.com" }),
+			wantErr: "must not carry userinfo",
+		},
+		{
+			name:    "remote endpoint with a query",
+			mutate:  withRemote(func(r *RemoteCacheConfig) { r.Endpoint = "https://s3.example.com/?x=1" }),
+			wantErr: "must not carry userinfo, a query or a fragment",
+		},
+		{
+			name:    "remote with an unknown SSE mode",
+			mutate:  withRemote(func(r *RemoteCacheConfig) { r.SSE = "aws:kms:dsse" }),
+			wantErr: `cache.remote: sse "aws:kms:dsse" is not supported`,
+		},
+		{
+			name:    "remote KMS key without SSE-KMS",
+			mutate:  withRemote(func(r *RemoteCacheConfig) { r.SSE, r.KMSKeyID = "AES256", "alias/haybale" }),
+			wantErr: `cache.remote: kmsKeyID requires sse "aws:kms"`,
+		},
+		{
+			name:    "remote header timeout unparseable",
+			mutate:  withRemote(func(r *RemoteCacheConfig) { r.HeaderTimeout = "10" }),
+			wantErr: "cache.remote: headerTimeout",
+		},
+		{
+			name:    "remote header timeout negative",
+			mutate:  withRemote(func(r *RemoteCacheConfig) { r.HeaderTimeout = "-1s" }),
+			wantErr: "cache.remote: headerTimeout \"-1s\" must not be negative",
 		},
 		{
 			name:    "staleIfErrorFor enabled",
@@ -556,7 +619,8 @@ func TestLoadCacheRejections(t *testing.T) {
 		{"bare integer size", "cache:\n  enabled: true\n  dir: /c\n  maxDiskSize: 1073741824\n", `size "1073741824" is invalid`},
 		{"SI size", "cache:\n  enabled: true\n  dir: /c\n  maxEntrySize: 1GB\n", `size "1GB" is invalid`},
 		{"missing dir", "cache:\n  enabled: true\n", "cache: dir is required"},
-		{"remote block", "cache:\n  enabled: true\n  dir: /c\n  remote:\n    type: s3\n    bucket: b\n", "cache: remote is not supported in this release"},
+		{"remote block without a region", "cache:\n  enabled: true\n  dir: /c\n  keyEnv: K\n  remote:\n    type: s3\n    bucket: b\n", "cache.remote: region is required"},
+		{"remote block without keyEnv", "cache:\n  enabled: true\n  dir: /c\n  remote:\n    type: s3\n    bucket: b\n    region: us-east-1\n", "cache: keyEnv is required when cache.remote is set"},
 		{"staleIfErrorFor", "cache:\n  enabled: true\n  dir: /c\n  staleIfErrorFor: 1h\n", "cache: staleIfErrorFor is not supported in this release"},
 		{"entry above disk", "cache:\n  enabled: true\n  dir: /c\n  maxDiskSize: 1GiB\n  maxEntrySize: 2GiB\n", "cache: maxEntrySize"},
 		{"entry above half of disk", "cache:\n  enabled: true\n  dir: /c\n  maxDiskSize: 2GiB\n  maxEntrySize: 1.5GiB\n", "cache: maxEntrySize 1536MiB must not exceed half of maxDiskSize 2GiB"},
@@ -760,5 +824,27 @@ func TestResolveAliasStopsAtACycle(t *testing.T) {
 	}
 	if got := mappingValue(loop, "cache"); got != nil {
 		t.Errorf("mappingValue(cycle) = %v, want nil", got)
+	}
+}
+
+// withRemote returns a mutation that sets keyEnv and a valid s3 remote
+// block, then applies mutate to the block.
+func withRemote(mutate func(*RemoteCacheConfig)) func(*CacheConfig) {
+	return func(c *CacheConfig) {
+		c.KeyEnv = "HAYBALE_CACHE_KEY"
+		c.Remote = RemoteCacheConfig{Type: "s3", Bucket: "haybale-cache", Prefix: "prod/", Region: "us-east-1", HeaderTimeout: "10s"}
+		if mutate != nil {
+			mutate(&c.Remote)
+		}
+	}
+}
+
+func TestLoadRemoteDefaultsHeaderTimeout(t *testing.T) {
+	cfg, err := loadWithCacheBlock(t, "cache:\n  enabled: true\n  dir: /c\n  keyEnv: K\n  remote:\n    type: s3\n    bucket: b\n    region: eu-west-1\n")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.Cache.Remote.ParsedHeaderTimeout(); got != 10*time.Second {
+		t.Errorf("ParsedHeaderTimeout() = %v, want the 10s default", got)
 	}
 }

@@ -43,7 +43,7 @@ func closeCache(t *testing.T, c *cache.Cache) {
 
 func TestBuildCacheDisabledReturnsNil(t *testing.T) {
 	c := CacheConfig{}
-	got, err := c.BuildCache(slog.New(slog.DiscardHandler), observability.NewNoopMetrics())
+	got, err := c.BuildCache(context.Background(), slog.New(slog.DiscardHandler), observability.NewNoopMetrics())
 	if err != nil || got != nil {
 		t.Fatalf("BuildCache on a disabled block = %v, %v; want nil, nil", got, err)
 	}
@@ -56,7 +56,7 @@ func TestBuildCacheEphemeralKeyLogsThatEntriesDoNotSurviveRestart(t *testing.T) 
 	c := enabledCacheConfig(t)
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
-	got, err := c.BuildCache(logger, observability.NewNoopMetrics())
+	got, err := c.BuildCache(context.Background(), logger, observability.NewNoopMetrics())
 	if err != nil {
 		t.Fatalf("BuildCache: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestBuildCacheReadsTheKeyFromTheEnvironment(t *testing.T) {
 	c := enabledCacheConfig(t)
 	c.KeyEnv = testCacheKeyEnv
 	var buf bytes.Buffer
-	got, err := c.BuildCache(slog.New(slog.NewTextHandler(&buf, nil)), observability.NewNoopMetrics())
+	got, err := c.BuildCache(context.Background(), slog.New(slog.NewTextHandler(&buf, nil)), observability.NewNoopMetrics())
 	if err != nil {
 		t.Fatalf("BuildCache: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestBuildCacheLogsTheEffectiveConfiguration(t *testing.T) {
 				c.KeyEnv = testCacheKeyEnv
 			}
 			var buf bytes.Buffer
-			got, err := c.BuildCache(slog.New(slog.NewTextHandler(&buf, nil)), observability.NewNoopMetrics())
+			got, err := c.BuildCache(context.Background(), slog.New(slog.NewTextHandler(&buf, nil)), observability.NewNoopMetrics())
 			if err != nil {
 				t.Fatalf("BuildCache: %v", err)
 			}
@@ -169,7 +169,7 @@ func TestBuildCacheWarnsWhenFillsCanOutgrowTheDiskBudget(t *testing.T) {
 				t.Fatalf("validate: %v", err)
 			}
 			var buf bytes.Buffer
-			got, err := c.BuildCache(slog.New(slog.NewTextHandler(&buf, nil)), observability.NewNoopMetrics())
+			got, err := c.BuildCache(context.Background(), slog.New(slog.NewTextHandler(&buf, nil)), observability.NewNoopMetrics())
 			if err != nil {
 				t.Fatalf("BuildCache: %v", err)
 			}
@@ -230,7 +230,7 @@ func TestBuildCacheRejectsBadKeys(t *testing.T) {
 			}
 			c := enabledCacheConfig(t)
 			c.KeyEnv = testCacheKeyEnv
-			got, err := c.BuildCache(slog.New(slog.DiscardHandler), observability.NewNoopMetrics())
+			got, err := c.BuildCache(context.Background(), slog.New(slog.DiscardHandler), observability.NewNoopMetrics())
 			if err == nil {
 				closeCache(t, got)
 				t.Fatalf("BuildCache succeeded, want an error containing %q", tc.wantErr)
@@ -248,7 +248,7 @@ func TestBuildCacheRejectsBadKeys(t *testing.T) {
 func TestBuildCacheRejectsAnUnusableDirectory(t *testing.T) {
 	c := enabledCacheConfig(t)
 	c.Dir = filepath.Join(c.Dir, "missing-parent", "cache")
-	got, err := c.BuildCache(slog.New(slog.DiscardHandler), observability.NewNoopMetrics())
+	got, err := c.BuildCache(context.Background(), slog.New(slog.DiscardHandler), observability.NewNoopMetrics())
 	if err == nil {
 		closeCache(t, got)
 		t.Fatal("BuildCache succeeded with a missing parent directory")

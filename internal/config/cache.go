@@ -1,9 +1,12 @@
 package config
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
+	"net/url"
 	"os"
 	"reflect"
 	"regexp"
@@ -13,6 +16,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/rxbynerd/haybale/internal/cache"
+	"github.com/rxbynerd/haybale/internal/cache/s3store"
 	"github.com/rxbynerd/haybale/internal/observability"
 )
 
@@ -31,6 +35,25 @@ const (
 	defaultCacheAccessRecheck         = "5m"
 	defaultCacheResponseHeaderTimeout = "60s"
 	defaultCacheIdleTimeout           = "2m"
+	defaultRemoteHeaderTimeout        = "10s"
+)
+
+// remoteTypeS3 is the only remote tier implementation.
+const remoteTypeS3 = "s3"
+
+// Server-side encryption modes RemoteCacheConfig.SSE accepts.
+const (
+	remoteSSEAES256 = "AES256"
+	remoteSSEKMS    = "aws:kms"
+)
+
+const (
+	// remoteProbeKey is the object BuildCache reads to check that the
+	// bucket is usable. It is never written, so a healthy bucket answers
+	// "not found".
+	remoteProbeKey = "v1/.probe"
+	// remoteProbeTimeout bounds the startup probe of the remote tier.
+	remoteProbeTimeout = 30 * time.Second
 )
 
 // Binary (IEC) size units, the only units ByteSize accepts.
@@ -183,8 +206,9 @@ type CacheConfig struct {
 	// ExposeStatus makes haybale emit a Cache-Status response header.
 	// Defaults to false.
 	ExposeStatus bool `yaml:"exposeStatus"`
-	// Remote configures a shared remote tier. Any non-zero value fails
-	// validate.
+	// Remote configures an optional remote tier shared by every replica.
+	// It requires KeyEnv, so that replicas seal and address entries under
+	// the same key.
 	Remote RemoteCacheConfig `yaml:"remote"`
 	// StaleIfErrorFor is a Go duration string: the maximum age of an
 	// entry served when upstream cannot answer. Only a zero duration is
@@ -200,31 +224,124 @@ type CacheConfig struct {
 	parsedIdleTimeout           time.Duration
 }
 
-// RemoteCacheConfig configures the optional shared remote cache tier,
-// an object-storage bucket. CacheConfig.validate rejects it when any
-// field is set.
+// RemoteCacheConfig configures the optional remote cache tier, a prefix
+// of an S3-compatible bucket. The block is set when any field is; a set
+// block is validated whenever the cache is enabled.
 type RemoteCacheConfig struct {
-	// Type selects the remote implementation, e.g. "s3".
+	// Type selects the remote implementation. Only "s3" is supported, and
+	// it is required.
 	Type string `yaml:"type"`
-	// Bucket is the bucket holding sealed entries.
+	// Bucket is the bucket holding sealed entries. Required.
 	Bucket string `yaml:"bucket"`
 	// Prefix is the key prefix within Bucket; one prefix is one trust
-	// domain.
+	// domain. Empty, or ending with "/".
 	Prefix string `yaml:"prefix"`
-	// Region is the bucket's region.
+	// Region is the signing region, and selects the AWS regional endpoint
+	// when Endpoint is empty. Required; it is never read from the
+	// environment.
 	Region string `yaml:"region"`
-	// Endpoint overrides the service endpoint (https), for S3-compatible
-	// stores.
+	// Endpoint is the service base URL of an S3-compatible store (R2,
+	// Ceph, GCS interoperability, directory buckets, China partitions).
+	// It must be https, or http for a loopback host. Empty selects
+	// https://s3.<region>.amazonaws.com.
 	Endpoint string `yaml:"endpoint"`
 	// ForcePathStyle selects path-style bucket addressing.
 	ForcePathStyle bool `yaml:"forcePathStyle"`
 	// HeaderTimeout is a Go duration string bounding the time to first
-	// byte of a remote read on the request path.
+	// byte of a remote read on the request path, and of each remote
+	// listing and deletion. "0s" applies no bound. Defaults to "10s".
 	HeaderTimeout string `yaml:"headerTimeout"`
-	// SSE is the server-side encryption mode, "AES256" or "aws:kms".
+	// SSE is the server-side encryption requested on upload: empty,
+	// "AES256" or "aws:kms".
 	SSE string `yaml:"sse"`
-	// KMSKeyID names the KMS key when SSE is "aws:kms".
+	// KMSKeyID names the KMS key when SSE is "aws:kms"; it is rejected
+	// otherwise. Empty uses the bucket's default key.
 	KMSKeyID string `yaml:"kmsKeyID"`
+
+	parsedHeaderTimeout time.Duration
+}
+
+// set reports whether any field of the block is set.
+func (r RemoteCacheConfig) set() bool {
+	r.parsedHeaderTimeout = 0
+	return r != RemoteCacheConfig{}
+}
+
+// ParsedHeaderTimeout returns the time.Duration a prior successful call to
+// Config.Validate parsed from HeaderTimeout. Zero means "no bound" (or
+// that Validate has not run).
+func (r RemoteCacheConfig) ParsedHeaderTimeout() time.Duration { return r.parsedHeaderTimeout }
+
+// validate checks a set remote block structurally, without network or
+// environment access.
+func (r *RemoteCacheConfig) validate() error {
+	switch r.Type {
+	case remoteTypeS3:
+	case "":
+		return fmt.Errorf("cache.remote: type is required (want %q)", remoteTypeS3)
+	default:
+		return fmt.Errorf("cache.remote: type %q is not supported (want %q)", r.Type, remoteTypeS3)
+	}
+	if r.Bucket == "" {
+		return errors.New("cache.remote: bucket is required")
+	}
+	if r.Prefix != "" && !strings.HasSuffix(r.Prefix, "/") {
+		return fmt.Errorf("cache.remote: prefix %q must end with \"/\"", r.Prefix)
+	}
+	if r.Region == "" {
+		return errors.New("cache.remote: region is required; it is never taken from AWS_REGION")
+	}
+	if r.Endpoint != "" {
+		if err := validateRemoteEndpoint(r.Endpoint); err != nil {
+			return fmt.Errorf("cache.remote: endpoint %w", err)
+		}
+	}
+	switch r.SSE {
+	case "", remoteSSEAES256, remoteSSEKMS:
+	default:
+		return fmt.Errorf("cache.remote: sse %q is not supported (want \"\", %q or %q)", r.SSE, remoteSSEAES256, remoteSSEKMS)
+	}
+	if r.KMSKeyID != "" && r.SSE != remoteSSEKMS {
+		return fmt.Errorf("cache.remote: kmsKeyID requires sse %q", remoteSSEKMS)
+	}
+	if r.HeaderTimeout != "" {
+		d, err := time.ParseDuration(r.HeaderTimeout)
+		if err != nil {
+			return fmt.Errorf("cache.remote: headerTimeout %q is not a valid duration: %w", r.HeaderTimeout, err)
+		}
+		if d < 0 {
+			return fmt.Errorf("cache.remote: headerTimeout %q must not be negative", r.HeaderTimeout)
+		}
+		r.parsedHeaderTimeout = d
+	}
+	return nil
+}
+
+// validateRemoteEndpoint requires an absolute https URL, or http for a
+// loopback host, with no userinfo, query or fragment.
+func validateRemoteEndpoint(raw string) error {
+	if err := validateJWKSURL(raw); err != nil {
+		return err
+	}
+	u, _ := url.Parse(raw)
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("%q must not carry userinfo, a query or a fragment", u.Redacted())
+	}
+	return nil
+}
+
+// storeConfig maps a validated block onto the s3 backend's configuration.
+func (r RemoteCacheConfig) storeConfig() s3store.Config {
+	return s3store.Config{
+		Bucket:         r.Bucket,
+		Prefix:         r.Prefix,
+		Region:         r.Region,
+		Endpoint:       r.Endpoint,
+		ForcePathStyle: r.ForcePathStyle,
+		HeaderTimeout:  r.parsedHeaderTimeout,
+		SSE:            r.SSE,
+		KMSKeyID:       r.KMSKeyID,
+	}
 }
 
 // ParsedRetention returns the time.Duration a prior successful call to
@@ -287,11 +404,15 @@ func (c *CacheConfig) applyDefaults() {
 	if c.IdleTimeout == "" {
 		c.IdleTimeout = defaultCacheIdleTimeout
 	}
+	if c.Remote.set() && c.Remote.HeaderTimeout == "" {
+		c.Remote.HeaderTimeout = defaultRemoteHeaderTimeout
+	}
 }
 
 // validate fail-fasts on an enabled block that is structurally unusable:
 // a missing dir, a duration that does not parse or is negative, sizes or
-// limits out of range, or a remote or stale-if-error setting. It does
+// limits out of range, an invalid remote block or one without keyEnv, or
+// a stale-if-error setting. It does
 // no filesystem, network or environment access, so `haybale policy check`
 // stays offline; the directory and key are checked when the cache is
 // built. A disabled block is always valid. An empty duration is accepted
@@ -348,8 +469,13 @@ func (c *CacheConfig) validate() error {
 		return fmt.Errorf("cache: maxRequestBody must be greater than zero, got %s", c.MaxRequestBody)
 	}
 
-	if c.Remote != (RemoteCacheConfig{}) {
-		return fmt.Errorf("cache: remote is not supported in this release; remove the remote block")
+	if c.Remote.set() {
+		if err := c.Remote.validate(); err != nil {
+			return err
+		}
+		if c.KeyEnv == "" {
+			return errors.New("cache: keyEnv is required when cache.remote is set, so that every replica seals and addresses entries under the same key")
+		}
 	}
 	if c.StaleIfErrorFor != "" {
 		d, err := time.ParseDuration(c.StaleIfErrorFor)
@@ -453,15 +579,68 @@ func checkKnownKeys(node *yaml.Node, typ reflect.Type, prefix string) error {
 	return nil
 }
 
+// BuildRemote constructs the remote tier a validated, enabled block
+// describes, or returns nil when the block has none. It sends no request;
+// ctx bounds loading the AWS SDK's shared configuration. Credentials come
+// from the SDK's default chain.
+func (c CacheConfig) BuildRemote(ctx context.Context) (cache.BlobStore, error) {
+	if !c.Enabled || !c.Remote.set() {
+		return nil, nil
+	}
+	store, err := s3store.New(ctx, c.Remote.storeConfig())
+	if err != nil {
+		return nil, fmt.Errorf("cache.remote: %w", err)
+	}
+	return store, nil
+}
+
+// probeRemote reads remoteProbeKey to check that the remote tier is
+// usable. Not found is healthy. An authorization or bucket error fails
+// startup, since it will not resolve itself; any other failure, such as
+// a network error or a 5xx, is logged and startup continues, so a bucket
+// outage cannot stop haybale from starting. The probe uses a GET rather
+// than a HEAD because a HEAD response has no body to tell a missing
+// bucket from a missing object.
+func probeRemote(ctx context.Context, store cache.BlobStore, logger *slog.Logger) error {
+	ctx, cancel := context.WithTimeout(ctx, remoteProbeTimeout)
+	defer cancel()
+	rc, _, err := store.Get(ctx, remoteProbeKey, 0)
+	switch {
+	case err == nil:
+		_ = rc.Close()
+		return nil
+	case errors.Is(err, cache.ErrNotFound):
+		return nil
+	}
+	var se *s3store.Error
+	if errors.As(err, &se) && remoteConfigurationError(se) {
+		return fmt.Errorf("cache.remote: the bucket cannot be used with these credentials and settings: %w", err)
+	}
+	logger.Warn("cache.remote: the startup probe of the bucket failed; continuing, and remote operations retry on use", "error", err)
+	return nil
+}
+
+// remoteConfigurationError reports whether a remote failure is an
+// authorization or bucket configuration error.
+func remoteConfigurationError(e *s3store.Error) bool {
+	switch e.Code {
+	case "AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch", "NoSuchBucket":
+		return true
+	}
+	return e.Status == 401 || e.Status == 403
+}
+
 // BuildCache constructs the live response cache from a validated block:
 // it reads the key from the environment variable named by KeyEnv, or
 // generates an ephemeral key when KeyEnv is empty, opens the cache
-// directory and starts the janitor. It returns nil, nil when the cache is
-// disabled. It must be called after Validate and only by `haybale
-// serve`; it is deliberately separate from validate so the offline
-// `haybale policy check` never touches the directory or the environment.
-// The caller closes the returned cache after draining in-flight requests.
-func (c CacheConfig) BuildCache(logger *slog.Logger, metrics *observability.Metrics) (*cache.Cache, error) {
+// directory, constructs and probes the remote tier when one is
+// configured, and starts the janitor and upload workers. It returns nil,
+// nil when the cache is disabled. It must be called after Validate and
+// only by `haybale serve`; it is deliberately separate from validate so
+// the offline `haybale policy check` never touches the directory, the
+// environment or the network. The caller closes the returned cache after
+// draining in-flight requests.
+func (c CacheConfig) BuildCache(ctx context.Context, logger *slog.Logger, metrics *observability.Metrics) (*cache.Cache, error) {
 	if !c.Enabled {
 		return nil, nil
 	}
@@ -481,6 +660,15 @@ func (c CacheConfig) BuildCache(logger *slog.Logger, metrics *observability.Metr
 		logger.Info("keyEnv is not set; entries are sealed under an ephemeral key, the cache does not survive a restart, and its entries are removed at the next start")
 		keyMode = "ephemeral"
 	}
+	remote, err := c.BuildRemote(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if remote != nil {
+		if err := probeRemote(ctx, remote, logger); err != nil {
+			return nil, err
+		}
+	}
 	built, err := cache.New(cache.Options{
 		Dir:                   c.Dir,
 		Keyring:               keyring,
@@ -494,6 +682,7 @@ func (c CacheConfig) BuildCache(logger *slog.Logger, metrics *observability.Metr
 		ResponseHeaderTimeout: c.parsedResponseHeaderTimeout,
 		IdleTimeout:           c.parsedIdleTimeout,
 		ExposeStatus:          c.ExposeStatus,
+		Remote:                remote,
 		Logger:                logger,
 		Metrics:               metrics,
 	})
@@ -512,5 +701,13 @@ func (c CacheConfig) BuildCache(logger *slog.Logger, metrics *observability.Metr
 		"maxDiskSize", c.MaxDiskSize.String(),
 		"maxEntrySize", c.MaxEntrySize.String(),
 		"maxConcurrentFills", c.MaxConcurrentFills)
+	if remote != nil {
+		logger.Info("response cache remote tier enabled",
+			"type", c.Remote.Type,
+			"bucket", c.Remote.Bucket,
+			"prefix", c.Remote.Prefix,
+			"region", c.Remote.Region,
+			"endpoint", c.Remote.Endpoint)
+	}
 	return built, nil
 }
