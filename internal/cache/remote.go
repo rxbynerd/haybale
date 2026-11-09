@@ -731,11 +731,19 @@ func (c *Cache) checkPurgeMarker(ctx context.Context, repo gitproto.Repo, repoHa
 	return current
 }
 
+// purgeCurrent reports whether repoHash's purge state is known current
+// for stale service, checking its purge marker when the cache has a
+// remote tier. Without one, the purges this process made itself are the
+// only ones, and the state is always current.
+func (c *Cache) purgeCurrent(ctx context.Context, repo gitproto.Repo, repoHash [32]byte) bool {
+	return c.remote == nil || c.checkPurgeMarker(ctx, repo, repoHash)
+}
+
 // readMarker reads and applies repoHash's purge marker for
 // checkPurgeMarker. failed reports a read or verification failure, as
 // opposed to a read cut short because ctx ended.
 func (c *Cache) readMarker(ctx context.Context, repo gitproto.Repo, repoHash [32]byte, now time.Time) (current, failed bool) {
-	ctx, cancel := context.WithTimeout(ctx, purgeMarkerTimeout)
+	ctx, cancel := context.WithTimeout(ctx, c.markerTimeout)
 	defer cancel()
 	times, found, err := readPurgeMarker(ctx, c.remote, c.keyring, repoHash, now)
 	switch {

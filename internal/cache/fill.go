@@ -172,6 +172,10 @@ type fill struct {
 	// dropEntry marks a committed refs entry that a push superseded. It is
 	// deleted by releaseSpool once pending subscribers have opened it.
 	dropEntry bool
+
+	// purge is the purge marker check started beside the upstream
+	// request; it belongs to the fill goroutine.
+	purge *purgeCheck
 }
 
 func (c *Cache) newFill(key entryKey, req Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher, shared bool) *fill {
@@ -236,6 +240,7 @@ func (f *fill) perform() {
 	// A refs fill from upstream renews the repository's access record, so
 	// the purge marker is checked first, alongside the upstream request.
 	purge := f.startPurgeCheck()
+	f.purge = purge
 	defer purge.wait()
 	started := f.c.now()
 	resp, done, err := f.fetchHeaders(probeDeadline)
@@ -358,8 +363,11 @@ func (f *fill) reportHealth(res upstreamResult, started time.Time) {
 }
 
 // holdsStaleEntry reports whether the fill's key has a tier-1 entry that
-// stale service could answer with.
+// stale service could answer with, the repository's purge state included.
 func (f *fill) holdsStaleEntry() bool {
+	if !f.purgeCurrent() {
+		return false
+	}
 	e := f.c.openStaleEntry(f.key, f.repo, string(f.req.Class))
 	if e == nil {
 		return false

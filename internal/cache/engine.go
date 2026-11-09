@@ -118,6 +118,8 @@ type Cache struct {
 
 	idleGrace     time.Duration
 	flushInterval time.Duration
+	// markerTimeout bounds one read of a repository's purge marker.
+	markerTimeout time.Duration
 
 	gens   generations
 	access accessRecords
@@ -215,6 +217,7 @@ func New(opts Options) (*Cache, error) {
 		classifySlots: make(chan struct{}, maxClassifications),
 		idleGrace:     fillIdleGrace,
 		flushInterval: sealFlushInterval,
+		markerTimeout: purgeMarkerTimeout,
 		access:        accessRecords{window: opts.AccessRecheck},
 		purges:        purgeRecords{retention: opts.Retention, interval: markerCheckInterval(opts.AccessRecheck)},
 		gates:         healthGates{logger: logger, interval: healthProbeInterval},
@@ -323,13 +326,13 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo
 	// wherever it would otherwise start or join a fill, and also when its
 	// key is marked uncacheable.
 	if c.marks.marked(key, c.now()) {
-		if out, ok := c.serveHeld(w, key, repo, class, identity, release); ok {
+		if out, ok := c.serveHeld(w, r, key, repo, class, identity, release); ok {
 			return out, true
 		}
 		return c.declined(w, host, class, "uncacheable"), false
 	}
 	if key.Group == GroupRefs && c.opts.RefsMaxAge <= 0 {
-		if out, ok := c.serveHeld(w, key, repo, class, identity, release); ok {
+		if out, ok := c.serveHeld(w, r, key, repo, class, identity, release); ok {
 			return out, true
 		}
 		f, ok := c.startSingle(key, req, repo, baseURL, fetch)
@@ -346,7 +349,7 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo
 			return out, true
 		}
 	}
-	if out, ok := c.serveHeld(w, key, repo, class, identity, release); ok {
+	if out, ok := c.serveHeld(w, r, key, repo, class, identity, release); ok {
 		return out, true
 	}
 	// A stored entry that fails verification before any byte is written
@@ -739,11 +742,13 @@ func (c *Cache) writeShared(w http.ResponseWriter, out *fillOutcome, host, class
 // serveHeld answers a request whose host's health gate holds it from the
 // key's qualifying tier-1 stale entry, before any fill slot, spool or
 // upstream request is taken, and releases the classification slot first.
-// ok is false, with nothing written, when stale service is disabled, the
-// gate does not hold the host, or no tier-1 entry qualifies; the request
-// then proceeds as it would otherwise.
-func (c *Cache) serveHeld(w http.ResponseWriter, key entryKey, repo gitproto.Repo, class, identity string, release func()) (Outcome, bool) {
-	if !c.staleEnabled() || !c.gates.held(repo.Host, c.now()) {
+// With a remote tier the repository's purge state must be known current
+// first. ok is false, with nothing written, when stale service is
+// disabled, the gate does not hold the host, the purge state is not
+// current, or no tier-1 entry qualifies; the request then proceeds as it
+// would otherwise.
+func (c *Cache) serveHeld(w http.ResponseWriter, r *http.Request, key entryKey, repo gitproto.Repo, class, identity string, release func()) (Outcome, bool) {
+	if !c.staleEnabled() || !c.gates.held(repo.Host, c.now()) || !c.purgeCurrent(r.Context(), repo, key.RepoHash) {
 		return Outcome{}, false
 	}
 	e := c.openStaleEntry(key, repo, class)

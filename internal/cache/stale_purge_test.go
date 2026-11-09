@@ -1,0 +1,336 @@
+package cache
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"testing/iotest"
+	"time"
+
+	"github.com/rxbynerd/haybale/internal/observability"
+	"github.com/rxbynerd/haybale/internal/security"
+)
+
+// newRemoteStaleReplica is a stale-enabled cache on store holding
+// testRepo's ls-refs and clone fetch entries on disk, with its clock past
+// accessRecheck and the purge marker check interval. Its gate admits no
+// probe within the test, so an open gate holds every request.
+func newRemoteStaleReplica(t *testing.T, store *memBlobStore) (*Cache, *fakeClock, *logCapture) {
+	t.Helper()
+	logger, logs := newLogCapture()
+	c, clock, _ := newRemoteTestCache(t, store, func(o *Options) {
+		enableStale(o)
+		o.Logger = logger
+	})
+	c.gates.interval = 24 * time.Hour
+	lsRefs(t, c, refsFetcher(t))
+	if out, _, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), packFetcher(remotePack(t))); !out.Stored {
+		t.Fatalf("seeding fetch = %+v, want a stored miss", out)
+	}
+	clock.Advance(10 * time.Minute)
+	return c, clock, logs
+}
+
+// staleReads are the two reads of testRepo whose entries the replica
+// holds.
+func staleReads(t *testing.T) map[string]func() *http.Request {
+	return map[string]func() *http.Request{
+		"ls-refs": func() *http.Request { return postV2(lsRefsBody(t)) },
+		"fetch":   func() *http.Request { return fetchRequest(t) },
+	}
+}
+
+// bothGroups purges both groups of a repository.
+var bothGroups = []Group{GroupRefs, GroupPack}
+
+// clearMarks forgets every uncacheable mark, so a key whose failed fill
+// marked it is offered to the cache again.
+func clearMarks(c *Cache) {
+	c.marks.mu.Lock()
+	defer c.marks.mu.Unlock()
+	c.marks.until = nil
+}
+
+// markerKey is the remote key of testRepo's purge marker.
+func markerKey(c *Cache) string {
+	return purgeMarkerPath(c.keyring.RepoHash(testBaseURL, testRepo))
+}
+
+// TestStaleServiceRefusesALocallyPurgedEntry: without a remote tier, a
+// purge on this replica leaves nothing to serve stale, on the fetch-error
+// path and while the gate is open.
+func TestStaleServiceRefusesALocallyPurgedEntry(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		h := newStaleHarness(t, nil)
+		if _, err := h.c.Purge(context.Background(), testRepo, testBaseURL, ""); err != nil {
+			t.Fatal(err)
+		}
+		h.clock.Advance(10 * time.Minute)
+		if held {
+			if out, handled, _ := serve(h.c, newCollectWriter(), otherFetchRequest(t), &failing{err: errDialRefused}); handled {
+				t.Fatalf("refused fetch without an entry = %+v, want a release", out)
+			}
+		}
+		out, _, _ := serve(h.c, newCollectWriter(), fetchRequest(t), &failing{status: 503})
+		if out.Result != observability.ResultMiss || out.Status != 503 {
+			t.Errorf("held %v: purged key = %+v, want the shared 503", held, out)
+		}
+		if ev := h.logs.securityEvents(t, security.EventCacheStaleServed); len(ev) != 0 {
+			t.Errorf("held %v: stale events = %d, want none", held, len(ev))
+		}
+	}
+}
+
+// TestStaleServiceRefusesARemoteEntryAMarkerCovers: a remote entry older
+// than the repository's purge marker is not served stale and is deleted.
+func TestStaleServiceRefusesARemoteEntryAMarkerCovers(t *testing.T) {
+	store := newMemBlobStore()
+	seedPeer(t, store, remotePack(t))
+	packKeys := store.keys(packPrefix)
+	if len(packKeys) != 1 {
+		t.Fatalf("remote packs = %v, want one", packKeys)
+	}
+	data, _ := store.object(packKeys[0])
+	c, clock, _ := newRemoteTestCache(t, store, enableStale)
+	clock.Advance(time.Minute)
+	if _, err := purgeRemote(store, c.keyring, bothGroups, clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+	store.set(func(m *memBlobStore) { m.objects[packKeys[0]] = memObject{data: data, modTime: clock.Now()} })
+	clock.Advance(time.Minute)
+
+	if out, _, _ := serve(c, newCollectWriter(), fetchRequest(t), &failing{status: 502}); out.Result != observability.ResultMiss || out.Status != 502 {
+		t.Errorf("covered remote entry = %+v, want the shared 502", out)
+	}
+	waitFor(t, "the covered remote entry to be deleted", func() bool { return len(store.keys(packPrefix)) == 0 })
+}
+
+// TestHeldStaleServiceReadsTheMarkerFirst: while the gate is open, a
+// held request reads the purge marker a peer wrote before answering, so
+// entries the marker covers are never served.
+func TestHeldStaleServiceReadsTheMarkerFirst(t *testing.T) {
+	store := newMemBlobStore()
+	c, clock, logs := newRemoteStaleReplica(t, store)
+	if out, handled, _ := serve(c, newCollectWriter(), otherFetchRequest(t), &failing{err: errDialRefused}); handled {
+		t.Fatalf("refused fetch without an entry = %+v, want a release", out)
+	}
+	if !c.gates.held(testRepo.Host, c.now()) {
+		t.Fatal("the refused connection did not open the gate")
+	}
+	if _, err := purgeRemote(store, c.keyring, bothGroups, clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(markerCheckInterval(c.opts.AccessRecheck))
+	before := store.count("get", purgePrefix)
+	for name, req := range staleReads(t) {
+		if out, handled, _ := serve(c, newCollectWriter(), req(), &failing{err: errDialRefused}); handled || out.Result == observability.ResultStale {
+			t.Errorf("held %s after a peer's purge = %+v handled %v, want a release", name, out, handled)
+		}
+	}
+	if got := store.count("get", purgePrefix) - before; got != 1 {
+		t.Errorf("marker reads = %d, want one shared by both requests", got)
+	}
+	if ev := logs.securityEvents(t, security.EventCacheStaleServed); len(ev) != 0 {
+		t.Errorf("stale events = %d, want none", len(ev))
+	}
+}
+
+// TestStaleDecisionWaitsForTheMarkerRead: an upstream failure that
+// arrives before the purge marker read finishes is decided only once the
+// read has, so the first request after a peer's purge is already refused.
+func TestStaleDecisionWaitsForTheMarkerRead(t *testing.T) {
+	for name, req := range staleReads(t) {
+		t.Run(name, func(t *testing.T) {
+			store := newMemBlobStore()
+			c, clock, _ := newRemoteStaleReplica(t, store)
+			if _, err := purgeRemote(store, c.keyring, bothGroups, clock.Now()); err != nil {
+				t.Fatal(err)
+			}
+			failed := make(chan struct{})
+			var once sync.Once
+			store.set(func(m *memBlobStore) {
+				m.getHook = func(key string, _ int64) error {
+					if strings.HasPrefix(key, purgePrefix) {
+						<-failed
+					}
+					return nil
+				}
+			})
+			fetch := fetchFunc(func(context.Context, Request) (*http.Response, error) {
+				defer once.Do(func() { close(failed) })
+				return response(503, "text/plain", []byte("down\n")), nil
+			})
+			if out, _, _ := serve(c, newCollectWriter(), req(), fetch); out.Result != observability.ResultMiss || out.Status != 503 {
+				t.Errorf("first request after the purge = %+v, want the shared 503", out)
+			}
+		})
+	}
+}
+
+// TestStaleServiceFailsClosedWithoutACurrentMarkerCheck: a marker read
+// that fails, a marker that fails verification, and a check skipped under
+// the backoff all leave the request to fail as it would without stale
+// service.
+func TestStaleServiceFailsClosedWithoutACurrentMarkerCheck(t *testing.T) {
+	cases := map[string]func(c *Cache, store *memBlobStore){
+		"marker read fails": func(_ *Cache, store *memBlobStore) {
+			store.set(func(m *memBlobStore) {
+				m.getHook = func(key string, _ int64) error {
+					if strings.HasPrefix(key, purgePrefix) {
+						return errors.New("memblob: 503 SlowDown")
+					}
+					return nil
+				}
+			})
+		},
+		"marker fails verification": func(c *Cache, store *memBlobStore) {
+			store.set(func(m *memBlobStore) { m.objects[markerKey(c)] = memObject{data: []byte("not a sealed marker")} })
+		},
+	}
+	for name, fault := range cases {
+		t.Run(name, func(t *testing.T) {
+			store := newMemBlobStore()
+			c, clock, logs := newRemoteStaleReplica(t, store)
+			fault(c, store)
+			for read, req := range staleReads(t) {
+				if out, _, _ := serve(c, newCollectWriter(), req(), &failing{status: 503}); out.Result != observability.ResultMiss || out.Status != 503 {
+					t.Errorf("%s = %+v, want the shared 503", read, out)
+				}
+			}
+			// Within the backoff no marker is read and nothing is served
+			// stale, even once the fault has cleared.
+			store.set(func(m *memBlobStore) {
+				m.getHook = nil
+				delete(m.objects, markerKey(c))
+			})
+			clearMarks(c)
+			clock.Advance(time.Second)
+			before := store.count("get", purgePrefix)
+			for read, req := range staleReads(t) {
+				if out, _, _ := serve(c, newCollectWriter(), req(), &failing{status: 503}); out.Result != observability.ResultMiss || out.Status != 503 {
+					t.Errorf("%s under the backoff = %+v, want the shared 503", read, out)
+				}
+			}
+			if got := store.count("get", purgePrefix) - before; got != 0 {
+				t.Errorf("marker reads under the backoff = %d, want none", got)
+			}
+			if ev := logs.securityEvents(t, security.EventCacheStaleServed); len(ev) != 0 {
+				t.Errorf("stale events = %d, want none", len(ev))
+			}
+			clearMarks(c)
+			clock.Advance(purgeCheckBackoff)
+			if out, _, _ := serve(c, newCollectWriter(), fetchRequest(t), &failing{status: 503}); out.Result != observability.ResultStale {
+				t.Errorf("fetch after the backoff = %+v, want stale", out)
+			}
+		})
+	}
+}
+
+// TestStaleServiceWithACurrentMarkerCheck: with no marker, or one older
+// than the entries, stale service answers; a check that succeeded within
+// the interval is reused, and concurrent checks share one read.
+func TestStaleServiceWithACurrentMarkerCheck(t *testing.T) {
+	t.Run("no marker", func(t *testing.T) {
+		store := newMemBlobStore()
+		c, _, _ := newRemoteStaleReplica(t, store)
+		before := store.count("get", purgePrefix)
+		for read, req := range staleReads(t) {
+			if out, _, _ := serve(c, newCollectWriter(), req(), &failing{status: 503}); out.Result != observability.ResultStale {
+				t.Errorf("%s = %+v, want stale", read, out)
+			}
+		}
+		if got := store.count("get", purgePrefix) - before; got != 1 {
+			t.Errorf("marker reads = %d, want one reused by the second request", got)
+		}
+	})
+
+	t.Run("marker older than the entries", func(t *testing.T) {
+		store := newMemBlobStore()
+		c, clock, _ := newRemoteStaleReplica(t, store)
+		if _, err := purgeRemote(store, c.keyring, bothGroups, clock.Now().Add(-time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		for read, req := range staleReads(t) {
+			if out, _, _ := serve(c, newCollectWriter(), req(), &failing{status: 503}); out.Result != observability.ResultStale {
+				t.Errorf("%s = %+v, want stale", read, out)
+			}
+		}
+	})
+
+	t.Run("concurrent checks share one read", func(t *testing.T) {
+		store := newMemBlobStore()
+		c, _, _ := newRemoteStaleReplica(t, store)
+		release := make(chan struct{})
+		store.set(func(m *memBlobStore) {
+			m.getHook = func(key string, _ int64) error {
+				if strings.HasPrefix(key, purgePrefix) {
+					<-release
+				}
+				return nil
+			}
+		})
+		before := store.count("get", purgePrefix)
+		const clients = 10
+		fetch := &failing{status: 503}
+		reqs := make([]*http.Request, clients)
+		for i := range reqs {
+			reqs[i] = postV2(lsRefsBody(t))
+		}
+		results := make(chan Outcome, clients)
+		for _, r := range reqs {
+			go func() {
+				out, _, _ := serve(c, newCollectWriter(), r, fetch)
+				results <- out
+			}()
+		}
+		waitFor(t, "every refs fill to reach upstream", func() bool { return fetch.count() == clients })
+		waitFor(t, "the marker read to start", func() bool { return store.count("get", purgePrefix)-before == 1 })
+		close(release)
+		for range clients {
+			if out := <-results; out.Result != observability.ResultStale {
+				t.Errorf("ls-refs = %+v, want stale", out)
+			}
+		}
+		if got := store.count("get", purgePrefix) - before; got != 1 {
+			t.Errorf("marker reads = %d, want one shared read", got)
+		}
+	})
+}
+
+// TestHeldStaleServiceWaitsAtMostTheMarkerTimeout: a held request whose
+// marker read hangs gives up at the marker timeout and is not answered
+// stale.
+func TestHeldStaleServiceWaitsAtMostTheMarkerTimeout(t *testing.T) {
+	store := newMemBlobStore()
+	c, clock, _ := newRemoteStaleReplica(t, store)
+	c.markerTimeout = 50 * time.Millisecond
+	if out, handled, _ := serve(c, newCollectWriter(), otherFetchRequest(t), &failing{err: errDialRefused}); handled {
+		t.Fatalf("refused fetch without an entry = %+v, want a release", out)
+	}
+	if _, err := purgeRemote(store, c.keyring, bothGroups, clock.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	store.set(func(m *memBlobStore) {
+		m.wrapBody = func(ctx context.Context, key string, _ int64, body io.Reader) io.Reader {
+			if !strings.HasPrefix(key, purgePrefix) {
+				return body
+			}
+			<-ctx.Done()
+			return iotest.ErrReader(ctx.Err())
+		}
+	})
+	clock.Advance(markerCheckInterval(c.opts.AccessRecheck))
+	start := time.Now()
+	out, handled, _ := serve(c, newCollectWriter(), fetchRequest(t), &failing{err: errDialRefused})
+	if elapsed := time.Since(start); elapsed > shortly {
+		t.Errorf("held request took %v, want it bounded by the marker timeout", elapsed)
+	}
+	if handled || out.Result == observability.ResultStale {
+		t.Errorf("held request with a hung marker read = %+v handled %v, want a release", out, handled)
+	}
+}

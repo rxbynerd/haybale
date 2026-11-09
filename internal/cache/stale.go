@@ -193,8 +193,9 @@ func (f *fill) staleAcceptable(h entryHeader) bool {
 }
 
 // serveStale settles a fill whose upstream request failed with an
-// eligible result from the newest qualifying entry: the tier-1 entry, or
-// else a copy of the remote tier's entry spooled as a remote fill.
+// eligible result from a qualifying entry: the tier-1 entry, or else a
+// copy of the remote tier's entry spooled as a remote fill. Nothing is
+// served unless the repository's purge state is known current.
 // fallback is what subscribers receive when they cannot open the tier-1
 // entry after all. fillReason labels the fill metric of a tier-1 answer;
 // empty records none, for a fill that never contacted upstream. It
@@ -202,7 +203,7 @@ func (f *fill) staleAcceptable(h entryHeader) bool {
 // or no entry qualifies.
 func (f *fill) serveStale(res upstreamResult, fallback fillOutcome, fillReason string) bool {
 	c := f.c
-	if !res.eligible || !c.staleEnabled() {
+	if !res.eligible || !c.staleEnabled() || !f.purgeCurrent() {
 		return false
 	}
 	st := &staleService{reason: res.reason, fwdStatus: res.status}
@@ -217,6 +218,17 @@ func (f *fill) serveStale(res upstreamResult, fallback fillOutcome, fillReason s
 		return true
 	}
 	return c.remote != nil && f.fillFromRemote(st)
+}
+
+// purgeCurrent reports whether the repository's purge state is known
+// current for stale service. A refs fill waits for the check it started
+// beside its upstream request; any other fill checks the marker itself,
+// which a recent successful check answers without a read.
+func (f *fill) purgeCurrent() bool {
+	if f.purge != nil && f.key.Group == GroupRefs {
+		return f.purge.wait()
+	}
+	return f.c.purgeCurrent(f.ctx, f.repo, f.key.RepoHash)
 }
 
 // logStaleServed records a stale response to one client.
