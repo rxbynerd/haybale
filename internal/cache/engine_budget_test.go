@@ -180,15 +180,41 @@ func TestUnknownLengthResponseThatOutgrowsTheBudgetAbortsOnceAndIsMarkedForReten
 	})
 	kept := storeEntries(t, c, 5, 20)     // five entries of about 100 KB
 	huge := fetchResultBody(t, 720, 5000) // about 3.6 MB
+	// The first body is held after its first segment until the leader has
+	// written bytes: a subscriber that has written nothing when the budget
+	// runs out is released to passthrough instead of aborted.
+	pr, pw := io.Pipe()
 	var calls atomic.Int32
 	fetch := fetchFunc(func(context.Context, Request) (*http.Response, error) {
-		calls.Add(1)
+		if calls.Add(1) == 1 {
+			return streamingResponse(contentTypeResult, pr), nil
+		}
 		return streamingResponse(contentTypeResult, chunkedBody(huge)), nil
 	})
+	type attempt struct {
+		out              Outcome
+		handled, aborted bool
+	}
 	w := newCollectWriter()
-	out, handled, aborted := serve(c, w, fetchRequest(t), fetch)
-	if !aborted {
-		t.Fatalf("first attempt = %+v handled %v, want an abort once the free budget is exhausted", out, handled)
+	first := make(chan attempt, 1)
+	go func() {
+		out, handled, aborted := serve(c, w, fetchRequest(t), fetch)
+		first <- attempt{out, handled, aborted}
+	}()
+	if _, err := pw.Write(huge[:70000]); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-w.first:
+	case a := <-first:
+		t.Fatalf("first attempt = %+v handled %v aborted %v before writing a byte", a.out, a.handled, a.aborted)
+	}
+	go func() {
+		_, _ = pw.Write(huge[70000:]) // refused once the fill aborts and closes the body
+		_ = pw.Close()
+	}()
+	if a := <-first; !a.aborted {
+		t.Fatalf("first attempt = %+v handled %v, want an abort once the free budget is exhausted", a.out, a.handled)
 	}
 	if _, body, _ := w.result(); len(body) == 0 || len(body) >= len(huge) {
 		t.Errorf("client received %d bytes, want a partial response", len(body))
@@ -196,10 +222,11 @@ func TestUnknownLengthResponseThatOutgrowsTheBudgetAbortsOnceAndIsMarkedForReten
 	if hits := hitsFor(t, c, 5, kept); hits != 5 {
 		t.Errorf("committed entries still hits = %d, want all 5", hits)
 	}
+	// An aborting fill fails the spool before it records its result.
+	assertStoreIdle(t, c)
 	if got := fillsWithReason(t, reader, observability.FillResultDiscarded, observability.FillReasonTooLarge); got != 1 {
 		t.Errorf("fills discarded too_large = %d, want 1", got)
 	}
-	assertStoreIdle(t, c)
 
 	clock.Advance(2 * time.Minute)
 	if _, ok, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), fetch); ok || calls.Load() != 1 {
