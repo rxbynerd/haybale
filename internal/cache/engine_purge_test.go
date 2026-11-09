@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -116,25 +117,28 @@ func TestConcurrentRefsFillsShareOneMarkerRead(t *testing.T) {
 		}
 	})
 	c, _, _ := newRemoteTestCache(t, store, nil)
+	var joined atomic.Int32
+	c.hooks.markerCheckJoined = func() { joined.Add(1) }
 	refs := refsFetcher(t)
 	const fills = 10
 	var wg sync.WaitGroup
 	errs := make(chan string, fills)
 	for range fills {
+		req := postV2(lsRefsBody(t))
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			out, handled, aborted := serve(c, httptest.NewRecorder(), postV2(lsRefsBody(t)), refs)
+			out, handled, aborted := serve(c, httptest.NewRecorder(), req, refs)
 			if !handled || aborted || out.Result != observability.ResultMiss {
 				errs <- "ls-refs was not served"
 			}
 		}()
 	}
-	waitFor(t, "every refs fill to start", func() bool {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		return c.refsFills == fills
-	})
+	// The leader's read is held, so the other fills can only join it.
+	if !pollFor(func() bool { return joined.Load() == fills-1 }) {
+		close(release)
+		t.Fatalf("fills joined the marker read = %d, want %d", joined.Load(), fills-1)
+	}
 	close(release)
 	wg.Wait()
 	close(errs)

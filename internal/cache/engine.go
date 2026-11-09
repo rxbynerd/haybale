@@ -155,6 +155,9 @@ type fillHooks struct {
 	// afterCommittedOpen runs in a subscriber that found the spool
 	// committed, once it has told the fill it opened the entry.
 	afterCommittedOpen func(key entryKey)
+	// markerCheckJoined runs when a refs fill joins another fill's purge
+	// marker read, before it waits for the result.
+	markerCheckJoined func()
 }
 
 // New opens the cache directory, indexes its entries, removes entries

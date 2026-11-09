@@ -684,6 +684,9 @@ func (c *Cache) checkPurgeMarker(ctx context.Context, repo gitproto.Repo, repoHa
 	case checkBackoff:
 		return false
 	case checkJoin:
+		if h := c.hooks.markerCheckJoined; h != nil {
+			h()
+		}
 		select {
 		case <-mc.done:
 			return mc.current
