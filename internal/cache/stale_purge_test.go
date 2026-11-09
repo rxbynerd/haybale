@@ -156,7 +156,10 @@ func TestStaleDecisionWaitsForTheMarkerRead(t *testing.T) {
 			store.set(func(m *memBlobStore) {
 				m.getHook = func(key string, _ int64) error {
 					if strings.HasPrefix(key, purgePrefix) {
-						<-failed
+						select {
+						case <-failed:
+						case <-time.After(shortly):
+						}
 					}
 					return nil
 				}
@@ -269,7 +272,10 @@ func TestStaleServiceWithACurrentMarkerCheck(t *testing.T) {
 		store.set(func(m *memBlobStore) {
 			m.getHook = func(key string, _ int64) error {
 				if strings.HasPrefix(key, purgePrefix) {
-					<-release
+					select {
+					case <-release:
+					case <-time.After(shortly):
+					}
 				}
 				return nil
 			}
@@ -292,7 +298,7 @@ func TestStaleServiceWithACurrentMarkerCheck(t *testing.T) {
 		waitFor(t, "the marker read to start", func() bool { return store.count("get", purgePrefix)-before == 1 })
 		close(release)
 		for range clients {
-			if out := <-results; out.Result != observability.ResultStale {
+			if out := receive(t, results, "an ls-refs request"); out.Result != observability.ResultStale {
 				t.Errorf("ls-refs = %+v, want stale", out)
 			}
 		}

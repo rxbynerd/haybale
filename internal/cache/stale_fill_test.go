@@ -81,7 +81,11 @@ func TestRemoteStaleStreamOutlivesTheUpstreamIdleTimeout(t *testing.T) {
 			release := make(chan struct{})
 			fetch := fetchFunc(func(ctx context.Context, _ Request) (*http.Response, error) {
 				fetchCtx.Store(&ctx)
-				<-release
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
 				resp := response(http.StatusServiceUnavailable, "text/plain", nil)
 				resp.Body, resp.ContentLength = upstreamBody, int64(size)
 				return resp, nil
@@ -117,7 +121,7 @@ func TestRemoteStaleStreamOutlivesTheUpstreamIdleTimeout(t *testing.T) {
 			}
 			close(release)
 			for range reqs {
-				res := <-results
+				res := receive(t, results, "a subscriber")
 				if !res.handled || res.out.Result != observability.ResultStale || !bytes.Equal(res.body, pack) {
 					t.Errorf("subscriber = %+v handled %v with %d bytes, want the remote copy served stale", res.out, res.handled, len(res.body))
 				}

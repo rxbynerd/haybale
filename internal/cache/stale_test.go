@@ -421,8 +421,12 @@ func TestStaleServiceTakesPrecedenceOverTheSharedResponse(t *testing.T) {
 	h := newStaleHarness(t, nil)
 	h.clock.Advance(10 * time.Minute)
 	gate := make(chan struct{})
-	fetch := fetchFunc(func(context.Context, Request) (*http.Response, error) {
-		<-gate
+	fetch := fetchFunc(func(ctx context.Context, _ Request) (*http.Response, error) {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 		return response(503, "text/plain", []byte("unavailable\n")), nil
 	})
 	const subscribers = 3
@@ -440,7 +444,7 @@ func TestStaleServiceTakesPrecedenceOverTheSharedResponse(t *testing.T) {
 		waitForSubscribers(t, h.c, i+1)
 	}
 	close(gate)
-	wg.Wait()
+	waitGroupShortly(t, &wg, "the subscribers")
 	for i := range subscribers {
 		status, body, _ := recs[i].result()
 		if outs[i].Result != observability.ResultStale || status != 200 || !bytes.Equal(body, h.pack) {

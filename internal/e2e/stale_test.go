@@ -30,8 +30,9 @@ const (
 	// staleHeaderTimeout is the cache's response-header timeout in the
 	// stale tests: the time a request to a hanging upstream would wait.
 	staleHeaderTimeout = 30 * time.Second
-	// probeInterval is the cache's health gate probe interval.
-	probeInterval = 5 * time.Second
+	// pastProbeInterval moves the clock past the cache's health gate
+	// probe interval, so the next request is admitted as the probe.
+	pastProbeInterval = time.Minute
 	// pastAccessRecheck moves the clock past the cache's accessRecheck,
 	// so a stored pack is no longer a hit.
 	pastAccessRecheck = 6 * time.Minute
@@ -347,7 +348,7 @@ func TestStaleIfErrorServesClonesDuringAnOutage(t *testing.T) {
 	h.cloneFails(t, unseenRepoName)
 
 	h.upstream.restart(t)
-	h.clock.Advance(probeInterval)
+	h.clock.Advance(pastProbeInterval)
 	mark = h.statuses.count()
 	dir, env = h.clone(t, repoName)
 	if sha := headOf(t, h.gitPath, dir, env); sha != h.headSHA {

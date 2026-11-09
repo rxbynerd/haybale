@@ -392,7 +392,7 @@ func TestHealthGateHoldsRequestsBeforeFillSlots(t *testing.T) {
 	}
 	got := map[string]int{}
 	for range clients {
-		res := <-results
+		res := receive(t, results, "a held request")
 		if !res.handled || res.out.Result != observability.ResultStale {
 			t.Fatalf("held request = %+v handled %v, want stale", res.out, res.handled)
 		}
@@ -451,7 +451,7 @@ func TestHealthGateHoldsRequestsBeforeFillSlots(t *testing.T) {
 
 	close(hang.release)
 	for range stuckReqs {
-		<-stuck
+		receive(t, stuck, "a stuck fill")
 	}
 	h.clock.Advance(healthProbeInterval)
 	probe := &failing{status: 503}
@@ -520,11 +520,7 @@ func TestHealthGateHoldsRequestsThatCannotProbe(t *testing.T) {
 	}
 	close(hang.release)
 	for range stuckReqs {
-		select {
-		case <-stuck:
-		case <-time.After(shortly):
-			t.Fatal("a stuck fill never finished")
-		}
+		receive(t, stuck, "a stuck fill")
 	}
 	assertStoreIdle(t, h.c)
 }
