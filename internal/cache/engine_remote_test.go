@@ -496,10 +496,10 @@ func TestEntryNamesUseTheKeyedRequestHash(t *testing.T) {
 	if len(local) != 1 || local[0] != remote {
 		t.Errorf("disk entries %v and remote object %s differ, want one shared name", local, remote)
 	}
-	if strings.Contains(remote, hex.EncodeToString(req.KeyHash[:])) {
+	if strings.Contains(remote, hex.EncodeToString(req.Digest[:])) {
 		t.Errorf("object name %s contains the plain request digest", remote)
 	}
-	want := entryKey{Group: GroupPack, RepoHash: c.keyring.RepoHash(testBaseURL, testRepo), KeyHash: c.keyring.pathHash(req.KeyHash)}.Path()
+	want := entryKey{Group: GroupPack, RepoHash: c.keyring.RepoHash(testBaseURL, testRepo), KeyHash: c.keyring.pathHash(req.Digest)}.Path()
 	if remote != want {
 		t.Errorf("object name = %s, want %s", remote, want)
 	}

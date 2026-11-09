@@ -193,7 +193,7 @@ func TestRelocatedEntryFailsVerification(t *testing.T) {
 	}
 	src := entryPathOnDisk(t, c)
 	other, _, _ := classifyRequest(t, otherFetchRequest(t))
-	dst := filepath.Join(c.opts.Dir, filepath.FromSlash(entryKey{Group: GroupPack, RepoHash: c.keyring.RepoHash(testBaseURL, testRepo), KeyHash: c.keyring.pathHash(other.KeyHash)}.Path()))
+	dst := filepath.Join(c.opts.Dir, filepath.FromSlash(entryKey{Group: GroupPack, RepoHash: c.keyring.RepoHash(testBaseURL, testRepo), KeyHash: c.keyring.pathHash(other.Digest)}.Path()))
 	writeEntry(t, dst, readEntryFile(t, src))
 	c.store.sweep(c.opts.Retention)
 
@@ -233,7 +233,7 @@ func TestDeleteEntryLeavesAReplacementAlone(t *testing.T) {
 func entryKeyFor(t *testing.T, c *Cache, r *http.Request) entryKey {
 	t.Helper()
 	req, _, _ := classifyRequest(t, r)
-	return entryKey{Group: req.Class.Group(), RepoHash: c.keyring.RepoHash(testBaseURL, testRepo), KeyHash: c.keyring.pathHash(req.KeyHash)}
+	return entryKey{Group: req.Class.Group(), RepoHash: c.keyring.RepoHash(testBaseURL, testRepo), KeyHash: c.keyring.pathHash(req.Digest)}
 }
 
 // plantEntry writes a sealed entry for key with the given creation time

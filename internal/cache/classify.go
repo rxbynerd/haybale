@@ -107,7 +107,7 @@ func classifyAdvertisement(r *http.Request, repo gitproto.Repo, protocol string)
 		Endpoint: endpointAdvertisement,
 		Accept:   acceptAny,
 	}
-	req.KeyHash = keyHash(req.Class, req.Protocol, nil)
+	req.Digest = requestDigest(req.Class, req.Protocol, nil)
 	return req, false, "", nil
 }
 
@@ -149,14 +149,14 @@ func classifyUploadPack(r *http.Request, repo gitproto.Repo, protocol string, ve
 		ContentType: contentTypeRequest,
 		Accept:      contentTypeResult,
 	}
-	req.KeyHash = keyHash(req.Class, req.Protocol, req.Body)
+	req.Digest = requestDigest(req.Class, req.Protocol, req.Body)
 	return req, false, "", nil
 }
 
-// keyHash is SHA-256 over class, protocol and body separated by
+// requestDigest is SHA-256 over class, protocol and body separated by
 // newlines. Neither class nor a validated protocol value can contain a
 // newline, so the encoding is unambiguous.
-func keyHash(class Class, protocol string, body []byte) [32]byte {
+func requestDigest(class Class, protocol string, body []byte) [32]byte {
 	h := sha256.New()
 	h.Write([]byte(string(class) + "\n" + protocol + "\n"))
 	h.Write(body)
