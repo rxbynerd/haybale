@@ -38,6 +38,15 @@ const (
 	// reserveStep is the smallest amount by which a fill grows its spool
 	// reservation once the sealed output outruns it.
 	reserveStep = 4 * SegmentSize
+	// refsInitialReservation is the disk a refs fill reserves up front.
+	// Refs responses are kilobytes, so they neither reserve maxEntrySize
+	// like a pack of unknown length nor take a pack fill slot; see
+	// maxRefsFills.
+	refsInitialReservation = 1 << 20
+	// maxRefsFills bounds concurrent refs fills; beyond it a refs request
+	// passes through unstored. It is fixed because a refs fill holds only
+	// refsInitialReservation and a slot is cheap.
+	maxRefsFills = 64
 	// fetchBufferSize is the read size for upstream bodies.
 	fetchBufferSize = 32 << 10
 	// contentTypeAdvertisement is the Content-Type a stored advertisement
@@ -138,7 +147,7 @@ func (c *Cache) newFill(key Key, req Request, repo gitproto.Repo, baseURL *url.U
 func (f *fill) run() {
 	defer close(f.done)
 	defer f.c.wg.Done()
-	defer func() { <-f.c.slots }()
+	defer f.c.releaseSlot(f.key.Group)
 	defer f.end()
 	defer func() {
 		if r := recover(); r != nil {
@@ -221,14 +230,19 @@ func (f *fill) share(resp *http.Response, body io.Reader) {
 }
 
 // openSpool reserves disk for the response and writes the sealed header.
-// contentLength is the upstream Content-Length, or -1 when unknown, in
-// which case the whole maxEntrySize is reserved up front.
+// A pack fill reserves the sealed size of the upstream Content-Length, or
+// of maxEntrySize when the length is unknown (contentLength -1); a refs
+// fill reserves refsInitialReservation. Either grows as sealed bytes
+// arrive.
 func (f *fill) openSpool(contentLength int64, now time.Time) bool {
-	expected := f.c.opts.MaxEntrySize
-	if contentLength >= 0 {
-		expected = contentLength
+	reserve := int64(refsInitialReservation)
+	if f.key.Group == GroupPack {
+		expected := f.c.opts.MaxEntrySize
+		if contentLength >= 0 {
+			expected = contentLength
+		}
+		reserve = SealedSize(expected)
 	}
-	reserve := SealedSize(expected)
 	sp, err := f.c.store.Create(f.key.Path(), reserve)
 	if err != nil {
 		f.release(storeReason(err), transientCooldown)

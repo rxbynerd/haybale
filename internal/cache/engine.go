@@ -41,8 +41,9 @@ type Options struct {
 	MaxDiskSize int64
 	// MaxEntrySize is the largest response body stored, in bytes.
 	MaxEntrySize int64
-	// MaxConcurrentFills bounds fills in flight; a request that finds no
-	// free slot bypasses the cache.
+	// MaxConcurrentFills bounds pack fills in flight, each of which may
+	// reserve maxEntrySize; a request that finds no free slot bypasses
+	// the cache. Refs fills are bounded separately by a fixed cap.
 	MaxConcurrentFills int
 	// MaxRequestBody bounds the decoded request body Classify inspects.
 	MaxRequestBody int64
@@ -88,7 +89,10 @@ type Cache struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
-	slots  chan struct{}
+	// slots are the pack fill slots; refsFills counts refs fills in
+	// flight against maxRefsFills and is guarded by mu.
+	slots     chan struct{}
+	refsFills int
 
 	idleGrace     time.Duration
 	flushInterval time.Duration
@@ -338,13 +342,11 @@ func (c *Cache) joinOrStart(key Key, req Request, repo gitproto.Repo, baseURL *u
 	return f, nil, false, f != nil
 }
 
-// startFillLocked takes a fill slot and starts the fill goroutine with
-// the caller as its first subscriber. It returns nil when no slot is
-// free. Cache.mu must be held.
+// startFillLocked takes a fill slot for the key's group and starts the
+// fill goroutine with the caller as its first subscriber. It returns nil
+// when no slot is free. Cache.mu must be held.
 func (c *Cache) startFillLocked(key Key, req Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher, shared bool) *fill {
-	select {
-	case c.slots <- struct{}{}:
-	default:
+	if !c.acquireSlotLocked(key.Group) {
 		return nil
 	}
 	f := c.newFill(key, req, repo, baseURL, fetch, shared)
@@ -355,6 +357,35 @@ func (c *Cache) startFillLocked(key Key, req Request, repo gitproto.Repo, baseUR
 	c.wg.Add(1)
 	go f.run()
 	return f
+}
+
+// acquireSlotLocked takes a fill slot for group: one of the configured
+// pack slots, or one of the fixed refs slots. Cache.mu must be held.
+func (c *Cache) acquireSlotLocked(group Group) bool {
+	if group == GroupRefs {
+		if c.refsFills >= maxRefsFills {
+			return false
+		}
+		c.refsFills++
+		return true
+	}
+	select {
+	case c.slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// releaseSlot returns the slot acquireSlotLocked took for group.
+func (c *Cache) releaseSlot(group Group) {
+	if group == GroupRefs {
+		c.mu.Lock()
+		c.refsFills--
+		c.mu.Unlock()
+		return
+	}
+	<-c.slots
 }
 
 // subscribe serves the request from fill f.

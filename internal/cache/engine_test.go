@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -528,8 +529,9 @@ func TestOversizeResponseIsServedNotStoredAndMarksTheKey(t *testing.T) {
 		t.Fatalf("known oversize = %+v handled %v, want a bypass", out, handled)
 	}
 
-	// Unknown length: the response is spooled, served and discarded.
-	c.marks = uncacheableMarks{}
+	// Unknown length, under a second key so the first mark plays no part:
+	// the response is spooled, served and discarded.
+	other := func() *http.Request { return postV2(fetchBody(t, "want "+oidB+"\n", "done\n")) }
 	pr, pw := io.Pipe()
 	go func() {
 		_, _ = pw.Write(want)
@@ -539,14 +541,14 @@ func TestOversizeResponseIsServedNotStoredAndMarksTheKey(t *testing.T) {
 		return streamingResponse(contentTypeResult, pr), nil
 	})
 	rec = httptest.NewRecorder()
-	out, handled, _ = serve(c, rec, fetchRequest(t), streaming)
+	out, handled, _ = serve(c, rec, other(), streaming)
 	if !handled || out.Result != observability.ResultMiss || out.Stored || !bytes.Equal(rec.Body.Bytes(), want) {
 		t.Fatalf("oversize stream = %+v handled %v, %d bytes; want a served, unstored miss", out, handled, rec.Body.Len())
 	}
 	if len(entryFiles(t, c.opts.Dir)) != 0 {
 		t.Error("oversize response left files behind")
 	}
-	if _, handled, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), fetch); handled {
+	if _, handled, _ := serve(c, httptest.NewRecorder(), other(), fetch); handled {
 		t.Error("key was not marked uncacheable after an oversize response")
 	}
 	clock.Advance(25 * time.Hour)
@@ -554,7 +556,7 @@ func TestOversizeResponseIsServedNotStoredAndMarksTheKey(t *testing.T) {
 		t.Fatal("ls-refs was not handled")
 	}
 	fetch = &fixedFetcher{status: 200, contentType: contentTypeResult, body: fetchResultBody(t, 1, 10)}
-	if out, handled, _ := serve(c, httptest.NewRecorder(), fetchRequest(t), fetch); !handled || out.Result != observability.ResultMiss {
+	if out, handled, _ := serve(c, httptest.NewRecorder(), other(), fetch); !handled || out.Result != observability.ResultMiss {
 		t.Errorf("after retention the mark should have expired: %+v handled %v", out, handled)
 	}
 }
@@ -868,6 +870,88 @@ func TestNoFillSlotBypasses(t *testing.T) {
 		t.Error("bypassed request reached the fetcher")
 	}
 	close(gate)
+	<-done
+}
+
+// TestRefsFillsDoNotTakePackSlots: ten concurrent refs requests are all
+// stored with a single configured fill slot, because refs fills have
+// their own fixed cap and a small fixed reservation, while a pack fill
+// still takes the configured slot.
+func TestRefsFillsDoNotTakePackSlots(t *testing.T) {
+	c, _ := newTestCache(t, func(o *Options) {
+		o.MaxConcurrentFills = 1
+		o.RefsMaxAge = time.Minute
+		o.AccessRecheck = 0
+	})
+	// Each fetch answers its headers at once and holds the body open, so
+	// every fill has opened its spool while the test inspects the store.
+	var mu sync.Mutex
+	var bodies []*io.PipeWriter
+	refs := fetchFunc(func(context.Context, Request) (*http.Response, error) {
+		pr, pw := io.Pipe()
+		mu.Lock()
+		bodies = append(bodies, pw)
+		mu.Unlock()
+		return streamingResponse(contentTypeResult, pr), nil
+	})
+
+	const n = 10
+	outs := make([]Outcome, n)
+	handled := make([]bool, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Distinct ref-prefix arguments make distinct keys, so every
+			// request starts its own fill.
+			body := pkts(t, "command=ls-refs\n", pktline.Delim, "ref-prefix refs/heads/b"+strconv.Itoa(i)+"\n", pktline.Flush)
+			outs[i], handled[i], _ = serve(c, httptest.NewRecorder(), postV2(body), refs)
+		}()
+	}
+	want := int64(n * refsInitialReservation)
+	waitFor(t, "ten refs reservations", func() bool {
+		_, inflight, _ := c.store.Usage()
+		return inflight == want
+	})
+	// With every refs fill in flight, the single pack slot is still free.
+	if len(c.slots) != 0 {
+		t.Errorf("pack slots in use = %d while only refs fills run, want 0", len(c.slots))
+	}
+	mu.Lock()
+	for _, pw := range bodies {
+		_, _ = pw.Write(lsRefsResultBody(t))
+		_ = pw.Close()
+	}
+	mu.Unlock()
+	wg.Wait()
+	for i := range n {
+		if !handled[i] || outs[i].Result != observability.ResultMiss || !outs[i].Stored {
+			t.Errorf("refs request %d: %+v handled %v, want a stored miss", i, outs[i], handled[i])
+		}
+	}
+
+	packGate := make(chan struct{})
+	packStarted := make(chan struct{})
+	pack := fetchFunc(func(context.Context, Request) (*http.Response, error) {
+		close(packStarted)
+		<-packGate
+		return response(http.StatusOK, contentTypeResult, fetchResultBody(t, 1, 10)), nil
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		serve(c, httptest.NewRecorder(), fetchRequest(t), pack)
+	}()
+	<-packStarted
+	if len(c.slots) != 1 {
+		t.Errorf("pack slots in use = %d during a pack fill, want 1", len(c.slots))
+	}
+	// A refs request is still served while the only pack slot is taken.
+	if out, ok, _ := serve(c, httptest.NewRecorder(), get(), &fixedFetcher{status: 200, contentType: contentTypeAdvertisement, body: advertisementBody(t)}); !ok || !out.Stored {
+		t.Errorf("refs request during a pack fill = %+v handled %v, want a stored miss", out, ok)
+	}
+	close(packGate)
 	<-done
 }
 
