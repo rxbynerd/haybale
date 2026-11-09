@@ -206,13 +206,16 @@ func TestRemoteStaleReadFailures(t *testing.T) {
 		if !aborted && handled {
 			t.Errorf("got %+v handled %v, want the response aborted", out, handled)
 		}
+		// The subscriber can meet the corrupt segment in the spool before
+		// the fill does, so the fill's verdict is awaited.
+		waitFor(t, "the corrupt remote entry to be deleted", func() bool { return len(store.keys(packPrefix)) == 0 })
+		assertStoreIdle(t, c)
 		if ev := logs.securityEvents(t, security.EventCacheIntegrityFailed); len(ev) != 1 {
 			t.Errorf("integrity events = %d, want 1", len(ev))
 		}
 		if ev := logs.securityEvents(t, security.EventCacheStaleServed); len(ev) != 0 {
 			t.Errorf("stale events = %d, want none", len(ev))
 		}
-		waitFor(t, "the corrupt remote entry to be deleted", func() bool { return len(store.keys(packPrefix)) == 0 })
 	})
 }
 
