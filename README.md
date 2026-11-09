@@ -18,6 +18,8 @@ client.
 - per-request, least-privilege GitHub App installation tokens, or static
   credentials for other Git hosts
 - streaming Git smart-HTTP proxying with no pack-size limit
+- an optional, encrypted on-disk response cache that serves repeated identical
+  clones and fetches without contacting the upstream again
 - TLS, graceful draining, structured security logs, and optional OpenTelemetry
   traces, metrics, and logs
 
@@ -103,6 +105,7 @@ See the [configuration reference](docs/configuration.md) for complete examples.
 ```text
 haybale serve [--config haybale.yaml]
 haybale policy check --config haybale.yaml --id ID --repo HOST/OWNER/REPO --verb read|write
+haybale cache purge --config haybale.yaml --repo HOST/OWNER/REPO [--group refs|pack]
 haybale version
 ```
 
@@ -112,6 +115,7 @@ draining.
 ## Documentation
 
 - [Configuration reference](docs/configuration.md)
+- [Response cache guide](docs/caching.md)
 - [JWT issuer contract](docs/jwt-identity.md)
 - [GitHub Actions OIDC integration](docs/github-actions.md)
 - [OpenTelemetry signals](docs/observability.md)

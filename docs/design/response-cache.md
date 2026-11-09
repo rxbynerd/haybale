@@ -1,6 +1,8 @@
 # Design: response cache for Git smart HTTP reads
 
-Status: proposed, revised 2026-11-09 after design review (pressure test,
+Status: accepted; the first pull request implements Decisions 1 to 7 and 9
+(tier 1 only); Decision 6's remote tier and Decision 8 follow in later pull
+requests. Revised 2026-11-09 after design review (pressure test,
 security threat model, API design review, adversarial document review)
 and a research survey of prior art. This document records the design
 decisions behind haybale's optional response cache so that future changes
