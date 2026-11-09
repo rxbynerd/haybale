@@ -338,10 +338,10 @@ Lifecycle:
 - `recover()` guards every fill goroutine; a panic in the scanner or
   sealing code aborts that fill and its subscribers, never the process.
 - Concurrent fills are bounded by `cache.maxConcurrentFills` (default
-  `8`); a request that cannot obtain a slot bypasses. A fill of unknown
-  length reserves `maxEntrySize` up front, so with the defaults eight
-  fills can be in flight against the 10 GiB budget; operators size the
-  three values together.
+  `4`); a request that cannot obtain a slot bypasses. A fill of unknown
+  length reserves `maxEntrySize` up front, so with the defaults four
+  fills reserve at most 4 GiB of the 10 GiB budget, leaving the rest for
+  stored entries; operators size the three values together.
 
 A fill that completes the storability checks (Decision 5) commits the
 spool by rename and becomes a normal entry.
@@ -377,13 +377,15 @@ It is fuzzed.
 
 ## Decision 6: sealed entries, two storage tiers
 
-**Entry format.** Every stored object, on both tiers, is a preamble, an
-authenticated header, and sealed segments. The preamble (magic, format
-version, key id, per-entry random nonce prefix) is clear text. The
-header records only fields known when the response starts: `repoHash`,
-group, class, `keyHash`, plain repository name and upstream base URL for
-operators, creation time, `Content-Type`, protocol, and the
-canonical-request digest. The body is encrypted and authenticated with
+**Entry format.** Every stored object, on both tiers, is a preamble, a
+sealed header, and sealed segments. The preamble (magic, format version,
+key id, per-entry random nonce prefix) is clear text. The header is
+encrypted and authenticated like the body, so repository names are
+hidden from anyone who can read the disk or bucket without the key; it
+records only fields known when the response starts: `repoHash`, group,
+class, `keyHash` (which is the canonical-request digest), plain
+repository name and upstream base URL, creation time, `Content-Type`,
+and protocol. The body is encrypted and authenticated with
 AES-256-GCM in a STREAM-style construction (nonce = prefix || segment
 counter || final-segment flag) with the header's digest as associated
 data on every segment. **Segments are variable length**, each framed by
@@ -414,9 +416,14 @@ not to support dual-key operation.
 
 **Tier 1, local disk (`cache.dir`), required when the cache is enabled.**
 It is the spool for in-flight fills, the read path for every subscriber,
-and the local cache. Requirements: the directory must exist, be owned by
-the process user with no group or other permission bits, and every file
-operation goes through `os.Root` so symlinks cannot escape it. Files are
+and the local cache. Requirements: haybale creates the leaf directory
+with mode 0700 if it is missing (its parent must exist, so a root-owned
+`emptyDir` mounted at the parent needs no init container); the directory
+must be owned by the process user with no group or other permission
+bits; every file operation goes through `os.Root` so symlinks cannot
+escape it; and one directory serves one server process (opening a store
+removes other processes' temporary files, so replicas must not share a
+volume). Files are
 created `0600`, written to a temporary name under the directory, synced,
 and renamed into place; a partially written entry is never visible.
 Temporary names carry a per-process prefix, so the startup sweep removes
@@ -434,7 +441,8 @@ tier-1 commit, the sealed file is uploaded by a bounded worker pool from
 its finalised length (for `pack` entries a `Stat` first skips the upload
 when a peer already stored the key; `refs` entries are always uploaded so
 the shared copy is refreshed). On a tier-1 miss, tier 2 is consulted before upstream
-under `cache.remote.timeout`; a tier-2 hit is streamed into the tier-1
+under `cache.remote.headerTimeout` (a time-to-first-byte bound; body
+reads fall under the fill's idle timeout); a tier-2 hit is streamed into the tier-1
 spool as a fill source, so subscribers coalesce on it exactly as on an
 upstream fill. A tier-2 failure before the first byte falls through to
 upstream inside the same fill; a failure mid-stream resumes with a ranged
@@ -585,8 +593,11 @@ Responses served through the cache path carry the stored `Content-Type`,
 upstream. When `cache.exposeStatus` is `true` (default `false`), the
 response also carries an RFC 9211 `Cache-Status: haybale; ...` header with
 `hit`, `fwd=miss` (with `collapsed` for a subscriber that joined an
-in-flight fill and `stored` when the fill committed), `fwd=bypass`, or
-`hit; fwd=stale; fwd-status=<n>` for stale service. The header is off by
+in-flight fill), `fwd=bypass` (written by the proxy on the passthrough
+path for a read the cache declined), or `hit; fwd=stale; fwd-status=<n>`
+for stale service. Whether a fill was stored is only known after the
+response has been written, so it appears in the request log
+(`cacheStored`), not in the header. The header is off by
 default because within a repository that several tenants may read, a
 `hit` reveals that another identity made the identical request recently.
 The request log's `cache` field carries the same values for operators.
@@ -645,7 +656,7 @@ cache:
   keyEnv: HAYBALE_CACHE_KEY        # 32-byte base64 key; optional for disk-only, required with remote
   maxDiskSize: 10GiB               # tier-1 budget: committed + in-flight + evicted-but-open
   maxEntrySize: 1GiB               # larger responses stream through unstored
-  maxConcurrentFills: 8            # with maxEntrySize, bounds in-flight disk use
+  maxConcurrentFills: 4            # with maxEntrySize, bounds in-flight disk use
   maxRequestBody: 1MiB             # decoded size; larger read bodies bypass
   retention: 24h                   # all entries; also the post-rewrite exposure window
   refsMaxAge: 0s                   # 0s = always revalidate refs upstream
@@ -674,8 +685,9 @@ startup instead of silently reverting to a default. Sizes use a
 can never be misread by a factor of 1024. Durations use Go duration
 strings as elsewhere. `cache` follows the configuration package's
 pattern: a structural `validate()` at load time (parses sizes and
-durations, checks `staleIfErrorFor <= retention`, requires `keyEnv` with
-`remote`, recognises the remote type) with no filesystem or network side
+durations, requires `retention > 0`, requires `refsMaxAge < accessRecheck`
+when both are set, checks `staleIfErrorFor <= retention`, requires
+`keyEnv` with `remote`, recognises the remote type) with no filesystem or network side
 effects, so `haybale policy check` stays offline; and a
 `BuildCache(ctx, logger, metrics)` step called from `serve` that opens
 the directory, loads or generates the key, constructs the remote client,
