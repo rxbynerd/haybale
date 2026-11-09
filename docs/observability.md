@@ -185,7 +185,10 @@ deleted, so each replica logs the event again about every minute while it
 receives refs requests for the repository, and its pack hits for the
 repository lapse within `accessRecheck` (unless `accessRecheck` is `0s`, which
 disables the rule), until `haybale cache purge --remote` replaces the marker
-(see [Purging a repository](caching.md#purging-a-repository)).
+(see [Purging a repository](caching.md#purging-a-repository)). With
+`staleIfErrorFor` set, nothing is served stale for the repository meanwhile
+either (see [Purges and stale
+service](caching.md#purges-and-stale-service)).
 
 `cache_stale_served` is logged once for every response the cache answers from a
 stale entry because the upstream could not answer (see [Serving through an

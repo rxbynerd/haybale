@@ -415,6 +415,9 @@ successful check, so while the marker cannot be read or fails verification,
 its pack hits for the repository lapse within `accessRecheck` and go to the
 upstream instead of outliving a purge. Setting `accessRecheck` to `0s`
 disables that rule, and pack hits then continue while marker checks fail.
+With `staleIfErrorFor` set, a replica also checks the marker before every stale
+answer, and serves nothing stale for the repository while the check fails
+(see [Stale-if-error](#stale-if-error)).
 
 The host that runs `haybale cache purge --remote` holds the cache key and write
 access to the bucket. Together they are enough to seal entries that every
@@ -432,9 +435,10 @@ a failure on the replicas' side:
 - a bucket writer can delete a purge marker before the replicas read it, in
   which case their older local entries stay servable until `retention`, as
   they would without the marker, or replace it with an invalid object, which
-  stops pack hits for the repository on every replica until `purge --remote`
-  replaces it. The replacement records only the groups purged then, so the
-  other group's earlier purge time is lost for replicas that had not read it.
+  stops pack hits, and stale service, for the repository on every replica
+  until `purge --remote` replaces it. The replacement records only the groups
+  purged then, so the other group's earlier purge time is lost for replicas
+  that had not read it.
   When the purge that printed `notice: the repository's purge marker failed
   verification and was replaced` used `--group`, run it again for both
   groups; and
@@ -442,7 +446,9 @@ a failure on the replicas' side:
   entries from the bucket, best effort, and never serves an older refs entry
   from the bucket itself. When that deletion fails, other replicas, and the
   same replica after a restart, can serve the pre-push refs from the bucket
-  for up to `refsMaxAge`.
+  for up to `refsMaxAge`. With `staleIfErrorFor` set, refs entries are uploaded
+  even at a `refsMaxAge` of `0s`, and a surviving pre-push refs object can be
+  served stale during an outage for up to `staleIfErrorFor`.
 
 Pre-push refs can reach clients from the bucket in three more ways, none of
 which needs write access to the bucket:
@@ -526,20 +532,24 @@ field of the request log carries the same information for operators.
 
 ### Fill timeouts
 
-A response being fetched into the cache has two bounds that passthrough requests
-do not have: `cache.responseHeaderTimeout` (default `60s`) for the upstream's
-response headers and `cache.idleTimeout` (default `2m`) for the gap between body
-bytes. A single fill can serve many waiting clients, so a wedged upstream
-connection would otherwise hold all of them. Expiry is treated as an upstream
-failure. If the response headers had not arrived, the waiting requests are
-released to the passthrough path and reach the upstream directly, so clients see
-a delay of up to `responseHeaderTimeout`, unless stale-if-error answers them from
-a stored entry. If the body stalls after bytes were sent, the waiting clients'
-connections are closed without a clean ending. In both cases requests for the
-same key go straight to the upstream for one minute, except while
-stale-if-error is enabled, when the key stays cacheable.
+A response being fetched into the cache has two bounds:
+`cache.responseHeaderTimeout` (default `60s`) for the upstream's response
+headers and `cache.idleTimeout` (default `2m`) for the gap between body bytes. A
+single fill can serve many waiting clients, so a wedged upstream connection
+would otherwise hold all of them. With the cache enabled, a read on the
+passthrough path also waits at most `responseHeaderTimeout` for response
+headers and is then answered `502`; its body, and every push, stay unbounded.
+Expiry is treated as an upstream failure. If the response headers had not
+arrived, the waiting requests are released to the passthrough path and reach
+the upstream directly, so clients see a delay of up to `responseHeaderTimeout`,
+or twice that ending in a `502` when the upstream still does not answer, unless
+stale-if-error answers them from a stored entry. If the body stalls after bytes
+were sent, the waiting clients' connections are closed without a clean ending.
+In both cases requests for the same key go straight to the upstream for one
+minute, except while stale-if-error is enabled, when the key stays cacheable.
 The number of fills in flight is bounded by `cache.maxConcurrentFills`; a
-request that finds no free slot is proxied directly.
+request that finds no free slot is proxied directly, unless the health gate is
+open and a stored entry on disk answers it stale.
 
 ### Stale-if-error
 
@@ -557,9 +567,12 @@ accepts these risks:
   deleted, retained entries can be served for up to `staleIfErrorFor` while the
   upstream is failing, rather than for `accessRecheck`. Policy still applies:
   only an identity that policy allows to read the repository is served. A
-  reachable upstream that refuses access (`401`, `403`, `404`, or a credential
-  refusal) is never masked, and the next probe closes the health gate. Only a
-  revocation that coincides with an outage is hidden.
+  `401`, `403` or `404` from the upstream is never masked, and the next probe
+  closes the gate, including a probe whose client was already answered stale
+  at the probe deadline, because its upstream request runs on until headers
+  arrive or `responseHeaderTimeout` expires. A credential refusal is not masked
+  for the request that reaches the credential source, but it leaves the gate
+  open. Only a revocation that coincides with an outage is hidden.
 - **Chosen outages.** A party on the network path between haybale and the
   upstream can cause the connect failures that trigger stale service. Anyone
   who can disrupt haybale's egress (DNS poisoning, blocked connections, a bad
@@ -604,20 +617,28 @@ The entry served must be an entry for the identical request, created no more
 than `staleIfErrorFor` ago, verified like any other entry, and not covered by a
 purge. With a remote tier, a replica learns of a purge made on another host
 only from the repository's purge marker, so no entry is served stale until the
-marker check is current: read within the last minute or read now. If the
-marker cannot be read or fails verification, stale service fails closed and the
-request fails as it would without the setting. A client that makes its own
+marker check is current: read within the last minute (or `accessRecheck`, when
+that is shorter) or read now. If the marker cannot be read or fails
+verification, stale service fails closed and the request fails as it would
+without the setting. A client that makes its own
 request fail upstream, for example with a request that makes the upstream answer
 `500`, can only steer that request to the stored answer for the same request;
-it changes nothing for other readers.
+it changes nothing for other readers. A client whose request becomes the
+gate's probe cannot keep the gate open by being slow or by leaving: the probe's
+upstream request is not cancelled with it, and its answer still reaches the
+gate.
 
 To avoid a connection timeout per request during an outage, each upstream host
 has a health gate. It opens only on failures a client cannot cause, although a
 party on the network path can: a failed connection and an unavailable
 credential API. A `5xx` or a header timeout never opens it. While it is open, a
 request with a qualifying entry is answered without contacting the upstream,
-one request every 5 seconds probes the upstream, and any upstream answer other
-than `500`, `502`, `503` or `504` closes it.
+one request at a time probes the upstream, 5 seconds after the previous probe
+ended, and any upstream answer other than `500`, `502`, `503` or `504` closes
+it. A probe's client is answered stale after 5 seconds when it has a
+qualifying entry, but the probe itself runs until the upstream answers or
+`responseHeaderTimeout` expires, so an upstream that answers slowly still
+closes the gate.
 
 Every stale response logs a `cache_stale_served` security event with the
 identity, the repository, the request class, the tier, the reason and the

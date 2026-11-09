@@ -120,7 +120,8 @@ an oversize response (`too_large`) the period is `retention`, and a `generation`
 discard, or a fill cancelled because every request waiting on it left, marks
 nothing. With `staleIfErrorFor` set, a failure that suggests the upstream
 cannot answer is answered from a stored entry instead when one qualifies, and
-marks nothing either, and a `fetch_error` failure marks nothing; see [Serving
+then marks nothing either. A `fetch_error` failure also marks nothing while
+`staleIfErrorFor` is set, whether or not an entry answered it; see [Serving
 through an upstream outage](#serving-through-an-upstream-outage).
 
 With the default settings, fifty concurrent clones of one repository cost one
@@ -377,7 +378,8 @@ within `retention` plus the lifecycle margin; refs entries are kilobytes.
 Entries over 5GiB are never uploaded, which the default `maxEntrySize` of 1GiB
 already guarantees. Request volume is one read per eligible disk miss, at most
 one small read of each repository's purge marker per minute, or per
-`accessRecheck` when that is shorter (on an upstream refs request), and one
+`accessRecheck` when that is shorter (on an upstream refs request, and before
+a stale answer; see [Purges and stale service](#purges-and-stale-service)), and one
 upload per stored pack entry, plus an existence check first, and per stored
 refs entry when `refsMaxAge` is above `0s`. A push costs a listing of the
 repository's refs entries and a deletion for each one found.
@@ -420,6 +422,9 @@ below; every other operation tries the bucket afresh. During an outage:
   record that pack hits depend on, so pack requests stop hitting, on disk as
   well, within `accessRecheck` and go to the upstream instead, unless
   `accessRecheck` is `0s`, which disables the rule;
+- with `staleIfErrorFor` set, nothing is served stale for a repository whose
+  marker cannot be read (see [Purges and stale
+  service](#purges-and-stale-service));
 - a push's result is unaffected, but the push handler can take up to
   `headerTimeout` (one minute when it is `0s`) longer to return while it tries
   to delete the bucket's refs entries; and
@@ -458,16 +463,21 @@ A read is answered stale when all of these hold:
 - the request was offered to the cache: a read that the cache declines (see
   [Clones always miss](#clones-always-miss)) takes the passthrough path, which
   never serves stale. A key marked uncacheable is declined too, unless the
-  [health gate](#health-gate) is open. For example, a `401` or `403` discards
-  the fill and marks its key for a minute, so a `503` inside that minute is
-  relayed rather than answered stale while the gate is closed.
+  [health gate](#health-gate) is open and this replica's disk holds a
+  qualifying entry; a marked key is never answered from the remote tier. For
+  example, a `401` or `403` discards the fill and marks its key for a minute,
+  so a `503` inside that minute is relayed rather than answered stale while the
+  gate is closed.
 
 The `accessRecheck` and `refsMaxAge` rules are waived for stale service, since
 both exist to make haybale ask the upstream, and the upstream cannot answer.
 The disk entry is used when it qualifies; otherwise the remote tier's copy is
 read, served and stored on disk like any remote fill. Every request waiting on
 the failed fill is served the stale entry rather than the upstream's error
-response.
+response. One case can answer only from disk: when the body of an upstream
+`5xx` stalls for `idleTimeout`, the fill is cancelled, so the remote tier's
+copy cannot be read and a purge marker cannot be checked, and only a disk entry
+whose marker check is already current can answer.
 
 These are never answered stale and fail as they do without the setting:
 
@@ -482,14 +492,20 @@ These are never answered stale and fail as they do without the setting:
 - every push; and
 - a request with no stored entry, or only one older than `staleIfErrorFor`.
 
-While `staleIfErrorFor` is set, a fill that fails with `fetch_error` (a reset,
-an EOF, or a failure stale service cannot answer) does not mark its key
+While `staleIfErrorFor` is set, a fill that fails with `fetch_error` (a failed
+connection, no response headers, a credential that could not be obtained, a
+reset or an EOF) does not mark its key
 uncacheable, so the next request for the key can still be answered stale. The
-cost is that during a `5xx` or hung-upstream outage a key with no stored entry
-goes to the upstream on every request, where the mark would have sent its
-requests straight to the passthrough path for a minute. Connect failures are
-bounded by the health gate instead. Other marks (`too_large`, `truncated`, store
-errors, and a rejected credential) are unchanged.
+cost is that during a connection or hung-upstream outage a key with no stored
+entry goes to the upstream on every request, where the mark would have sent its
+requests straight to the passthrough path for a minute. Such a request waits
+for the upstream twice, once in the fill and once on the passthrough path: two
+connection timeouts against a host that drops connections, or two
+`responseHeaderTimeout` waits against one that accepts them and never answers,
+after which the passthrough path answers `502`. A `5xx` answer with no
+qualifying entry still marks its key for a minute, as without the setting.
+Other marks (`too_large`, `truncated`, store errors, and a rejected
+credential) are unchanged.
 
 A stale response carries `Cache-Status: haybale; hit; fwd=stale;
 fwd-status=503` when `exposeStatus` is on, where `fwd-status` is the upstream's
@@ -523,7 +539,9 @@ fails as it would without the setting. As a result:
   minutes ahead, stops stale service for that repository on every replica until
   `purge --remote` replaces it, as it already stops pack hits; and
 - a held request can wait up to the marker timeout once a minute per
-  repository while the bucket is slow.
+  repository while the bucket is slow. Concurrent requests for a repository
+  share one read, and a client that disconnects while waiting for it does not
+  cut the read short for the others.
 
 ### What an outage clone can do
 
@@ -564,18 +582,36 @@ it.
 While the gate is open:
 
 - a request with a qualifying entry on this replica's disk is answered from it
-  at once, without contacting the upstream and without taking a fill slot, so
-  fills stuck on the upstream cannot crowd it out;
+  at once, without contacting the upstream and without taking a fill slot. The
+  exception is the one request that becomes the probe (below), which needs a
+  free fill slot; a request that finds a probe due but no slot free, or whose
+  key is marked uncacheable, cannot probe and is answered from its entry
+  anyway, so fills stuck on the upstream cannot crowd out requests with disk
+  entries;
 - a request whose only qualifying entry is in the remote tier is answered from
   it through a fill, which takes a fill slot and stores the copy on disk; with
   no slot free it takes the passthrough path, like any other request;
 - a request without a qualifying entry still goes to the upstream, since
   nothing else can answer it; and
-- one request at a time goes to the upstream as a probe, at most once every 5
-  seconds. A probe that has a qualifying entry on disk waits at most 5 seconds
-  for the upstream's response headers and is then answered stale, leaving the
-  gate open; a probe without one waits the full `responseHeaderTimeout`. A
-  failed probe is answered stale like any other request.
+- one request at a time goes to the upstream as a probe, once 5 seconds have
+  passed since the previous probe ended. The probe's client waits at most 5
+  seconds for the upstream's response headers. It is then answered from its
+  qualifying disk entry, when it has one and the purge marker check is
+  current, while the probe's upstream request carries on in the background
+  until headers arrive or `responseHeaderTimeout` expires. The probe ends
+  only then, and its result reaches the gate either way, so an upstream that
+  is reachable but slower than 5 seconds still closes it; a response that can
+  be stored is stored. A client that disconnects does not cancel its probe. A
+  probe without a qualifying disk entry waits the full
+  `responseHeaderTimeout`. A `responseHeaderTimeout` under 5 seconds expires
+  before the probe deadline, so a probe with an entry is then answered stale
+  with reason `header_timeout`. A failed probe is answered stale like any other
+  request.
+
+Because the next probe waits for the previous one to end, a lone client that
+sends requests one after another pays the 5-second probe deadline once, for the
+request that becomes the probe; its later requests are answered from disk while
+that probe runs and for 5 seconds after it ends.
 
 Any upstream answer other than `500`, `502`, `503` or `504` closes the gate.
 Probes ride on client requests, so with no traffic the gate stays open until the
@@ -588,7 +624,10 @@ memory, so a restarted replica, or another replica, starts with it closed.
 An upstream that accepts connections but never answers never opens the gate,
 since header timeouts do not. Each request then waits `responseHeaderTimeout`
 before it is answered stale, so for that kind of outage lower
-`responseHeaderTimeout`.
+`responseHeaderTimeout`. A read that cannot be answered stale then takes the
+passthrough path, which also waits at most `responseHeaderTimeout` for the
+upstream's response headers before it answers `502`; pushes are not bounded
+this way.
 
 ## Observing the cache
 
@@ -812,15 +851,18 @@ so both groups are purged. This applies at any `refsMaxAge`.
 The marker is sealed under the cache key and records the purge time of each
 group. A replica checks it alongside an upstream refs request for the
 repository, and drops its local entries created before the purge time; until
-then those entries are still served. Because a pack hit needs a recent refs
-success, a replica that reads the marker on a clone's `ls-refs` also misses that
-clone's `fetch`. A successful check, which finds the marker or confirms there
-is none, stays current for a minute (or for `accessRecheck` when that is
-shorter), and concurrent refs requests for the repository share one read. A
-replica therefore honours a purge within about a minute plus its next upstream
-refs request for the repository. A check that fails, because the read fails,
-times out after 30 seconds, or finds a marker that fails verification, is not
-retried for a minute, so a replica whose checks are failing honours a purge
+then those entries are still served as hits. With `staleIfErrorFor` set, a
+replica also checks it before any stale answer, so a purged entry is never
+served stale (see [Purges and stale service](#purges-and-stale-service)).
+Because a pack hit needs a recent refs success, a replica that reads the marker
+on a clone's `ls-refs` also misses that clone's `fetch`. A successful check,
+which finds the marker or confirms there is none, stays current for a minute
+(or for `accessRecheck` when that is shorter), and concurrent requests for the
+repository share one read. A replica therefore honours a purge within about a
+minute plus its next upstream refs request or stale answer for the repository.
+A check that fails, because the read fails, times out after 30 seconds, or
+finds a marker that fails verification, is not retried for a minute, so a
+replica whose checks are failing honours a purge
 up to that minute later. A failed check does not renew the access record that
 pack hits depend on, so the replica's pack hits for the repository lapse
 within `accessRecheck` and go to the upstream until a check succeeds, unless
@@ -885,7 +927,8 @@ out through the lifecycle rule.
   entry.
 - A fill that was discarded marks its key uncacheable for one minute, or for
   `retention` after an oversize response (`too_large`), so clones for that key
-  miss until the mark expires.
+  miss until the mark expires. With `staleIfErrorFor` set, a `fetch_error`
+  marks nothing.
 - With several replicas behind a load balancer, each replica has its own cache
   unless they share a [remote tier](#remote-tier). With a remote tier, check
   `uploads.total` for `failed` or `dropped` results and `store_errors.total`
@@ -917,13 +960,15 @@ The `reason` on `fills.total` says why, and what clients see depends on it:
   receive it, and the key is not marked.
 - `upstream_status`: the upstream answered with something other than a
   cacheable `200`. The waiting requests share that one response, or go to the
-  upstream if it was over 64KiB.
+  upstream if it was over 64KiB, unless stale-if-error answers them from a
+  stored entry.
 - `fetch_error`: a transport failure, a timeout, a failure to obtain a
   credential, a failure reading an error body, or a read from the remote tier
   that could not continue after three resumes or whose object was replaced or
   deleted during the read. Requests that had not yet received bytes go to the
   upstream directly. If the failure comes mid-response, clients that had
-  received bytes lose the connection.
+  received bytes lose the connection. While `staleIfErrorFor` is set, a
+  `fetch_error` does not mark the key.
 - `encoding`: the upstream answered with a content encoding. The waiting
   requests go to the upstream directly.
 - `store_error`: the disk failed, the fill panicked, or an entry read from the
@@ -956,7 +1001,8 @@ object replaced or deleted, or failed its integrity check. If the upstream does
 not send response headers within `responseHeaderTimeout`, waiting requests are
 instead sent to the upstream directly, and clients see only the delay. After a
 failed fill, requests for the same key go straight to the upstream for one
-minute, or for `retention` after an oversize response.
+minute, or for `retention` after an oversize response; with `staleIfErrorFor`
+set, a `fetch_error` marks nothing, so the next request tries the cache again.
 
 ### `haybale serve` refuses to start
 

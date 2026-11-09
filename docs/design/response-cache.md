@@ -292,7 +292,8 @@ no effect on cache behaviour.
   tiers and bumps an in-memory per-repository generation. A refs fill
   whose upstream request began under an older generation is discarded at
   commit. Replicas that did not see the push keep their tier-1 refs
-  entries until they age out, which matters only when `refsMaxAge > 0`.
+  entries until they age out, which matters only when `refsMaxAge > 0`, or
+  during an outage with `staleIfErrorFor` set.
 
 > Implemented as: Refs entries are written and counted against the disk
 > budget. At the default `refsMaxAge` of `0s` they are never served as hits;
@@ -725,17 +726,21 @@ opens only on failures a client cannot induce: DNS, dial and TLS errors,
 and `ErrUnavailable` from the credential source. Response-header timeouts
 and 5xx never open it. While open, requests that have a qualifying stale
 entry are served immediately; requests without one, and one probe request
-at a time, go upstream. A success closes the gate; an open gate re-probes
-every 5 s. The probe interval is a constant, not configuration. A held
-request with a qualifying tier-1 entry is answered before it takes a fill
-slot, so fills stuck on upstream cannot crowd it out; a tier-2 answer is
-spooled through a fill and so needs a slot. A probe that holds a
-qualifying tier-1 entry waits at most the probe interval for upstream
-headers, is then answered stale with reason `health_gate`, and leaves the
-gate open; whichever of that deadline and `responseHeaderTimeout` expires
-first sets the reason. A hung upstream that accepts connections never
-opens the gate, so the deadline applies only while an earlier connect
-failure holds it open.
+at a time, go upstream. A success closes the gate; an open gate admits its
+next probe 5 s after the previous one ended. The probe interval is a
+constant, not configuration. A held request with a qualifying tier-1 entry
+is answered before it takes a fill slot, and a request that finds a probe
+due but cannot become the probe, for want of a slot or because its key is
+marked, is answered stale too, so fills stuck on upstream cannot crowd it
+out; a tier-2 answer is spooled through a fill and so needs a slot. A
+probe's subscribers wait at most the probe interval for upstream headers
+and are then answered from a qualifying tier-1 entry with reason
+`health_gate`, while the probe's upstream request continues until headers
+arrive or `responseHeaderTimeout` expires; its result, not the deadline,
+decides the gate. When `responseHeaderTimeout` is shorter it expires first
+and sets the reason. A hung upstream that accepts connections never opens
+the gate, so the deadline applies only while an earlier connect failure
+holds it open.
 
 A clone during an outage therefore succeeds only if the same clone (same
 tips, same options) happened recently through this instance or a peer
@@ -755,26 +760,41 @@ Both limits are stated in the documentation.
 > upstream sends, and the cache honours the header only on a 502 and only
 > for 401 or 403. The tier-1 entry is used whenever it qualifies, and tier 2 is
 > read only when it does not, so a newer remote refs entry does not replace a
-> qualifying local one. Purge markers and retention still apply. With a
+> qualifying local one: tier 1 answers a held request without a fill slot,
+> while tier 2 is read only through a fill that takes one. Purge markers and
+> retention still apply. With a
 > remote tier, no entry is served stale until the repository's purge marker
 > check is current (a successful check within the marker interval, or a read
 > made now); a failed read, a marker that fails verification, or a check
-> skipped under the backoff fails closed. A failure
-> answered stale leaves the key cacheable, so later requests during the outage
-> are answered stale too, and while stale-if-error is enabled a `fetch_error`
-> marks nothing, so a key marked for another reason is still answered stale
-> while the gate is open. The proxy passes the verified identity to `Serve`
-> as a parameter. The `cache_stale_served` event also carries `tier`,
+> skipped under the backoff fails closed. Concurrent checks of a repository
+> share one marker read, which runs under the cache's lifetime, so a caller
+> that leaves neither cuts it short nor fails it for the others. A failure
+> answered stale leaves the key cacheable, so later requests during the
+> outage are answered stale too, and while stale-if-error is enabled a
+> `fetch_error` marks nothing. A key marked for another reason is still
+> answered stale from tier 1 while the gate is open, because the held answer
+> is tried before the mark is honoured. The proxy passes the verified
+> identity to `Serve` as a parameter. The `cache_stale_served` event also carries `tier`,
 > `reason` (`connect`, `credential_unavailable`, `header_timeout`,
 > `upstream_status` or `health_gate`) and `entryAgeSeconds`. The gate exists
 > only while `staleIfErrorFor` is above zero. Any upstream answer other than
 > 500, 502, 503 or 504 counts as a success. Probes ride on client requests:
 > at most one at a time, admitted no sooner than 5 s after the previous probe
-> began or the gate opened, and a probe ends when its response headers or its
-> fetch error arrive. A connect failure of an attempt that began before the
-> latest success is ignored. A request the gate holds back that has no
-> qualifying entry goes upstream, and a held request answered stale records no
-> fill metric. Request-driven probing, the neutrality of 5xx and header
+> ended or the gate opened, and a probe ends when its response headers or its
+> fetch error arrive. Its purge marker check starts beside its upstream
+> request; at the deadline its subscribers are answered stale only when that
+> check is current and the tier-1 entry still qualifies, and otherwise keep
+> waiting for upstream. A probe is never abandoned, even when its client
+> leaves; once it ends, a probe fill that no subscriber holds behaves as any
+> such fill, so a storable late answer is stored and an idle one is
+> cancelled after the grace period. A connect failure of an attempt that
+> began before the latest success is ignored. A request the gate holds back
+> that has no qualifying entry goes upstream, and a held request answered
+> from tier 1 records no fill metric. With the cache enabled, the
+> passthrough path bounds a read's wait for response headers by
+> `responseHeaderTimeout` too, so a read declined after a fill's header
+> timeout fails with a 502 instead of waiting on the upstream without
+> bound. Request-driven probing, the neutrality of 5xx and header
 > timeouts for the gate, and the `identity` parameter on `Serve` are the
 > accepted design.
 
@@ -787,8 +807,8 @@ upstream. When `cache.exposeStatus` is `true` (default `false`), the
 response also carries an RFC 9211 `Cache-Status: haybale; ...` header with
 `hit`, `fwd=miss` (with `collapsed` for a subscriber that joined an
 in-flight fill), `fwd=bypass` (written by the proxy on the passthrough
-path for a read the cache declined), or `hit; fwd=stale; fwd-status=<n>`
-for stale service. Whether a fill was stored is only known after the
+path for a read the cache declined), or `hit; fwd=stale` for stale
+service, with `fwd-status=<n>` when an upstream status arrived. Whether a fill was stored is only known after the
 response has been written, so it appears in the request log
 (`cacheStored`), not in the header. The header is off by
 default because within a repository that several tenants may read, a
