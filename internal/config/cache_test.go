@@ -495,3 +495,12 @@ func TestLoadCacheRejections(t *testing.T) {
 		})
 	}
 }
+
+func TestCacheConfigRejectsZeroRetention(t *testing.T) {
+	cfg := CacheConfig{Enabled: true, Dir: t.TempDir(), Retention: "0s"}
+	cfg.applyDefaults()
+	err := cfg.validate()
+	if err == nil || !strings.Contains(err.Error(), "retention") {
+		t.Fatalf("validate() error = %v, want a retention error", err)
+	}
+}

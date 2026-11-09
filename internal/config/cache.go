@@ -145,7 +145,7 @@ type CacheConfig struct {
 	RefsMaxAge string `yaml:"refsMaxAge"`
 	// AccessRecheck is a Go duration string: how long after the last
 	// successful upstream refs response a pack hit is served without
-	// another upstream check. Defaults to "5m".
+	// another upstream check. "0s" disables the check. Defaults to "5m".
 	AccessRecheck string `yaml:"accessRecheck"`
 	// ResponseHeaderTimeout is a Go duration string bounding how long the
 	// cache's upstream fetches wait for response headers. "0s" (the
@@ -289,6 +289,12 @@ func (c *CacheConfig) validate() error {
 		*d.dst = parsed
 	}
 
+	if c.Retention != "" && c.parsedRetention == 0 {
+		// A zero retention would expire every entry at commit, making the
+		// cache a pure spool that never serves a hit; "0s" here is far
+		// more likely a mistake than an intent.
+		return fmt.Errorf("cache: retention %q must be greater than zero", c.Retention)
+	}
 	if c.MaxEntrySize > c.MaxDiskSize {
 		return fmt.Errorf("cache: maxEntrySize %s must not exceed maxDiskSize %s", c.MaxEntrySize, c.MaxDiskSize)
 	}
