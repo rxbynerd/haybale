@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -208,6 +209,12 @@ func entryFiles(t *testing.T, dir string) []string {
 	var files []string
 	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
+			// The janitor prunes empty entry directories concurrently
+			// with this walk; a directory that vanishes between listing
+			// and descent simply has no entries.
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
 			return err
 		}
 		if !d.IsDir() {
