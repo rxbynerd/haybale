@@ -651,7 +651,7 @@ type cacheFetcher struct {
 // User-Agent, and the injected Authorization. Nothing from the client's
 // own request is carried. A credential mint failure is returned as an
 // error; the cache then releases the request to the passthrough path,
-// which reports and logs it as it does today.
+// which answers 502 and logs upstream_auth_failed.
 func (f *cacheFetcher) Fetch(ctx context.Context, req cache.Request) (*http.Response, error) {
 	source, ok := f.proxy.credentialSources[f.repo.Host]
 	if !ok || source == nil {
