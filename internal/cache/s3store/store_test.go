@@ -261,8 +261,8 @@ func TestGetRejectsIgnoredRange(t *testing.T) {
 
 	_, _, err := s.Get(context.Background(), testKey, 4)
 	var e *Error
-	if !errors.As(err, &e) || e.Code != codeBadResponse {
-		t.Fatalf("Get against a server ignoring Range: err = %v, want an %s error", err, codeBadResponse)
+	if !errors.As(err, &e) || e.Code != CodeInvalidResponse {
+		t.Fatalf("Get against a server ignoring Range: err = %v, want an %s error", err, CodeInvalidResponse)
 	}
 }
 
@@ -531,8 +531,8 @@ func TestErrorWhenEndpointUnreachable(t *testing.T) {
 
 	_, err = s.Stat(context.Background(), testKey)
 	var e *Error
-	if !errors.As(err, &e) || e.Code != codeSendFailed || e.Status != 0 {
-		t.Fatalf("Stat against a closed port: err = %v, want %s with no status", err, codeSendFailed)
+	if !errors.As(err, &e) || e.Code != CodeSendFailed || e.Status != 0 {
+		t.Fatalf("Stat against a closed port: err = %v, want %s with no status", err, CodeSendFailed)
 	}
 	if strings.Contains(err.Error(), "dial") || strings.Contains(err.Error(), addr) {
 		t.Errorf("error %q carries transport detail", err)
@@ -593,8 +593,8 @@ func TestHeaderTimeoutBeforeHeaders(t *testing.T) {
 			err := op(s)
 			elapsed := time.Since(start)
 			var e *Error
-			if !errors.As(err, &e) || e.Code != codeHeaderTimeout {
-				t.Fatalf("err = %v, want a %s error", err, codeHeaderTimeout)
+			if !errors.As(err, &e) || e.Code != CodeHeaderTimeout {
+				t.Fatalf("err = %v, want a %s error", err, CodeHeaderTimeout)
 			}
 			if !errors.Is(err, context.DeadlineExceeded) {
 				t.Errorf("err = %v does not match context.DeadlineExceeded", err)
@@ -871,8 +871,8 @@ func TestErrorWhenTheCredentialChainIsEmpty(t *testing.T) {
 
 	_, _, err := s.Get(context.Background(), testKey, 0)
 	var e *Error
-	if !errors.As(err, &e) || e.Code != codeNoCredentials || e.Status != 0 {
-		t.Fatalf("Get with no credentials: err = %v, want %s with no status", err, codeNoCredentials)
+	if !errors.As(err, &e) || e.Code != CodeNoCredentials || e.Status != 0 {
+		t.Fatalf("Get with no credentials: err = %v, want %s with no status", err, CodeNoCredentials)
 	}
 	if got, want := err.Error(), "s3store: get "+testKey+": NoCredentials"; got != want {
 		t.Errorf("error = %q, want %q", got, want)
@@ -892,8 +892,8 @@ func TestErrorWhenTheServerCertificateIsUntrusted(t *testing.T) {
 
 	_, _, err := s.Get(context.Background(), testKey, 0)
 	var e *Error
-	if !errors.As(err, &e) || e.Code != codeTLSFailed || e.Status != 0 {
-		t.Fatalf("Get against an untrusted certificate: err = %v, want %s with no status", err, codeTLSFailed)
+	if !errors.As(err, &e) || e.Code != CodeTLSVerificationFailed || e.Status != 0 {
+		t.Fatalf("Get against an untrusted certificate: err = %v, want %s with no status", err, CodeTLSVerificationFailed)
 	}
 	if strings.Contains(err.Error(), "x509") || strings.Contains(err.Error(), "127.0.0.1") {
 		t.Errorf("error %q carries TLS detail", err)

@@ -204,7 +204,7 @@ type closeRecorder struct {
 func (c closeRecorder) Close() error { c.closed.Store(true); return nil }
 
 func TestProbeRemoteClassifiesFailures(t *testing.T) {
-	probeErr := func(code string, status int) error {
+	probeErr := func(code s3store.Code, status int) error {
 		return &s3store.Error{Op: "get", Key: "v1/.probe", Code: code, Status: status}
 	}
 	tests := []struct {
@@ -218,6 +218,9 @@ func TestProbeRemoteClassifiesFailures(t *testing.T) {
 		{"bad signature", probeErr("SignatureDoesNotMatch", 403), true},
 		{"missing bucket", probeErr("NoSuchBucket", 404), true},
 		{"wrong region", probeErr("PermanentRedirect", 301), true},
+		{"bare 301", probeErr("MovedPermanently", 301), true},
+		{"temporary redirect", probeErr("TemporaryRedirect", 307), false},
+		{"permanent redirect status 308", probeErr("PermanentRedirect308", 308), false},
 		{"malformed authorization", probeErr("AuthorizationHeaderMalformed", 400), true},
 		{"expired token", probeErr("ExpiredToken", 400), true},
 		{"invalid token", probeErr("InvalidToken", 400), true},

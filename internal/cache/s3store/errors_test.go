@@ -30,15 +30,15 @@ func TestCredentialChainFailuresAreTransientOrMissing(t *testing.T) {
 	tests := []struct {
 		name  string
 		cause error
-		want  string
+		want  Code
 	}{
-		{"STS answers 503", statusError{http.StatusServiceUnavailable}, codeCredsDown},
-		{"STS throttles", statusError{http.StatusTooManyRequests}, codeCredsDown},
-		{"the provider cannot be reached", &smithyhttp.RequestSendError{Err: errors.New("dial tcp: connection refused")}, codeCredsDown},
-		{"the provider times out", timeoutError{}, codeCredsDown},
-		{"instance metadata answers 404", statusError{http.StatusNotFound}, codeNoCredentials},
-		{"web identity is refused", statusError{http.StatusForbidden}, codeNoCredentials},
-		{"no provider in the chain", errors.New("failed to refresh cached credentials, no EC2 IMDS role found"), codeNoCredentials},
+		{"STS answers 503", statusError{http.StatusServiceUnavailable}, CodeCredentialsUnavailable},
+		{"STS throttles", statusError{http.StatusTooManyRequests}, CodeCredentialsUnavailable},
+		{"the provider cannot be reached", &smithyhttp.RequestSendError{Err: errors.New("dial tcp: connection refused")}, CodeCredentialsUnavailable},
+		{"the provider times out", timeoutError{}, CodeCredentialsUnavailable},
+		{"instance metadata answers 404", statusError{http.StatusNotFound}, CodeNoCredentials},
+		{"web identity is refused", statusError{http.StatusForbidden}, CodeNoCredentials},
+		{"no provider in the chain", errors.New("failed to refresh cached credentials, no EC2 IMDS role found"), CodeNoCredentials},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -66,7 +66,7 @@ func TestInstanceMetadataAnswering404IsNoCredentials(t *testing.T) {
 
 	_, _, err := s.Get(context.Background(), testKey, 0)
 	var e *Error
-	if !errors.As(err, &e) || e.Code != codeNoCredentials {
-		t.Fatalf("Get with instance metadata answering 404: err = %v, want %s", err, codeNoCredentials)
+	if !errors.As(err, &e) || e.Code != CodeNoCredentials {
+		t.Fatalf("Get with instance metadata answering 404: err = %v, want %s", err, CodeNoCredentials)
 	}
 }

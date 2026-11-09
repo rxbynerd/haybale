@@ -629,7 +629,7 @@ func probeRemote(ctx context.Context, store cache.BlobStore, logger *slog.Logger
 	}
 	var se *s3store.Error
 	switch {
-	case errors.As(err, &se) && se.Code == "NoCredentials":
+	case errors.As(err, &se) && se.Code == s3store.CodeNoCredentials:
 		return fmt.Errorf("cache.remote: no AWS credentials were found in the SDK's default chain; "+
 			"configure IRSA, EKS Pod Identity, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or a shared profile: %w", err)
 	case errors.As(err, &se) && remotePermanentError(se):
@@ -639,18 +639,19 @@ func probeRemote(ctx context.Context, store cache.BlobStore, logger *slog.Logger
 	return nil
 }
 
-// remotePermanentError reports whether a probe failure is a credential,
-// TLS, authorization or bucket configuration error that retrying will not
-// fix.
+// remotePermanentError reports whether a probe failure is a TLS,
+// authorization or bucket configuration error that retrying will not fix.
+// A temporary redirect, a timeout and throttling can pass.
 func remotePermanentError(e *s3store.Error) bool {
 	switch e.Code {
-	case "AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch", "NoSuchBucket",
-		"PermanentRedirect", "AuthorizationHeaderMalformed", "ExpiredToken", "InvalidToken",
-		"NoCredentials", "TLSVerificationFailed":
+	case s3store.CodeAccessDenied, s3store.CodeInvalidAccessKeyID, s3store.CodeSignatureDoesNotMatch,
+		s3store.CodeNoSuchBucket, s3store.CodePermanentRedirect, s3store.CodeAuthorizationHeaderMalformed,
+		s3store.CodeExpiredToken, s3store.CodeInvalidToken, s3store.CodeTLSVerificationFailed:
 		return true
 	}
 	switch e.Status {
-	case http.StatusRequestTimeout, http.StatusTooManyRequests:
+	case http.StatusTemporaryRedirect, http.StatusPermanentRedirect,
+		http.StatusRequestTimeout, http.StatusTooManyRequests:
 		return false
 	}
 	return e.Status >= 300 && e.Status < 500
