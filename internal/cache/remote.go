@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"runtime/debug"
+	"sync/atomic"
 	"time"
 
 	"github.com/rxbynerd/haybale/internal/gitproto"
@@ -32,6 +33,9 @@ const (
 	// remoteResumeBackoff is the pause before the first resume; each later
 	// resume waits twice as long as the one before.
 	remoteResumeBackoff = 100 * time.Millisecond
+	// maxEmptyReads is how many consecutive reads returning no bytes and no
+	// error a remote body may make before it counts as a failed read.
+	maxEmptyReads = 100
 	// remoteSizeSlack is how far a remote object may exceed the sealed size
 	// of maxEntrySize, covering the segments that flushes seal early.
 	remoteSizeSlack = 1 << 20
@@ -41,10 +45,14 @@ var (
 	// errRemoteChanged reports that a remote object was replaced while a
 	// fill was reading it, so its bytes cannot be resumed.
 	errRemoteChanged = errors.New("cache: remote object changed during the read")
-	// errRemoteRead reports a remote read that failed past its resumes. The
-	// error that wraps it never wraps the transport error too, so a short
-	// read is not mistaken for a truncated entry.
+	// errRemoteRead reports a remote read that failed before resumes were
+	// enabled or past its resumes. The error that wraps it never wraps the
+	// transport error too, so a short read is not mistaken for a
+	// truncated entry.
 	errRemoteRead = errors.New("cache: remote read failed")
+	// errRemoteHeaderTimeout reports a remote entry whose header did not
+	// arrive within the remote tier's header timeout.
+	errRemoteHeaderTimeout = errors.New("cache: remote entry header did not arrive within the header timeout")
 )
 
 // remoteEligible reports whether a fill may be served from the remote
@@ -66,8 +74,9 @@ func (f *fill) remoteEligible() bool {
 
 // fillFromRemote serves the fill from the remote tier's copy of the entry.
 // It returns false, having spooled nothing, when the remote tier has no
-// usable copy or fails before the first byte; the fill then goes
-// upstream. Once it returns true the fill is settled. The remote object is
+// usable copy or fails before the fill publishes its outcome: the Get, or
+// reading the sealed header within RemoteHeaderTimeout, with no resume.
+// The fill then goes upstream. Once it returns true the fill is settled. The remote object is
 // the sealed entry, so its bytes are spooled as they are and verified as
 // they pass; a verification failure is a store error and a
 // cache_integrity_failed event.
@@ -75,11 +84,12 @@ func (f *fill) fillFromRemote() bool {
 	c := f.c
 	path := f.key.Path()
 	src := &remoteReader{
-		ctx:     f.ctx,
-		store:   c.remote,
-		key:     path,
-		idle:    c.opts.IdleTimeout,
-		onError: func(err error) { f.remoteReadFailed(err) },
+		ctx:           f.ctx,
+		store:         c.remote,
+		key:           path,
+		idle:          c.opts.IdleTimeout,
+		prefixTimeout: c.opts.RemoteHeaderTimeout,
+		onError:       func(err error) { f.remoteReadFailed(err) },
 	}
 	defer src.Close()
 	info, err := src.start()
@@ -125,6 +135,7 @@ func (f *fill) fillFromRemote() bool {
 	}
 	tee.w = sp
 	f.setOutcome(fillOutcome{kind: fillStreaming, contentType: h.ContentType, tier: observability.TierRemote})
+	src.enableResumes()
 	f.streamRemote(sr, tee)
 	return true
 }
@@ -236,29 +247,34 @@ func (t *spoolTee) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// remoteReader reads one remote object of known size from the start. When
-// a body read fails, or stalls for idle, it resumes with a ranged Get from
-// the current offset, up to maxRemoteResumes times, provided the object is
-// unchanged: the same ETag, through ConditionalGetter when the store
-// implements it, and otherwise the same size and modification time. It
-// ends with io.EOF exactly at the object's size. It is not safe for
-// concurrent use.
+// remoteReader reads one remote object of known size from the start.
+// Until enableResumes is called, the first body must deliver its bytes
+// within prefixTimeout of the Get returning, and any failure is final.
+// After it, when a body read fails, or stalls for idle, the reader resumes
+// with a ranged Get from the current offset, up to maxRemoteResumes times,
+// provided the object is unchanged: the same ETag, through
+// ConditionalGetter when the store implements it, and otherwise the same
+// size and modification time. It ends with io.EOF exactly at the object's
+// size. It is not safe for concurrent use.
 type remoteReader struct {
-	ctx     context.Context
-	store   BlobStore
-	key     string
-	idle    time.Duration
-	onError func(error)
+	ctx           context.Context
+	store         BlobStore
+	key           string
+	idle          time.Duration
+	prefixTimeout time.Duration
+	onError       func(error)
 
-	size    int64
-	modTime time.Time
-	etag    string
-	off     int64
-	rc      io.ReadCloser
-	cancel  context.CancelFunc
-	timer   *time.Timer
-	resumes int
-	lastErr error
+	size      int64
+	modTime   time.Time
+	etag      string
+	off       int64
+	rc        io.ReadCloser
+	cancel    context.CancelFunc
+	timer     *time.Timer
+	expired   atomic.Bool
+	resumable bool
+	resumes   int
+	lastErr   error
 }
 
 // start issues the first Get and returns the object's description.
@@ -270,8 +286,27 @@ func (r *remoteReader) start() (ObjectInfo, error) {
 		return ObjectInfo{}, err
 	}
 	r.size, r.modTime, r.etag = info.Size, info.ModTime, info.ETag
-	r.attach(rc, cancel)
+	r.rc, r.cancel = rc, cancel
+	if r.prefixTimeout > 0 {
+		r.timer = time.AfterFunc(r.prefixTimeout, func() {
+			r.expired.Store(true)
+			cancel()
+		})
+	}
 	return info, nil
+}
+
+// enableResumes ends the first-body phase: from here a failed or idle
+// body is resumed.
+func (r *remoteReader) enableResumes() {
+	r.resumable = true
+	if r.timer != nil {
+		r.timer.Stop()
+		r.timer = nil
+	}
+	if r.rc != nil && r.idle > 0 {
+		r.timer = time.AfterFunc(r.idle, r.cancel)
+	}
 }
 
 func (r *remoteReader) Read(p []byte) (int, error) {
@@ -284,27 +319,38 @@ func (r *remoteReader) Read(p []byte) (int, error) {
 	if rest := r.size - r.off; int64(len(p)) > rest {
 		p = p[:rest]
 	}
+	empty := 0
 	for {
 		if r.rc != nil {
 			n, err := r.rc.Read(p)
 			if n > 0 {
 				r.off += int64(n)
-				if r.timer != nil {
+				if r.timer != nil && r.resumable {
 					r.timer.Reset(r.idle)
 				}
 				return n, nil
 			}
 			if err == nil {
-				continue
+				if empty++; empty < maxEmptyReads {
+					continue
+				}
+				err = io.ErrNoProgress
 			}
+			empty = 0
 			r.detach()
 			if cerr := r.ctx.Err(); cerr != nil {
 				return 0, cerr
 			}
-			if errors.Is(err, io.EOF) {
+			switch {
+			case r.expired.Load() && !r.resumable:
+				err = errRemoteHeaderTimeout
+			case errors.Is(err, io.EOF):
 				err = io.ErrUnexpectedEOF
 			}
 			r.failed(err)
+			if !r.resumable {
+				return 0, fmt.Errorf("%w: %v", errRemoteRead, err)
+			}
 		}
 		if r.resumes >= maxRemoteResumes {
 			return 0, fmt.Errorf("%w after %d resumes: %v", errRemoteRead, r.resumes, r.lastErr)
@@ -366,8 +412,9 @@ func (r *remoteReader) failed(err error) {
 	}
 }
 
-// attach makes rc the current body. A body that delivers no bytes for idle
-// is cancelled, which fails its next read and triggers a resume.
+// attach makes rc the current body of a resume. A body that delivers no
+// bytes for idle is cancelled, which fails its next read and triggers
+// another resume.
 func (r *remoteReader) attach(rc io.ReadCloser, cancel context.CancelFunc) {
 	r.rc, r.cancel = rc, cancel
 	if r.idle > 0 {

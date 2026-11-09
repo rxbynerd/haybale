@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rxbynerd/haybale/internal/observability"
 	"github.com/rxbynerd/haybale/internal/security"
@@ -21,8 +22,8 @@ func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
 // cache, with its logs captured, whose ls-refs has made the peer's pack
 // eligible, together with the pack, its remote key and a counter of
 // discarded fills by reason. prepare runs after seeding and before the
-// second cache's first request.
-func newRemoteFillCase(t *testing.T, store *memBlobStore, prepare func(key string, data []byte)) (*Cache, *logCapture, []byte, string, func(reason string) int64) {
+// second cache's first request; mutate adjusts the second cache's options.
+func newRemoteFillCase(t *testing.T, store *memBlobStore, mutate func(*Options), prepare func(key string, data []byte)) (*Cache, *logCapture, []byte, string, func(reason string) int64) {
 	t.Helper()
 	pack := remotePack(t)
 	seedPeer(t, store, pack)
@@ -32,7 +33,12 @@ func newRemoteFillCase(t *testing.T, store *memBlobStore, prepare func(key strin
 		prepare(key, bytes.Clone(data))
 	}
 	logger, logs := newLogCapture()
-	c, _, reader := newRemoteTestCache(t, store, func(o *Options) { o.Logger = logger })
+	c, _, reader := newRemoteTestCache(t, store, func(o *Options) {
+		o.Logger = logger
+		if mutate != nil {
+			mutate(o)
+		}
+	})
 	lsRefs(t, c, refsFetcher(t))
 	discarded := func(reason string) int64 {
 		return fillsWithReason(t, reader, observability.FillResultDiscarded, reason)
@@ -52,7 +58,7 @@ func assertNoPackStored(t *testing.T, c *Cache) {
 
 func TestRemoteShortReadsPastTheResumesAreAFetchError(t *testing.T) {
 	store := newMemBlobStore()
-	c, logs, pack, key, discarded := newRemoteFillCase(t, store, func(key string, _ []byte) {
+	c, logs, pack, key, discarded := newRemoteFillCase(t, store, nil, func(key string, _ []byte) {
 		store.set(func(m *memBlobStore) {
 			m.wrapBody = func(_ context.Context, k string, offset int64, body io.Reader) io.Reader {
 				switch {
@@ -91,12 +97,15 @@ func TestRemoteShortReadsPastTheResumesAreAFetchError(t *testing.T) {
 
 func TestRemoteObjectTruncatedAtRestIsAnIntegrityFailure(t *testing.T) {
 	store := newMemBlobStore()
-	c, logs, pack, key, discarded := newRemoteFillCase(t, store, func(key string, data []byte) {
+	c, logs, pack, key, discarded := newRemoteFillCase(t, store, nil, func(key string, data []byte) {
 		store.store(key, data[:len(data)-frameLen-trailerCTLen])
 	})
-	_, _, aborted := serve(c, newCollectWriter(), fetchRequest(t), packFetcher(pack))
-	if !aborted {
-		t.Fatal("a remote entry missing its trailer did not abort the response")
+	// The trailer is checked last, so whether the subscriber had already
+	// written bytes, and is aborted, or had not, and is released to the
+	// passthrough path, depends on scheduling.
+	_, handled, aborted := serve(c, newCollectWriter(), fetchRequest(t), packFetcher(pack))
+	if handled && !aborted {
+		t.Fatal("a remote entry missing its trailer was served as complete")
 	}
 	assertStoreIdle(t, c)
 	if got := discarded(observability.FillReasonStoreError); got != 1 {
@@ -113,7 +122,7 @@ func TestRemoteObjectTruncatedAtRestIsAnIntegrityFailure(t *testing.T) {
 
 func TestRemoteResumeGetFailuresUseTheResumes(t *testing.T) {
 	store := newMemBlobStore()
-	c, logs, pack, key, discarded := newRemoteFillCase(t, store, func(key string, _ []byte) {
+	c, logs, pack, key, discarded := newRemoteFillCase(t, store, nil, func(key string, _ []byte) {
 		store.set(func(m *memBlobStore) {
 			m.wrapBody = func(_ context.Context, k string, offset int64, body io.Reader) io.Reader {
 				if k == key && offset == 0 {
@@ -166,7 +175,7 @@ func TestRemoteResumeOfAReplacedObjectIsAFetchError(t *testing.T) {
 	store := newMemBlobStore()
 	store.set(func(m *memBlobStore) { m.etags = true })
 	var alt []byte
-	c, logs, pack, key, discarded := newRemoteFillCase(t, store, func(key string, data []byte) {
+	c, logs, pack, key, discarded := newRemoteFillCase(t, store, nil, func(key string, data []byte) {
 		alt = bytes.Clone(data)
 		alt[100000] ^= 0xff
 		replaceDuringRead(store, key, alt)
@@ -189,7 +198,7 @@ func TestRemoteResumeOfAReplacedObjectIsAFetchError(t *testing.T) {
 
 func TestRemoteResumeWithoutAnETagSplicesASameSecondReplacement(t *testing.T) {
 	store := newMemBlobStore()
-	c, logs, pack, key, discarded := newRemoteFillCase(t, store, func(key string, data []byte) {
+	c, logs, pack, key, discarded := newRemoteFillCase(t, store, nil, func(key string, data []byte) {
 		alt := bytes.Clone(data)
 		alt[100000] ^= 0xff
 		replaceDuringRead(store, key, alt)
@@ -207,5 +216,58 @@ func TestRemoteResumeWithoutAnETagSplicesASameSecondReplacement(t *testing.T) {
 	}
 	if _, ok := store.object(key); ok {
 		t.Error("the object that failed verification was not deleted")
+	}
+}
+
+func TestRemoteHeaderFailureFallsThroughWithoutResuming(t *testing.T) {
+	never := make(chan struct{})
+	cases := map[string]func(ctx context.Context, body io.Reader) io.Reader{
+		"stalls": func(ctx context.Context, body io.Reader) io.Reader {
+			return &gateReader{ctx: ctx, r: body, n: 100, release: never}
+		},
+		"fails": func(_ context.Context, body io.Reader) io.Reader { return cutReader(body, 100) },
+	}
+	for name, wrap := range cases {
+		t.Run(name, func(t *testing.T) {
+			store := newMemBlobStore()
+			const headerTimeout = 100 * time.Millisecond
+			c, logs, pack, key, _ := newRemoteFillCase(t, store, func(o *Options) {
+				o.RemoteHeaderTimeout = headerTimeout
+				o.IdleTimeout = time.Minute
+			}, func(key string, _ []byte) {
+				store.set(func(m *memBlobStore) {
+					m.wrapBody = func(ctx context.Context, k string, offset int64, body io.Reader) io.Reader {
+						if k != key {
+							return body
+						}
+						return wrap(ctx, body)
+					}
+				})
+			})
+			upstream := packFetcher(pack)
+			rec := newCollectWriter()
+			start := time.Now()
+			out, _, aborted := serve(c, rec, fetchRequest(t), upstream)
+			elapsed := time.Since(start)
+			if aborted || !out.Stored || upstream.calls.Load() != 1 {
+				t.Fatalf("fetch = %+v aborted %v upstream %d, want a stored miss from upstream", out, aborted, upstream.calls.Load())
+			}
+			if _, body, _ := rec.result(); !bytes.Equal(body, pack) {
+				t.Errorf("received %d bytes, want the %d pack bytes", len(body), len(pack))
+			}
+			if elapsed > 10*headerTimeout {
+				t.Errorf("fall-through took %s, want about the header timeout %s", elapsed, headerTimeout)
+			}
+			if got := store.getOffsets(key); fmt.Sprint(got) != "[0]" {
+				t.Errorf("remote Get offsets = %v, want the one Get and no resume", got)
+			}
+			if n := store.count("delete", key); n != 0 {
+				t.Errorf("remote deletes = %d, want none", n)
+			}
+			if got := logs.securityEvents(t, security.EventCacheIntegrityFailed); len(got) != 0 {
+				t.Errorf("integrity events = %v, want none", got)
+			}
+			assertStoreIdle(t, c)
+		})
 	}
 }

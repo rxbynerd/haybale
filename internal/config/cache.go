@@ -683,6 +683,7 @@ func (c CacheConfig) BuildCache(ctx context.Context, logger *slog.Logger, metric
 		IdleTimeout:           c.parsedIdleTimeout,
 		ExposeStatus:          c.ExposeStatus,
 		Remote:                remote,
+		RemoteHeaderTimeout:   c.Remote.parsedHeaderTimeout,
 		Logger:                logger,
 		Metrics:               metrics,
 	})

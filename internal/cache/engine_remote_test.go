@@ -632,6 +632,7 @@ func TestRemoteObjectReplacedDuringAResumeIsNotSpliced(t *testing.T) {
 	if _, err := r.start(); err != nil {
 		t.Fatal(err)
 	}
+	r.enableResumes()
 	if _, err := io.ReadFull(r, make([]byte, 1000)); err != nil {
 		t.Fatal(err)
 	}
@@ -659,6 +660,7 @@ func TestRemoteResumeRequiresTheSameETag(t *testing.T) {
 	if _, err := r.start(); err != nil {
 		t.Fatal(err)
 	}
+	r.enableResumes()
 	if _, err := io.ReadFull(r, make([]byte, 1000)); err != nil {
 		t.Fatal(err)
 	}
@@ -687,6 +689,7 @@ func TestRemoteReaderResumesAStalledBody(t *testing.T) {
 	if _, err := r.start(); err != nil {
 		t.Fatal(err)
 	}
+	r.enableResumes()
 	got, err := io.ReadAll(r)
 	if err != nil || !bytes.Equal(got, data) {
 		t.Fatalf("ReadAll = %d bytes, %v; want the %d bytes after an idle resume", len(got), err, len(data))
@@ -737,14 +740,35 @@ func TestRemoteBodyFailingVerificationAbortsTheFill(t *testing.T) {
 	corrupt, _ := store.object(key)
 	corrupt = bytes.Clone(corrupt)
 	// The first segment verifies and reaches the client; the second does not.
-	corrupt[headerFixedPrefix+segmentOverhead+segmentSize+500] ^= 0xff
+	firstSegmentEnd := int64(headerFixedPrefix + segmentOverhead + segmentSize)
+	corrupt[firstSegmentEnd+500] ^= 0xff
 	store.store(key, corrupt)
+	release := make(chan struct{})
+	store.set(func(m *memBlobStore) {
+		m.wrapBody = func(ctx context.Context, k string, offset int64, body io.Reader) io.Reader {
+			if k != key || offset != 0 {
+				return body
+			}
+			return &gateReader{ctx: ctx, r: body, n: firstSegmentEnd, release: release}
+		}
+	})
 
 	logger, logs := newLogCapture()
 	c, _, reader := newRemoteTestCache(t, store, func(o *Options) { o.Logger = logger })
 	lsRefs(t, c, refsFetcher(t))
-	_, _, aborted := serve(c, newCollectWriter(), fetchRequest(t), packFetcher(pack))
-	if !aborted {
+	w := newCollectWriter()
+	done := make(chan bool, 1)
+	go func() {
+		_, _, aborted := serve(c, w, fetchRequest(t), packFetcher(pack))
+		done <- aborted
+	}()
+	select {
+	case <-w.first:
+	case <-time.After(shortly):
+		t.Fatal("the first segment did not reach the client")
+	}
+	close(release)
+	if aborted := <-done; !aborted {
 		t.Fatal("a remote entry failing verification mid-stream did not abort the response")
 	}
 	assertStoreIdle(t, c)
@@ -753,6 +777,36 @@ func TestRemoteBodyFailingVerificationAbortsTheFill(t *testing.T) {
 	}
 	if got := logs.securityEvents(t, security.EventCacheIntegrityFailed); len(got) == 0 {
 		t.Error("no cache_integrity_failed event was logged")
+	}
+	if _, ok := store.object(key); ok {
+		t.Error("the corrupt remote object was not deleted")
+	}
+}
+
+func TestRemoteFirstSegmentFailingVerificationReleasesTheRequest(t *testing.T) {
+	store := newMemBlobStore()
+	pack := remotePack(t)
+	seedPeer(t, store, pack)
+	key := store.keys(packPrefix)[0]
+	corrupt, _ := store.object(key)
+	corrupt = bytes.Clone(corrupt)
+	corrupt[headerFixedPrefix+segmentOverhead+500] ^= 0xff
+	store.store(key, corrupt)
+
+	logger, logs := newLogCapture()
+	c, _, _ := newRemoteTestCache(t, store, func(o *Options) { o.Logger = logger })
+	lsRefs(t, c, refsFetcher(t))
+	w := newCollectWriter()
+	out, handled, aborted := serve(c, w, fetchRequest(t), packFetcher(pack))
+	if handled || aborted || out.Result != observability.ResultBypass {
+		t.Fatalf("fetch = %+v handled %v aborted %v, want a bypass", out, handled, aborted)
+	}
+	if _, body, _ := w.result(); len(body) != 0 {
+		t.Errorf("%d bytes reached the client", len(body))
+	}
+	assertStoreIdle(t, c)
+	if got := logs.securityEvents(t, security.EventCacheIntegrityFailed); len(got) != 1 {
+		t.Errorf("integrity events = %v, want one", got)
 	}
 	if _, ok := store.object(key); ok {
 		t.Error("the corrupt remote object was not deleted")

@@ -71,6 +71,10 @@ type Options struct {
 	// holds the same key. The implementation bounds the time to first
 	// byte of its Stat and Get calls; nil disables the tier.
 	Remote BlobStore
+	// RemoteHeaderTimeout bounds remote-tier work on the request path that
+	// the store does not: reading a remote entry's sealed header before the
+	// fill falls through to upstream. Zero means unbounded.
+	RemoteHeaderTimeout time.Duration
 	// Logger receives operational logs; nil discards them.
 	Logger *slog.Logger
 	// Metrics receives the response-cache instruments; nil records nothing.
@@ -233,7 +237,7 @@ func validateOptions(opts Options) error {
 		return fmt.Errorf("cache: max request body must be positive, got %d", opts.MaxRequestBody)
 	case opts.Retention <= 0:
 		return fmt.Errorf("cache: retention must be positive, got %v", opts.Retention)
-	case opts.RefsMaxAge < 0 || opts.AccessRecheck < 0 || opts.ResponseHeaderTimeout < 0 || opts.IdleTimeout < 0:
+	case opts.RefsMaxAge < 0 || opts.AccessRecheck < 0 || opts.ResponseHeaderTimeout < 0 || opts.IdleTimeout < 0 || opts.RemoteHeaderTimeout < 0:
 		return errors.New("cache: durations must not be negative")
 	}
 	return nil
