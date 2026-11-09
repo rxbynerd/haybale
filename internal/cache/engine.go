@@ -73,7 +73,9 @@ type Options struct {
 	Remote BlobStore
 	// RemoteHeaderTimeout bounds remote-tier work on the request path that
 	// the store does not: reading a remote entry's sealed header before the
-	// fill falls through to upstream. Zero means unbounded.
+	// fill falls through to upstream. Zero bounds that read by IdleTimeout
+	// instead, and the deletions after a push, a failed verification or a
+	// superseded upload by one minute.
 	RemoteHeaderTimeout time.Duration
 	// Logger receives operational logs; nil discards them.
 	Logger *slog.Logger

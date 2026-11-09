@@ -564,3 +564,59 @@ func TestPaddedRemoteObjectsReserveAtMostTheSizeBound(t *testing.T) {
 		})
 	}
 }
+
+func TestRemoteHeaderStallIsBoundedByTheIdleTimeoutWithoutAHeaderTimeout(t *testing.T) {
+	store := newMemBlobStore()
+	never := make(chan struct{})
+	const idle = 200 * time.Millisecond
+	c, _, pack, key, _ := newRemoteFillCase(t, store, func(o *Options) {
+		o.RemoteHeaderTimeout = 0
+		o.IdleTimeout = idle
+	}, func(key string, _ []byte) {
+		store.set(func(m *memBlobStore) {
+			m.wrapBody = func(ctx context.Context, k string, _ int64, body io.Reader) io.Reader {
+				if k != key {
+					return body
+				}
+				return &gateReader{ctx: ctx, r: body, n: 100, release: never}
+			}
+		})
+	})
+	upstream := packFetcher(pack)
+	start := time.Now()
+	out, _, aborted := serve(c, newCollectWriter(), fetchRequest(t), upstream)
+	elapsed := time.Since(start)
+	if aborted || !out.Stored || upstream.calls.Load() != 1 {
+		t.Fatalf("fetch = %+v aborted %v upstream %d, want a stored miss from upstream", out, aborted, upstream.calls.Load())
+	}
+	if elapsed > 10*idle {
+		t.Errorf("fall-through took %s, want about the idle timeout %s", elapsed, idle)
+	}
+	if got := store.getOffsets(key); fmt.Sprint(got) != "[0]" {
+		t.Errorf("remote Get offsets = %v, want one Get and no resume", got)
+	}
+	assertStoreIdle(t, c)
+}
+
+func TestTheHeaderBoundEndsWithTheHeaderRead(t *testing.T) {
+	store := newMemBlobStore()
+	data := bytes.Repeat([]byte("x"), 3*segmentSize)
+	store.store("k", data)
+	r := &remoteReader{ctx: context.Background(), store: store, key: "k", prefixTimeout: 50 * time.Millisecond}
+	defer r.Close()
+	if _, err := r.start(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(r, make([]byte, headerFixedPrefix)); err != nil {
+		t.Fatal(err)
+	}
+	r.endPrefix()
+	time.Sleep(100 * time.Millisecond)
+	r.enableResumes()
+	if _, err := io.ReadAll(r); err != nil {
+		t.Fatalf("ReadAll after the header bound passed: %v", err)
+	}
+	if got := store.getOffsets("k"); fmt.Sprint(got) != "[0]" {
+		t.Errorf("Get offsets = %v, want the first body read to its end", got)
+	}
+}

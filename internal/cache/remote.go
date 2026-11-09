@@ -56,6 +56,10 @@ var (
 	// errRemoteHeaderTimeout reports a remote entry whose header did not
 	// arrive within the remote tier's header timeout.
 	errRemoteHeaderTimeout = errors.New("cache: remote entry header did not arrive within the header timeout")
+	// errRemoteHeaderIdle reports a remote entry whose header did not
+	// arrive within the idle timeout, the bound when the header timeout is
+	// zero.
+	errRemoteHeaderIdle = errors.New("cache: remote entry header did not arrive within the idle timeout")
 )
 
 // uploadsGroup reports whether committed entries of group are uploaded
@@ -118,6 +122,7 @@ func (f *fill) fillFromRemote() bool {
 	if _, err := io.ReadFull(src, prefix); err != nil {
 		return false
 	}
+	src.endPrefix()
 	tee := &spoolTee{src: src}
 	sr, err := newSealedReader(io.MultiReader(bytes.NewReader(prefix), tee), c.keyring)
 	if err == nil {
@@ -298,6 +303,7 @@ type remoteReader struct {
 	cancel    context.CancelFunc
 	timer     *time.Timer
 	expired   atomic.Bool
+	prefixErr error
 	resumable bool
 	resumes   int
 	lastErr   error
@@ -313,8 +319,13 @@ func (r *remoteReader) start() (ObjectInfo, error) {
 	}
 	r.size, r.modTime, r.etag = info.Size, info.ModTime, info.ETag
 	r.rc, r.cancel = rc, cancel
-	if r.prefixTimeout > 0 {
-		r.timer = time.AfterFunc(r.prefixTimeout, func() {
+	bound, cause := r.prefixTimeout, errRemoteHeaderTimeout
+	if bound <= 0 {
+		bound, cause = r.idle, errRemoteHeaderIdle
+	}
+	if bound > 0 {
+		r.prefixErr = cause
+		r.timer = time.AfterFunc(bound, func() {
 			r.expired.Store(true)
 			cancel()
 		})
@@ -322,14 +333,19 @@ func (r *remoteReader) start() (ObjectInfo, error) {
 	return info, nil
 }
 
-// enableResumes ends the first-body phase: from here a failed or idle
-// body is resumed.
-func (r *remoteReader) enableResumes() {
-	r.resumable = true
+// endPrefix stops the first-body bound once the header has been read.
+func (r *remoteReader) endPrefix() {
 	if r.timer != nil {
 		r.timer.Stop()
 		r.timer = nil
 	}
+}
+
+// enableResumes ends the first-body phase: from here a failed or idle
+// body is resumed.
+func (r *remoteReader) enableResumes() {
+	r.resumable = true
+	r.endPrefix()
 	if r.rc != nil && r.idle > 0 {
 		r.timer = time.AfterFunc(r.idle, r.cancel)
 	}
@@ -369,7 +385,7 @@ func (r *remoteReader) Read(p []byte) (int, error) {
 			}
 			switch {
 			case r.expired.Load() && !r.resumable:
-				err = errRemoteHeaderTimeout
+				err = r.prefixErr
 			case errors.Is(err, io.EOF):
 				err = io.ErrUnexpectedEOF
 			}

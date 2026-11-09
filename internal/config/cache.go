@@ -255,7 +255,9 @@ type RemoteCacheConfig struct {
 	// or deletion, the response headers of a read, and then the read of a
 	// remote entry's sealed header before a fill falls through to
 	// upstream. It also bounds the deletion of remote refs entries after
-	// a push. "0s" applies no per-request bound. Defaults to "10s".
+	// a push. "0s" removes the per-request bound: the sealed-header read is
+	// then bounded by idleTimeout, and the deletions after a push, a failed
+	// verification or a superseded upload by one minute. Defaults to "10s".
 	HeaderTimeout string `yaml:"headerTimeout"`
 	// SSE is the server-side encryption requested on upload: empty,
 	// "AES256" or "aws:kms".
