@@ -24,6 +24,9 @@ import (
 
 var testBaseURL = &url.URL{Scheme: "https", Host: "upstream.test"}
 
+// testIdentity is the verified identity every test request carries.
+const testIdentity = "test-identity"
+
 // fetchFunc adapts a function to the Fetcher interface.
 type fetchFunc func(ctx context.Context, req Request) (*http.Response, error)
 
@@ -180,7 +183,7 @@ func serve(c *Cache, w http.ResponseWriter, r *http.Request, fetch Fetcher) (out
 			aborted = true
 		}
 	}()
-	out, handled = c.Serve(w, r, testRepo, testBaseURL, fetch)
+	out, handled = c.Serve(w, r, testRepo, testBaseURL, fetch, testIdentity)
 	return out, handled, false
 }
 
@@ -933,18 +936,20 @@ func TestCloseReportsADeadline(t *testing.T) {
 
 func TestCacheStatusValue(t *testing.T) {
 	cases := []struct {
-		result    string
-		collapsed bool
-		want      string
+		status cacheStatus
+		want   string
 	}{
-		{observability.ResultHit, false, "haybale; hit"},
-		{observability.ResultMiss, false, "haybale; fwd=miss"},
-		{observability.ResultMiss, true, "haybale; fwd=miss; collapsed"},
-		{observability.ResultBypass, false, "haybale; fwd=bypass"},
+		{cacheStatus{result: observability.ResultHit}, "haybale; hit"},
+		{cacheStatus{result: observability.ResultMiss}, "haybale; fwd=miss"},
+		{cacheStatus{result: observability.ResultMiss, collapsed: true}, "haybale; fwd=miss; collapsed"},
+		{cacheStatus{result: observability.ResultStale, fwdStatus: 503}, "haybale; hit; fwd=stale; fwd-status=503"},
+		{cacheStatus{result: observability.ResultStale, collapsed: true, fwdStatus: 502}, "haybale; hit; fwd=stale; fwd-status=502"},
+		{cacheStatus{result: observability.ResultStale}, "haybale; hit; fwd=stale"},
+		{cacheStatus{result: observability.ResultBypass}, "haybale; fwd=bypass"},
 	}
 	for _, tc := range cases {
-		if got := cacheStatusValue(tc.result, tc.collapsed); got != tc.want {
-			t.Errorf("cacheStatusValue(%q, %v) = %q, want %q", tc.result, tc.collapsed, got, tc.want)
+		if got := tc.status.value(); got != tc.want {
+			t.Errorf("%+v.value() = %q, want %q", tc.status, got, tc.want)
 		}
 	}
 }

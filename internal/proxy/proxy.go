@@ -68,10 +68,10 @@ var errNoCredentialSource = errors.New("proxy: no credential source configured f
 
 // ResponseCache is the consumer-side interface of the response cache;
 // *cache.Cache satisfies it. Serve is offered every policy-allowed read
-// and reports whether it wrote the response; Invalidate is called after
-// every git-receive-pack POST.
+// with the verified identity's ID and reports whether it wrote the
+// response; Invalidate is called after every git-receive-pack POST.
 type ResponseCache interface {
-	Serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo, baseURL *url.URL, fetch cache.Fetcher) (cache.Outcome, bool)
+	Serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo, baseURL *url.URL, fetch cache.Fetcher, identity string) (cache.Outcome, bool)
 	Invalidate(ctx context.Context, repo gitproto.Repo, baseURL *url.URL)
 }
 
@@ -378,7 +378,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// continues down the passthrough path with its body restored.
 	var cacheAttrs []any
 	if verb == gitproto.Read && p.cache != nil {
-		outcome, handled := p.cache.Serve(rec, r, repo, base, &cacheFetcher{proxy: p, base: base, repo: repo})
+		outcome, handled := p.cache.Serve(rec, r, repo, base, &cacheFetcher{proxy: p, base: base, repo: repo}, id.ID)
 		cacheAttrs = cacheLogAttrs(outcome)
 		span.SetAttributes(cacheSpanAttrs(outcome)...)
 		if handled {
@@ -670,8 +670,10 @@ type cacheFetcher struct {
 // Accept-Encoding: identity so the stored body is never encoded, a fixed
 // User-Agent, and the injected Authorization. Nothing from the client's
 // own request is carried. A credential mint failure is returned as an
-// error; the cache then releases the request to the passthrough path,
-// which answers 502 and logs upstream_auth_failed.
+// error; the cache then answers the request stale or releases it to the
+// passthrough path, which answers 502 and logs upstream_auth_failed. An
+// upstream 401 or 403 is returned as the sanitised 502 carrying
+// cache.UpstreamStatusHeader with the status upstream sent.
 func (f *cacheFetcher) Fetch(ctx context.Context, req cache.Request) (*http.Response, error) {
 	source, ok := f.proxy.credentialSources[f.repo.Host]
 	if !ok || source == nil {
@@ -717,6 +719,7 @@ func (f *cacheFetcher) Fetch(ctx context.Context, req cache.Request) (*http.Resp
 	}
 	if upstreamStatus, sanitized := sanitizeUpstreamResponse(resp); sanitized {
 		f.proxy.logUpstreamRejected(f.repo, gitproto.Read, upstreamStatus)
+		resp.Header.Set(cache.UpstreamStatusHeader, strconv.Itoa(upstreamStatus))
 	}
 	return resp, nil
 }

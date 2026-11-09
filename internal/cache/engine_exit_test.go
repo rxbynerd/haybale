@@ -367,7 +367,7 @@ func TestClassificationSlotIsReleasedOnEveryExit(t *testing.T) {
 					t.Fatal("panic did not propagate")
 				}
 			}()
-			_, _ = c.Serve(httptest.NewRecorder(), otherFetchRequest(t), testRepo, testBaseURL, fetch)
+			_, _ = c.Serve(httptest.NewRecorder(), otherFetchRequest(t), testRepo, testBaseURL, fetch, testIdentity)
 		},
 	}
 	for name, run := range cases {

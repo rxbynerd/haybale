@@ -139,7 +139,7 @@ func newS3Cache(t *testing.T, fake *s3fake.Server) *cache.Cache {
 func serveCache(t *testing.T, c *cache.Cache, r *http.Request, fetch cache.Fetcher) (cache.Outcome, *httptest.ResponseRecorder) {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	out, handled := c.Serve(rec, r, cacheTestRepo, cacheTestBaseURL, fetch)
+	out, handled := c.Serve(rec, r, cacheTestRepo, cacheTestBaseURL, fetch, "s3store-test")
 	if !handled {
 		t.Fatalf("Serve did not handle the request: %+v", out)
 	}

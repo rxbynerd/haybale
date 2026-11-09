@@ -74,6 +74,10 @@ const (
 	// fillReleased: the fill cannot serve its subscribers, which take the
 	// passthrough path instead.
 	fillReleased
+	// fillStale: upstream could not answer and every subscriber serves the
+	// stale tier-1 entry itself, or the fallback outcome when it cannot
+	// open that entry.
+	fillStale
 )
 
 // fillOutcome is the header outcome of a fill, fixed once headerReady is
@@ -87,6 +91,11 @@ type fillOutcome struct {
 	status int
 	header http.Header
 	body   []byte
+	// stale is set for a fillStale outcome and for a streaming outcome
+	// that spools a stale remote entry.
+	stale *staleService
+	// fallback is the shared or released outcome of a fillStale outcome.
+	fallback *fillOutcome
 }
 
 // fill is one response spooled on disk for its subscribers, read from the
@@ -109,6 +118,9 @@ type fill struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	abandoned atomic.Bool
+	// headerTimedOut records that the response-header timeout cancelled
+	// the upstream request.
+	headerTimedOut atomic.Bool
 
 	spool       *spool
 	headerReady chan struct{}
@@ -189,26 +201,32 @@ func (f *fill) run() {
 }
 
 func (f *fill) perform() {
-	if f.remoteEligible() && f.fillFromRemote() {
+	if f.remoteEligible() && f.fillFromRemote(nil) {
 		return
 	}
 	// A refs fill from upstream renews the repository's access record, so
 	// the purge marker is checked first, alongside the upstream request.
 	purge := f.startPurgeCheck()
 	defer purge.wait()
-	resp, err := f.fetchHeaders()
+	resp, done, err := f.fetchHeaders()
 	if err != nil {
 		// The error is not logged: a credential source's error may carry
 		// upstream response bytes.
 		f.logger().Debug("upstream fetch failed")
-		f.release(observability.FillReasonFetchError, transientCooldown)
+		res := classifyFetchError(err, f.headerTimedOut.Load())
+		if f.ctx.Err() != nil {
+			res = upstreamResult{}
+		}
+		f.releaseOrServeStale(res, observability.FillReasonFetchError)
 		return
 	}
+	defer done()
+	res := classifyStatus(upstreamStatus(resp))
 	body := newIdleReader(resp.Body, f.c.opts.IdleTimeout, f.cancel)
 	defer func() { _ = body.Close() }()
 
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != responseContentType(f.req.Class) {
-		f.share(resp, body)
+		f.share(resp, body, res)
 		return
 	}
 	if !identityEncoded(resp.Header) {
@@ -228,35 +246,44 @@ func (f *fill) perform() {
 	f.streamBody(resp.ContentLength, body)
 }
 
-// fetchHeaders performs the upstream round trip, cancelling the fill if
-// response headers do not arrive within the response-header timeout. The
-// timer is stopped once headers arrive so the body is not bounded by it.
-func (f *fill) fetchHeaders() (*http.Response, error) {
+// fetchHeaders performs the upstream round trip under a context of its
+// own, cancelled if response headers do not arrive within the
+// response-header timeout. The timer is stopped once headers arrive so
+// the body is not bounded by it. The caller calls done once it has
+// finished with the body.
+func (f *fill) fetchHeaders() (resp *http.Response, done context.CancelFunc, err error) {
+	ctx, cancel := context.WithCancel(f.ctx)
 	if t := f.c.opts.ResponseHeaderTimeout; t > 0 {
-		timer := time.AfterFunc(t, f.cancel)
+		timer := time.AfterFunc(t, func() {
+			f.headerTimedOut.Store(true)
+			cancel()
+		})
 		defer timer.Stop()
 	}
-	resp, err := f.fetch.Fetch(f.ctx, f.req)
+	resp, err = f.fetch.Fetch(ctx, f.req)
+	if err == nil && (resp == nil || resp.Body == nil) {
+		err = errors.New("cache: fetcher returned no response body")
+	}
 	if err != nil {
-		return nil, err
+		cancel()
+		return nil, nil, err
 	}
-	if resp == nil || resp.Body == nil {
-		return nil, errors.New("cache: fetcher returned no response body")
-	}
-	return resp, nil
+	return resp, cancel, nil
 }
 
 // share relays a non-streamable upstream response to every subscriber:
 // the body is buffered up to sharedBodyLimit and, with the response
-// headers and status, becomes the one response they all write.
-func (f *fill) share(resp *http.Response, body io.Reader) {
+// headers and status, becomes the one response they all write. A status
+// eligible for stale service is answered from a stale entry instead when
+// one qualifies.
+func (f *fill) share(resp *http.Response, body io.Reader, res upstreamResult) {
 	buf, err := io.ReadAll(io.LimitReader(body, sharedBodyLimit+1))
 	switch {
 	case err != nil:
-		f.release(observability.FillReasonFetchError, transientCooldown)
+		f.releaseOrServeStale(res, observability.FillReasonFetchError)
 		return
 	case len(buf) > sharedBodyLimit:
-		f.release(observability.FillReasonUpstreamStatus, transientCooldown)
+		f.releaseOrServeStale(res, observability.FillReasonUpstreamStatus)
 		return
 	}
 	h := make(http.Header, len(resp.Header))
@@ -266,8 +293,21 @@ func (f *fill) share(resp *http.Response, body io.Reader) {
 		}
 	}
 	h.Set("Content-Length", strconv.Itoa(len(buf)))
+	shared := fillOutcome{kind: fillShared, status: resp.StatusCode, header: h, body: buf}
+	if f.serveStale(res, shared, observability.FillReasonUpstreamStatus) {
+		return
+	}
 	f.finish(observability.FillResultDiscarded, observability.FillReasonUpstreamStatus, transientCooldown)
-	f.setOutcome(fillOutcome{kind: fillShared, status: resp.StatusCode, header: h, body: buf})
+	f.setOutcome(shared)
+}
+
+// releaseOrServeStale answers the fill's subscribers from a stale entry
+// when res is eligible and one qualifies, and otherwise releases them to
+// the passthrough path.
+func (f *fill) releaseOrServeStale(res upstreamResult, reason string) {
+	if !f.serveStale(res, fillOutcome{kind: fillReleased}, reason) {
+		f.release(reason, transientCooldown)
+	}
 }
 
 // openSpool reserves disk for the response and writes the sealed header.

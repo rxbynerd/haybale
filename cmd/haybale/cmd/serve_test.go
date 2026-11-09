@@ -350,7 +350,7 @@ func TestCloseResponseCacheWarnsWhenFillsOutlastTheBound(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, "/github.com/acme/widgets.git/info/refs?service=git-upload-pack", nil)
 		repo := gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}
 		baseURL, _ := url.Parse("https://github.com")
-		c.Serve(httptest.NewRecorder(), r, repo, baseURL, fetcher)
+		c.Serve(httptest.NewRecorder(), r, repo, baseURL, fetcher, "serve-test")
 	}()
 	select {
 	case <-fetcher.entered:

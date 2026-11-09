@@ -93,8 +93,10 @@ func (f *fill) remoteEligible() bool {
 // spooled as it is and verified as it passes. It returns false, having
 // spooled nothing, when there is no usable copy or the Get or header read
 // fails before the outcome is published; the fill then goes upstream.
-// Once it returns true the fill is settled.
-func (f *fill) fillFromRemote() bool {
+// Once it returns true the fill is settled. With st set the copy is stale
+// service: the stale rules decide whether it is usable instead of the hit
+// freshness rules, and subscribers serve it as stale.
+func (f *fill) fillFromRemote(st *staleService) bool {
 	c := f.c
 	path := f.key.Path()
 	src := &remoteReader{
@@ -133,7 +135,11 @@ func (f *fill) fillFromRemote() bool {
 		return false
 	}
 	h := sr.Header()
-	if !f.remoteFresh(h) {
+	usable := f.remoteFresh
+	if st != nil {
+		usable = f.staleAcceptable
+	}
+	if !usable(h) {
 		return false
 	}
 
@@ -149,7 +155,12 @@ func (f *fill) fillFromRemote() bool {
 		return true
 	}
 	tee.w = sp
-	f.setOutcome(fillOutcome{kind: fillStreaming, contentType: h.ContentType, tier: observability.TierRemote})
+	out := fillOutcome{kind: fillStreaming, contentType: h.ContentType, tier: observability.TierRemote}
+	if st != nil {
+		st.createdAt = h.CreatedAt
+		out.stale = st
+	}
+	f.setOutcome(out)
 	src.enableResumes()
 	f.streamRemote(sr, tee)
 	return true
