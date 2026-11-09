@@ -333,20 +333,24 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo
 	class := string(req.Class)
 	key := entryKey{Group: req.Class.Group(), RepoHash: c.keyring.RepoHash(baseURL, repo), KeyHash: c.keyring.pathHash(req.Digest)}
 	// A request the health gate holds is answered from its stale entry
-	// wherever it would otherwise start or join a fill, and also when its
-	// key is marked uncacheable.
+	// wherever it would otherwise start or join a fill. A request that
+	// cannot become the probe, because its key is marked uncacheable or no
+	// fill slot is free, is answered from it whenever the gate is open.
 	if c.marks.marked(key, c.now()) {
-		if out, ok := c.serveHeld(w, r, key, repo, class, identity, release); ok {
+		if out, ok := c.serveHeld(w, r, key, repo, class, identity, release, true); ok {
 			return out, true
 		}
 		return c.declined(w, host, class, "uncacheable"), false
 	}
 	if key.Group == GroupRefs && c.opts.RefsMaxAge <= 0 {
-		if out, ok := c.serveHeld(w, r, key, repo, class, identity, release); ok {
+		if out, ok := c.serveHeld(w, r, key, repo, class, identity, release, false); ok {
 			return out, true
 		}
 		f, ok := c.startSingle(key, req, repo, baseURL, fetch)
 		if !ok {
+			if out, ok := c.serveHeld(w, r, key, repo, class, identity, release, true); ok {
+				return out, true
+			}
 			return c.declined(w, host, class, "no_slot"), false
 		}
 		release()
@@ -359,7 +363,7 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo
 			return out, true
 		}
 	}
-	if out, ok := c.serveHeld(w, r, key, repo, class, identity, release); ok {
+	if out, ok := c.serveHeld(w, r, key, repo, class, identity, release, false); ok {
 		return out, true
 	}
 	// A stored entry that fails verification before any byte is written
@@ -367,6 +371,11 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo
 	// second failure of a freshly committed entry is declined.
 	for range 2 {
 		f, e, collapsed, declined := c.joinOrStart(key, req, repo, baseURL, fetch, class)
+		if declined == "no_slot" {
+			if out, ok := c.serveHeld(w, r, key, repo, class, identity, release, true); ok {
+				return out, true
+			}
+		}
 		if declined != "" {
 			return c.declined(w, host, class, declined), false
 		}
@@ -754,12 +763,15 @@ func (c *Cache) writeShared(w http.ResponseWriter, out *fillOutcome, host, class
 // key's qualifying tier-1 stale entry, before any fill slot, spool or
 // upstream request is taken. With a remote tier the repository's purge
 // state must be known current first; the classification slot is released
-// before that check, since the body is already buffered. ok is false,
-// with nothing written, when stale service is disabled, the gate does not
-// hold the host, the purge state is not current, or no tier-1 entry
-// qualifies; the request then proceeds as it would otherwise.
-func (c *Cache) serveHeld(w http.ResponseWriter, r *http.Request, key entryKey, repo gitproto.Repo, class, identity string, release func()) (Outcome, bool) {
-	if !c.staleEnabled() || !c.gates.held(repo.Host, c.now()) {
+// before that check, since the body is already buffered. noProbe reports
+// that the request cannot become the gate's probe, so an open gate holds
+// it even when a probe is due. ok is false, with nothing written, when
+// stale service is disabled, the gate does not hold the host, the purge
+// state is not current, or no tier-1 entry qualifies; the request then
+// proceeds as it would otherwise.
+func (c *Cache) serveHeld(w http.ResponseWriter, r *http.Request, key entryKey, repo gitproto.Repo, class, identity string, release func(), noProbe bool) (Outcome, bool) {
+	gated := c.gates.held(repo.Host, c.now()) || noProbe && c.gates.isOpen(repo.Host)
+	if !c.staleEnabled() || !gated {
 		return Outcome{}, false
 	}
 	release()

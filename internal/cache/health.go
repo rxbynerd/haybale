@@ -54,12 +54,22 @@ type healthGate struct {
 }
 
 // held reports whether a request for host at now would be held by its
-// gate: the gate is open and no probe is due. It admits no probe.
+// gate: the gate is open and either a probe is in flight or none is due.
+// It admits no probe.
 func (g *healthGates) held(host string, now time.Time) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	h := g.hosts[host]
 	return h != nil && h.open && (h.probing || now.Sub(h.lastProbe) < g.interval)
+}
+
+// isOpen reports whether host's gate is open, whether or not a probe is
+// due.
+func (g *healthGates) isOpen(host string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	h := g.hosts[host]
+	return h != nil && h.open
 }
 
 // admit decides how a fill for host proceeds at now. held is true while

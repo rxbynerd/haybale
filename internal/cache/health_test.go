@@ -49,6 +49,9 @@ func TestHealthGateStateMachine(t *testing.T) {
 	expect(t, "probe due", at(healthProbeInterval), false, true)
 	expect(t, "probe in flight", at(healthProbeInterval+time.Second), true, false)
 	expect(t, "probe in flight later", at(3*healthProbeInterval), true, false)
+	if !g.held("up", at(3*healthProbeInterval)) || !g.isOpen("up") {
+		t.Fatal("a probe in flight past the interval does not hold requests")
+	}
 	g.report("up", refused, at(3*healthProbeInterval), at(3*healthProbeInterval))
 	g.endProbe("up", at(3*healthProbeInterval))
 	expect(t, "within the interval of the failed probe's end", at(4*healthProbeInterval-time.Second), true, false)
@@ -59,6 +62,9 @@ func TestHealthGateStateMachine(t *testing.T) {
 
 	g.report("up", classifyStatus(http.StatusOK), at(5*healthProbeInterval), at(5*healthProbeInterval))
 	expect(t, "closed by a success", at(5*healthProbeInterval), false, false)
+	if g.held("up", at(5*healthProbeInterval)) || g.isOpen("up") {
+		t.Fatal("a closed gate still holds requests")
+	}
 	g.report("up", classifyStatus(http.StatusNotFound), at(5*healthProbeInterval), at(5*healthProbeInterval))
 	expect(t, "a success on a closed gate", at(5*healthProbeInterval), false, false)
 
@@ -451,6 +457,74 @@ func TestHealthGateHoldsRequestsBeforeFillSlots(t *testing.T) {
 	probe := &failing{status: 503}
 	if out, _, _ := serve(h.c, newCollectWriter(), otherFetchRequest(t), probe); out.Result != observability.ResultStale || probe.count() != 1 {
 		t.Errorf("probe-due request = %+v fetches %d, want it sent upstream as the probe and answered stale", out, probe.count())
+	}
+	assertStoreIdle(t, h.c)
+}
+
+// TestHealthGateHoldsRequestsThatCannotProbe: once a probe is due, a
+// request with a qualifying tier-1 entry that finds no free fill slot, or
+// whose key is marked, cannot become the probe, so it is answered stale
+// instead of being declined, on the pack path and the refs path.
+func TestHealthGateHoldsRequestsThatCannotProbe(t *testing.T) {
+	h := newStaleHarness(t, func(o *Options) { o.MaxConcurrentFills = 2 })
+	h.clock.Advance(10 * time.Minute)
+	openGate(t, h)
+
+	hang := newHangingFetch()
+	stuckReqs := []*http.Request{fetchRequestFor(t, 1), fetchRequestFor(t, 2)}
+	stuck := make(chan struct{}, len(stuckReqs))
+	for _, r := range stuckReqs {
+		go func() {
+			serve(h.c, newCollectWriter(), r, hang)
+			stuck <- struct{}{}
+		}()
+	}
+	waitFor(t, "both fill slots to be held", func() bool { return hang.calls.Load() == 2 })
+	h.clock.Advance(healthProbeInterval)
+	if h.c.gates.held(testRepo.Host, h.c.now()) {
+		t.Fatal("no probe is due")
+	}
+
+	untouched := &failing{err: errDialRefused}
+	expectStale := func(step string, r *http.Request, want []byte) {
+		t.Helper()
+		rec := newCollectWriter()
+		out, handled, _ := serve(h.c, rec, r, untouched)
+		if _, body, _ := rec.result(); !handled || out.Result != observability.ResultStale || !bytes.Equal(body, want) {
+			t.Errorf("%s = %+v handled %v, want the stale entry", step, out, handled)
+		}
+	}
+	expectStale("pack request without a free slot", fetchRequest(t), h.pack)
+
+	key := entryKeyFor(t, h.c, fetchRequest(t))
+	now := h.c.now()
+	h.c.marks.mark(key, now, now.Add(time.Minute))
+	expectStale("marked pack key", fetchRequest(t), h.pack)
+	clearMarks(h.c)
+
+	h.c.mu.Lock()
+	h.c.refsFills = maxRefsFills
+	h.c.mu.Unlock()
+	expectStale("ls-refs without a free slot", postV2(lsRefsBody(t)), h.refs)
+	h.c.mu.Lock()
+	h.c.refsFills = 0
+	h.c.mu.Unlock()
+
+	if untouched.count() != 0 {
+		t.Errorf("requests that could not probe fetched %d times, want none", untouched.count())
+	}
+	for _, rec := range h.logs.records(t, "bypass") {
+		if rec["reason"] == "no_slot" || rec["reason"] == "uncacheable" {
+			t.Errorf("a request with an entry was declined: %v", rec)
+		}
+	}
+	close(hang.release)
+	for range stuckReqs {
+		select {
+		case <-stuck:
+		case <-time.After(shortly):
+			t.Fatal("a stuck fill never finished")
+		}
 	}
 	assertStoreIdle(t, h.c)
 }
