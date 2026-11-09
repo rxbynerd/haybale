@@ -4,15 +4,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/rxbynerd/haybale/internal/cache"
+	"github.com/rxbynerd/haybale/internal/cache/s3store"
 	"github.com/rxbynerd/haybale/internal/cache/s3store/s3fake"
 	"github.com/rxbynerd/haybale/internal/observability"
 )
@@ -173,5 +177,132 @@ func TestBuildRemoteRefusesAmbientAWSSettingsItCannotHonour(t *testing.T) {
 				t.Errorf("the fake received %d requests", n)
 			}
 		})
+	}
+}
+
+// probeStub is a BlobStore whose Get returns err, or an empty body when
+// err is nil.
+type probeStub struct {
+	cache.BlobStore
+	err    error
+	closed atomic.Bool
+}
+
+func (p *probeStub) Get(context.Context, string, int64) (io.ReadCloser, cache.ObjectInfo, error) {
+	if p.err != nil {
+		return nil, cache.ObjectInfo{}, p.err
+	}
+	return closeRecorder{Reader: strings.NewReader(""), closed: &p.closed}, cache.ObjectInfo{}, nil
+}
+
+type closeRecorder struct {
+	io.Reader
+	closed *atomic.Bool
+}
+
+func (c closeRecorder) Close() error { c.closed.Store(true); return nil }
+
+func TestProbeRemoteClassifiesFailures(t *testing.T) {
+	probeErr := func(code string, status int) error {
+		return &s3store.Error{Op: "get", Key: "v1/.probe", Code: code, Status: status}
+	}
+	tests := []struct {
+		name     string
+		err      error
+		wantFail bool
+	}{
+		{"no object", cache.ErrNotFound, false},
+		{"access denied", probeErr("AccessDenied", 403), true},
+		{"unknown access key", probeErr("InvalidAccessKeyId", 403), true},
+		{"bad signature", probeErr("SignatureDoesNotMatch", 403), true},
+		{"missing bucket", probeErr("NoSuchBucket", 404), true},
+		{"wrong region", probeErr("PermanentRedirect", 301), true},
+		{"malformed authorization", probeErr("AuthorizationHeaderMalformed", 400), true},
+		{"expired token", probeErr("ExpiredToken", 400), true},
+		{"invalid token", probeErr("InvalidToken", 400), true},
+		{"invalid bucket name", probeErr("InvalidBucketName", 400), true},
+		{"bare 401", probeErr("Unauthorized", 401), true},
+		{"bare 403", probeErr("Forbidden", 403), true},
+		{"no credentials", probeErr("NoCredentials", 0), true},
+		{"untrusted certificate", probeErr("TLSVerificationFailed", 0), true},
+		{"dial failure", probeErr("RequestSendFailed", 0), false},
+		{"header timeout", probeErr("HeaderTimeout", 0), false},
+		{"deadline", probeErr("DeadlineExceeded", 0), false},
+		{"cancelled", probeErr("Canceled", 0), false},
+		{"server error", probeErr("InternalError", 500), false},
+		{"unavailable", probeErr("ServiceUnavailable", 503), false},
+		{"slow down", probeErr("SlowDown", 503), false},
+		{"request timeout", probeErr("RequestTimeout", 408), false},
+		{"too many requests", probeErr("TooManyRequests", 429), false},
+		{"not an s3store error", errors.New("memblob: reset"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			err := probeRemote(context.Background(), &probeStub{err: tt.err}, slog.New(slog.NewTextHandler(&buf, nil)))
+			if gotFail := err != nil; gotFail != tt.wantFail {
+				t.Fatalf("probeRemote = %v, want failure %v", err, tt.wantFail)
+			}
+			var se *s3store.Error
+			switch {
+			case err != nil && errors.As(tt.err, &se) && se.Code == "NoCredentials":
+				if !strings.Contains(err.Error(), "no AWS credentials") || !strings.Contains(err.Error(), "IRSA") {
+					t.Errorf("err = %q, want the problem and the remedy", err)
+				}
+			case err != nil:
+				want := "cache.remote: the bucket cannot be used with these credentials and settings: " + tt.err.Error()
+				if err.Error() != want {
+					t.Errorf("err = %q, want %q", err, want)
+				}
+			case !errors.Is(tt.err, cache.ErrNotFound) && !strings.Contains(buf.String(), "startup probe"):
+				t.Errorf("log = %q, want a warning", buf.String())
+			}
+		})
+	}
+}
+
+func TestProbeRemoteFailsWhenTheProbeKeyExists(t *testing.T) {
+	stub := &probeStub{}
+	err := probeRemote(context.Background(), stub, slog.New(slog.DiscardHandler))
+	if !errors.Is(err, errProbeKeyFound) {
+		t.Fatalf("probeRemote = %v, want errProbeKeyFound", err)
+	}
+	if !stub.closed.Load() {
+		t.Error("the probe body was not closed")
+	}
+}
+
+func TestBuildCacheFailsWithoutCredentials(t *testing.T) {
+	s3fake.IsolateAWSEnv(t)
+	for _, name := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"} {
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake := s3fake.New(t)
+	c := remoteCacheConfig(t, fake, s3fake.Bucket)
+	got, err := c.BuildCache(context.Background(), slog.New(slog.DiscardHandler), observability.NewNoopMetrics())
+	if err == nil {
+		closeCache(t, got)
+		t.Fatal("BuildCache succeeded with no credentials")
+	}
+	if !strings.Contains(err.Error(), "no AWS credentials") || !strings.HasSuffix(err.Error(), ": NoCredentials") {
+		t.Errorf("err = %q, want the NoCredentials failure", err)
+	}
+}
+
+func TestBuildCacheFailsAgainstAnUntrustedCertificate(t *testing.T) {
+	s3fake.IsolateAWSEnv(t)
+	srv := httptest.NewTLSServer(http.NotFoundHandler())
+	t.Cleanup(srv.Close)
+	c := remoteCacheConfig(t, s3fake.New(t), s3fake.Bucket)
+	c.Remote.Endpoint = srv.URL
+	got, err := c.BuildCache(context.Background(), slog.New(slog.DiscardHandler), observability.NewNoopMetrics())
+	if err == nil {
+		closeCache(t, got)
+		t.Fatal("BuildCache succeeded against an untrusted certificate")
+	}
+	if want := "cache.remote: the bucket cannot be used with these credentials and settings: s3store: get v1/.probe: TLSVerificationFailed"; err.Error() != want {
+		t.Errorf("err = %q, want %q", err, want)
 	}
 }

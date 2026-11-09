@@ -389,6 +389,27 @@ func TestCacheConfigValidate(t *testing.T) {
 			mutate:  withRemote(func(r *RemoteCacheConfig) { r.Endpoint = "https://s3.example.com/?x=1" }),
 			wantErr: "must not carry userinfo, a query or a fragment",
 		},
+		{name: "remote with an empty prefix", mutate: withRemote(func(r *RemoteCacheConfig) { r.Prefix = "" })},
+		{name: "remote prefix with a leading slash", mutate: withRemote(func(r *RemoteCacheConfig) { r.Prefix = "/prod/" })},
+		{name: "remote with a loopback ipv6 http endpoint", mutate: withRemote(func(r *RemoteCacheConfig) { r.Endpoint = "http://[::1]:9000" })},
+		{
+			name:    "remote http endpoint on a name that starts with localhost",
+			mutate:  withRemote(func(r *RemoteCacheConfig) { r.Endpoint = "http://localhost.evil.test:9000" }),
+			wantErr: "must use https",
+		},
+		{
+			name:    "remote http endpoint on a name that embeds a loopback address",
+			mutate:  withRemote(func(r *RemoteCacheConfig) { r.Endpoint = "http://127.0.0.1.nip.io:9000" }),
+			wantErr: "must use https",
+		},
+		{
+			name:    "remote region that cannot form the default endpoint",
+			mutate:  withRemote(func(r *RemoteCacheConfig) { r.Region = "evil.example/x" }),
+			wantErr: `cache.remote: region "evil.example/x" is not a valid AWS region name`,
+		},
+		{name: "remote custom region with an endpoint", mutate: withRemote(func(r *RemoteCacheConfig) {
+			r.Region, r.Endpoint = "auto", "https://account.r2.cloudflarestorage.com"
+		})},
 		{
 			name:    "remote with an unknown SSE mode",
 			mutate:  withRemote(func(r *RemoteCacheConfig) { r.SSE = "aws:kms:dsse" }),
@@ -846,5 +867,26 @@ func TestLoadRemoteDefaultsHeaderTimeout(t *testing.T) {
 	}
 	if got := cfg.Cache.Remote.ParsedHeaderTimeout(); got != 10*time.Second {
 		t.Errorf("ParsedHeaderTimeout() = %v, want the 10s default", got)
+	}
+}
+
+func TestRemoteEndpointErrorsNeverEchoAPassword(t *testing.T) {
+	t.Parallel()
+	for _, endpoint := range []string{
+		"http://user:secret@s3.example.com",
+		"https://user:secret@s3.example.com",
+		"http://user:secret@",
+		"https://user:secret@127.0.0.1:9000/?x=1",
+	} {
+		c := validCacheConfig()
+		withRemote(func(r *RemoteCacheConfig) { r.Endpoint = endpoint })(&c)
+		err := c.validate()
+		if err == nil {
+			t.Errorf("validate(%q) = nil, want an error", endpoint)
+			continue
+		}
+		if strings.Contains(err.Error(), "secret") {
+			t.Errorf("validate(%q) error %q echoes the password", endpoint, err)
+		}
 	}
 }

@@ -73,37 +73,46 @@ func (c Config) validate() (string, error) {
 		return "", fmt.Errorf("s3store: a KMS key id requires sse %q", sseKMS)
 	}
 	if c.Endpoint == "" {
-		if !awsRegionPattern.MatchString(c.Region) {
-			return "", fmt.Errorf("s3store: region %q is not a valid AWS region name", c.Region)
+		if err := ValidateDefaultRegion(c.Region); err != nil {
+			return "", fmt.Errorf("s3store: %w", err)
 		}
 		return "https://s3." + c.Region + ".amazonaws.com", nil
 	}
-	if err := validateEndpoint(c.Endpoint); err != nil {
-		return "", err
+	if err := ValidateEndpoint(c.Endpoint); err != nil {
+		return "", fmt.Errorf("s3store: %w", err)
 	}
 	return c.Endpoint, nil
 }
 
-// validateEndpoint requires an absolute https URL, or http for a loopback
-// host, with no credentials, query or fragment.
-func validateEndpoint(raw string) error {
+// ValidateDefaultRegion reports whether region can be spliced into the
+// default AWS endpoint host, which is used when no endpoint is set.
+func ValidateDefaultRegion(region string) error {
+	if !awsRegionPattern.MatchString(region) {
+		return fmt.Errorf("region %q is not a valid AWS region name", region)
+	}
+	return nil
+}
+
+// ValidateEndpoint requires an absolute https URL, or http for a loopback
+// host, with no credentials, query or fragment. Its errors show the URL
+// with any password redacted.
+func ValidateEndpoint(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return errors.New("s3store: endpoint is not a valid URL")
+		return errors.New("endpoint is not a valid URL")
 	}
-	if u.Host == "" {
-		return fmt.Errorf("s3store: endpoint %q must be an absolute URL with a host", raw)
-	}
-	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return fmt.Errorf("s3store: endpoint %q must not carry userinfo, a query or a fragment", u.Redacted())
-	}
+	shown := u.Redacted()
 	switch {
+	case u.User != nil || u.RawQuery != "" || u.Fragment != "":
+		return fmt.Errorf("endpoint %q must not carry userinfo, a query or a fragment", shown)
+	case u.Host == "":
+		return fmt.Errorf("endpoint %q must be an absolute URL with a host", shown)
 	case u.Scheme == "https":
 		return nil
 	case u.Scheme == "http" && isLoopbackHost(u.Hostname()):
 		return nil
 	default:
-		return fmt.Errorf("s3store: endpoint %q must use https (http is permitted only for a loopback host)", raw)
+		return fmt.Errorf("endpoint %q must use https (http is permitted only for a loopback host)", shown)
 	}
 }
 

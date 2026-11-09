@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
-	"net/url"
+	"net/http"
 	"os"
 	"reflect"
 	"regexp"
@@ -247,9 +247,12 @@ type RemoteCacheConfig struct {
 	Endpoint string `yaml:"endpoint"`
 	// ForcePathStyle selects path-style bucket addressing.
 	ForcePathStyle bool `yaml:"forcePathStyle"`
-	// HeaderTimeout is a Go duration string bounding the time to first
-	// byte of a remote read on the request path, and of each remote
-	// listing and deletion. "0s" applies no bound. Defaults to "10s".
+	// HeaderTimeout is a Go duration string bounding each remote request
+	// except an upload: the response of an existence check, listing page
+	// or deletion, the response headers of a read, and then the read of a
+	// remote entry's sealed header before a fill falls through to
+	// upstream. It also bounds the deletion of remote refs entries after
+	// a push. "0s" applies no per-request bound. Defaults to "10s".
 	HeaderTimeout string `yaml:"headerTimeout"`
 	// SSE is the server-side encryption requested on upload: empty,
 	// "AES256" or "aws:kms".
@@ -294,10 +297,12 @@ func (r *RemoteCacheConfig) validate() error {
 	if r.Region == "" {
 		return errors.New("cache.remote: region is required; it is never taken from AWS_REGION")
 	}
-	if r.Endpoint != "" {
-		if err := validateRemoteEndpoint(r.Endpoint); err != nil {
-			return fmt.Errorf("cache.remote: endpoint %w", err)
+	if r.Endpoint == "" {
+		if err := s3store.ValidateDefaultRegion(r.Region); err != nil {
+			return fmt.Errorf("cache.remote: %w", err)
 		}
+	} else if err := s3store.ValidateEndpoint(r.Endpoint); err != nil {
+		return fmt.Errorf("cache.remote: %w", err)
 	}
 	switch r.SSE {
 	case "", remoteSSEAES256, remoteSSEKMS:
@@ -316,19 +321,6 @@ func (r *RemoteCacheConfig) validate() error {
 			return fmt.Errorf("cache.remote: headerTimeout %q must not be negative", r.HeaderTimeout)
 		}
 		r.parsedHeaderTimeout = d
-	}
-	return nil
-}
-
-// validateRemoteEndpoint requires an absolute https URL, or http for a
-// loopback host, with no userinfo, query or fragment.
-func validateRemoteEndpoint(raw string) error {
-	if err := validateJWKSURL(raw); err != nil {
-		return err
-	}
-	u, _ := url.Parse(raw)
-	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return fmt.Errorf("%q must not carry userinfo, a query or a fragment", u.Redacted())
 	}
 	return nil
 }
@@ -597,13 +589,21 @@ func (c CacheConfig) BuildRemote(ctx context.Context) (cache.BlobStore, error) {
 	return store, nil
 }
 
+// errProbeKeyFound reports a probe GET that succeeded. haybale never
+// writes remoteProbeKey, so the endpoint is not behaving as S3.
+var errProbeKeyFound = errors.New("cache.remote: the startup probe read " + remoteProbeKey +
+	", which haybale never writes, so the endpoint is not behaving as S3-compatible storage")
+
 // probeRemote reads remoteProbeKey to check that the remote tier is
-// usable. Not found is healthy. An authorization or bucket error fails
-// startup, since it will not resolve itself; any other failure, such as
-// a network error or a 5xx, is logged and startup continues, so a bucket
-// outage cannot stop haybale from starting. The probe uses a GET rather
-// than a HEAD because a HEAD response has no body to tell a missing
-// bucket from a missing object.
+// usable. Not found is healthy. A failure that will not resolve itself
+// fails startup: missing credentials, a certificate that does not verify,
+// a redirect, or any 4xx other than 408 and 429, such as AccessDenied,
+// NoSuchBucket or ExpiredToken. A probe GET that succeeds fails startup
+// too. Any other failure, such as a network error, a timeout, a 5xx or
+// throttling, is logged and startup continues, so a bucket outage cannot
+// stop haybale from starting. The probe uses a GET rather than a HEAD
+// because a HEAD response has no body to tell a missing bucket from a
+// missing object.
 func probeRemote(ctx context.Context, store cache.BlobStore, logger *slog.Logger) error {
 	ctx, cancel := context.WithTimeout(ctx, remoteProbeTimeout)
 	defer cancel()
@@ -611,26 +611,38 @@ func probeRemote(ctx context.Context, store cache.BlobStore, logger *slog.Logger
 	switch {
 	case err == nil:
 		_ = rc.Close()
-		return nil
+		return errProbeKeyFound
 	case errors.Is(err, cache.ErrNotFound):
 		return nil
 	}
 	var se *s3store.Error
-	if errors.As(err, &se) && remoteConfigurationError(se) {
+	switch {
+	case errors.As(err, &se) && se.Code == "NoCredentials":
+		return fmt.Errorf("cache.remote: no AWS credentials were found in the SDK's default chain; "+
+			"configure IRSA, EKS Pod Identity, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or a shared profile: %w", err)
+	case errors.As(err, &se) && remotePermanentError(se):
 		return fmt.Errorf("cache.remote: the bucket cannot be used with these credentials and settings: %w", err)
 	}
 	logger.Warn("cache.remote: the startup probe of the bucket failed; continuing, and remote operations retry on use", "error", err)
 	return nil
 }
 
-// remoteConfigurationError reports whether a remote failure is an
-// authorization or bucket configuration error.
-func remoteConfigurationError(e *s3store.Error) bool {
+// remotePermanentError reports whether a probe failure is a credential,
+// TLS, authorization or bucket configuration error that retrying will not
+// fix.
+func remotePermanentError(e *s3store.Error) bool {
 	switch e.Code {
-	case "AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch", "NoSuchBucket":
+	case "AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch", "NoSuchBucket",
+		"PermanentRedirect", "AuthorizationHeaderMalformed", "ExpiredToken", "InvalidToken",
+		"NoCredentials", "TLSVerificationFailed":
 		return true
 	}
-	return e.Status == 401 || e.Status == 403
+	switch {
+	case e.Status == http.StatusRequestTimeout || e.Status == http.StatusTooManyRequests:
+		return false
+	default:
+		return e.Status >= 300 && e.Status < 500
+	}
 }
 
 // BuildCache constructs the live response cache from a validated block:

@@ -387,6 +387,9 @@ func TestListWithoutStorePrefix(t *testing.T) {
 	if len(keys) != 1 || keys[0] != testKey {
 		t.Fatalf("List = %v, want [%s]", keys, testKey)
 	}
+	if _, ok := fake.Objects()[testKey]; !ok {
+		t.Errorf("objects = %v, want %s at the bucket root", fake.Objects(), testKey)
+	}
 }
 
 func TestListStopsWhenConsumerStops(t *testing.T) {
