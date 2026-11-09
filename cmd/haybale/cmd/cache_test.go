@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/rxbynerd/haybale/internal/cache"
+	"github.com/rxbynerd/haybale/internal/cache/s3store/s3fake"
 	"github.com/rxbynerd/haybale/internal/gitproto"
 )
 
@@ -242,11 +244,11 @@ func TestRunCachePurgeErrors(t *testing.T) {
 		makeDir  bool
 	}{
 		{
-			name:     "remote tier",
+			name:     "remote tier not configured",
 			keyValue: validKey,
 			repo:     "github.com/acme/widgets",
 			remote:   true,
-			wantErr:  "not supported in this release",
+			wantErr:  "--remote: cache.remote is not configured",
 		},
 		{
 			name:     "bad group",
@@ -396,5 +398,68 @@ func TestCachePurgeCommandWiredIntoRootCmd(t *testing.T) {
 		if cachePurgeTestExists(dir, rel) {
 			t.Errorf("%s still exists after purge", rel)
 		}
+	}
+}
+
+// cachePurgeRemoteBlock is an enabled cache block on dir whose remote tier
+// is fake's bucket under the "tenant/" prefix.
+func cachePurgeRemoteBlock(dir string, fake *s3fake.Server) string {
+	return "cache:\n  enabled: true\n  dir: " + dir + "\n  keyEnv: " + cachePurgeTestKeyEnv + "\n" +
+		"  remote:\n    type: s3\n    bucket: " + s3fake.Bucket + "\n    prefix: tenant/\n    region: us-east-1\n" +
+		"    endpoint: " + fake.URL() + "\n    forcePathStyle: true\n"
+}
+
+func TestRunCachePurgeRemote(t *testing.T) {
+	s3fake.IsolateAWSEnv(t)
+	fake := s3fake.New(t)
+	key := cachePurgeTestKey(t)
+	t.Setenv(cachePurgeTestKeyEnv, base64.StdEncoding.EncodeToString(key))
+	dir := cachePurgeTestDir(t)
+	cfgPath := cachePurgeTestConfig(t, cachePurgeRemoteBlock(dir, fake))
+
+	widgets := cachePurgeTestRepoHash(t, key, "acme", "widgets")
+	gadgets := cachePurgeTestRepoHash(t, key, "acme", "gadgets")
+	cachePurgeTestPlace(t, dir, "pack", widgets, 2)
+	entry := strings.Repeat("e", 64)
+	fake.PutObject("tenant/v1/refs/"+widgets+"/"+entry, []byte("sealed"))
+	fake.PutObject("tenant/v1/pack/"+widgets+"/"+entry, []byte("sealed"))
+	survivor := "tenant/v1/pack/" + gadgets + "/" + entry
+	fake.PutObject(survivor, []byte("sealed"))
+
+	cmd := newTestCommand()
+	if err := runCachePurge(cmd, cfgPath, "github.com/acme/widgets", "", true); err != nil {
+		t.Fatalf("runCachePurge() unexpected error: %v", err)
+	}
+	want := "purged 2 entries\npurged 2 entries from the remote tier and wrote the purge marker\n"
+	if out := cmd.OutOrStdout().(*bytes.Buffer).String(); out != want {
+		t.Errorf("output = %q, want %q", out, want)
+	}
+	objects := fake.Objects()
+	if _, ok := objects["tenant/v1/purge/"+widgets]; !ok {
+		t.Error("no purge marker was written")
+	}
+	for k := range objects {
+		if strings.Contains(k, widgets) && !strings.HasPrefix(k, "tenant/v1/purge/") {
+			t.Errorf("%s survived the remote purge", k)
+		}
+	}
+	if _, ok := objects[survivor]; !ok {
+		t.Error("another repository's remote entry was deleted")
+	}
+}
+
+func TestRunCachePurgeRemoteReportsAFailingBucket(t *testing.T) {
+	s3fake.IsolateAWSEnv(t)
+	fake := s3fake.New(t)
+	fake.Intercept(func(w http.ResponseWriter, _ *http.Request) bool {
+		s3fake.WriteError(w, http.StatusForbidden, "AccessDenied", "Access Denied")
+		return true
+	})
+	t.Setenv(cachePurgeTestKeyEnv, base64.StdEncoding.EncodeToString(cachePurgeTestKey(t)))
+	cfgPath := cachePurgeTestConfig(t, cachePurgeRemoteBlock(cachePurgeTestDir(t), fake))
+
+	err := runCachePurge(newTestCommand(), cfgPath, "github.com/acme/widgets", "", true)
+	if err == nil || !strings.Contains(err.Error(), "--remote: purge the remote tier") || !strings.Contains(err.Error(), "AccessDenied (HTTP 403)") {
+		t.Fatalf("runCachePurge() error = %v, want the remote failure reported with its code", err)
 	}
 }

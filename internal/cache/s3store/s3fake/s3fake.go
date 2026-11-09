@@ -18,6 +18,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -66,6 +68,33 @@ type Server struct {
 	pageSize    int
 	interceptor Interceptor
 	now         func() time.Time
+}
+
+// IsolateAWSEnv gives the AWS SDK static credentials from the environment
+// and removes every other ambient AWS setting that could change how a
+// client behaves, including shared configuration files, instance metadata
+// and retries, for the rest of t.
+func IsolateAWSEnv(t testing.TB) {
+	t.Helper()
+	for _, name := range []string{
+		"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS",
+		"AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE", "AWS_DEFAULT_PROFILE",
+		"AWS_SESSION_TOKEN", "AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE",
+		"AWS_CA_BUNDLE", "AWS_REQUEST_CHECKSUM_CALCULATION", "AWS_RESPONSE_CHECKSUM_VALIDATION",
+		"AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+	} {
+		t.Setenv(name, "")
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatalf("unset %s: %v", name, err)
+		}
+	}
+	dir := t.TempDir()
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(dir, "config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(dir, "credentials"))
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	t.Setenv("AWS_MAX_ATTEMPTS", "1")
+	t.Setenv("AWS_ACCESS_KEY_ID", "s3fake-access-key")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "s3fake-secret-key")
 }
 
 // New starts a fake on a loopback port and stops it when t's test ends.
