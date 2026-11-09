@@ -606,16 +606,11 @@ func newProbeKey() string {
 	return remoteProbePrefix + hex.EncodeToString(b[:])
 }
 
-// probeRemote reads a new random key under remoteProbePrefix to check
-// that the remote tier is usable. Not found is healthy. A failure that will not resolve itself
-// fails startup: missing credentials, a certificate that does not verify,
-// a redirect, or any 4xx other than 408 and 429, such as AccessDenied,
-// NoSuchBucket or ExpiredToken. A probe GET that succeeds fails startup
-// too. Any other failure, such as a network error, a timeout, a 5xx or
-// throttling, is logged and startup continues, so a bucket outage cannot
-// stop haybale from starting. The probe uses a GET rather than a HEAD
-// because a HEAD response has no body to tell a missing bucket from a
-// missing object.
+// probeRemote GETs a new random key under remoteProbePrefix. Not found is
+// healthy; a success, missing credentials or a failure remotePermanentError
+// names fails startup; anything else is logged and startup continues, so a
+// bucket outage cannot stop haybale. A HEAD would not do: its response has
+// no body to tell a missing bucket from a missing object.
 func probeRemote(ctx context.Context, store cache.BlobStore, logger *slog.Logger) error {
 	ctx, cancel := context.WithTimeout(ctx, remoteProbeTimeout)
 	defer cancel()

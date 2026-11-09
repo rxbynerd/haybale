@@ -227,14 +227,11 @@ func (e *PurgeError) Error() string { return e.Err.Error() }
 
 func (e *PurgeError) Unwrap() error { return e.Err }
 
-// PurgeRepository purges a repository's entries in req.Groups, in this
-// order: with a remote tier it records the purge in the repository's purge
-// marker, so that every replica sharing the tier drops older local
-// entries at its next marker check, then deletes the remote entries; it
-// then deletes the local entries. A marker that cannot be written ends the
-// purge before anything is deleted. A remote deletion that fails still
-// lets the local step run, and both failures are returned as
-// *PurgeError values. Rerunning a purge is safe.
+// PurgeRepository purges a repository's entries in req.Groups: it writes
+// the purge marker and deletes the remote entries when there is a remote
+// tier, then deletes the local entries. A marker that cannot be written
+// ends the purge before any deletion; a failed remote deletion still lets
+// the local step run. Failures are *PurgeError values; reruns are safe.
 func PurgeRepository(ctx context.Context, kr Keyring, req PurgeRequest) (PurgeResult, error) {
 	var res PurgeResult
 	done := func(step PurgeStep) {

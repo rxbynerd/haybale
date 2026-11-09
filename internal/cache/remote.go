@@ -89,14 +89,11 @@ func (f *fill) remoteEligible() bool {
 	}
 }
 
-// fillFromRemote serves the fill from the remote tier's copy of the entry.
-// It returns false, having spooled nothing, when the remote tier has no
-// usable copy or fails before the fill publishes its outcome: the Get, or
-// reading the sealed header within RemoteHeaderTimeout, with no resume.
-// The fill then goes upstream. Once it returns true the fill is settled. The remote object is
-// the sealed entry, so its bytes are spooled as they are and verified as
-// they pass; a verification failure is a store error and a
-// cache_integrity_failed event.
+// fillFromRemote serves the fill from the remote tier's sealed copy,
+// spooled as it is and verified as it passes. It returns false, having
+// spooled nothing, when there is no usable copy or the Get or header read
+// fails before the outcome is published; the fill then goes upstream.
+// Once it returns true the fill is settled.
 func (f *fill) fillFromRemote() bool {
 	c := f.c
 	path := f.key.Path()
@@ -281,15 +278,11 @@ func (t *spoolTee) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// remoteReader reads one remote object of known size from the start.
-// Until enableResumes is called, the first body must deliver its bytes
-// within prefixTimeout of the Get returning, and any failure is final.
-// After it, when a body read fails, or stalls for idle, the reader resumes
-// with a ranged Get from the current offset, up to maxRemoteResumes times,
-// provided the object is unchanged: the same ETag, through
-// ConditionalGetter when the store implements it, and otherwise the same
-// size and modification time. It ends with io.EOF exactly at the object's
-// size. It is not safe for concurrent use.
+// remoteReader reads one remote object of known size from the start,
+// ending with io.EOF exactly at its size. Before enableResumes a failure
+// is final and the header read is bounded; after it a failed or idle body
+// resumes with a ranged Get, up to maxRemoteResumes times, while the
+// object is unchanged. It is not safe for concurrent use.
 type remoteReader struct {
 	ctx           context.Context
 	store         BlobStore
@@ -684,14 +677,11 @@ func (c *Cache) remoteErrorUnlessClosed(operation string, err error) {
 	c.remoteError(operation, err)
 }
 
-// checkPurgeMarker brings repoHash's purge state up to date with its
-// purge marker and reports whether that state is known current: the
-// marker was read and verified or confirmed absent, now or within the
-// check interval. A marker that records a purge this process has not
-// seen deletes the local entries it covers. Concurrent fills of one
-// repository share one read. A read that fails, or a marker that fails
-// verification, is logged and counted and starts purgeCheckBackoff, during
-// which the state is not current.
+// checkPurgeMarker applies repoHash's purge marker and reports whether
+// the repository's purge state is known current: read and verified, or
+// confirmed absent, now or within the check interval. Concurrent fills of
+// one repository share one read; a failed read or marker starts
+// purgeCheckBackoff, during which the state is not current.
 func (c *Cache) checkPurgeMarker(ctx context.Context, repo gitproto.Repo, repoHash [32]byte) bool {
 	now := c.now()
 	start, mc := c.purges.beginCheck(repoHash, now)
