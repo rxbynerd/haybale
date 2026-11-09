@@ -489,7 +489,7 @@ the block is rejected as an unknown field.
 | `maxConcurrentFills`    | `4`      | Maximum number of pack responses being fetched into the cache at once. A request that finds no free slot is proxied without the cache. An explicit `0` selects the default. Negative and malformed values fail startup. Ref advertisements and `ls-refs` responses do not count: they have a fixed separate cap of 64 concurrent fills and reserve 1 MiB each. |
 | `maxRequestBody`        | `1MiB`   | Largest decoded request body the cache will inspect. A read with a larger body bypasses the cache. An explicit `0` selects the default. Negative and malformed values fail startup. |
 | `retention`             | `24h`    | Go duration string: the maximum age of any entry, after which it is not served. Must be greater than zero. See "Retention". |
-| `refsMaxAge`            | `0s`     | Go duration string: how long a stored ref advertisement is reused without asking the upstream. `0s` always revalidates. When both are non-zero it must be less than `accessRecheck`. |
+| `refsMaxAge`            | `0s`     | Go duration string: how long a stored ref advertisement is reused without asking the upstream. `0s` always revalidates. When both are non-zero it must be less than `accessRecheck`. With a remote tier, refs entries are uploaded to the bucket only when it is greater than `0s`. |
 | `accessRecheck`         | `5m`     | Go duration string: how long a cached pack is served after the last successful upstream refs response before the upstream is asked again. `0s` disables the check. See "Validation" for its relation to `refsMaxAge`. |
 | `responseHeaderTimeout` | `60s`    | Go duration string bounding how long haybale waits for the upstream's response headers on a cache fill. `0s` applies no bound. Does not affect requests that bypass the cache. |
 | `idleTimeout`           | `2m`     | Go duration string bounding the gap between body bytes from the upstream during a cache fill. `0s` leaves the gap unbounded. Does not affect requests that bypass the cache. |
@@ -626,7 +626,7 @@ cache:
   remote:
     type: s3                       # required; the only type
     bucket: haybale-cache          # required
-    prefix: prod/                  # optional; must end with "/"
+    prefix: prod/                  # optional; empty, or ending with "/"
     region: us-east-1              # required
     endpoint: ""                   # optional; https, or http for a loopback host
     forcePathStyle: false          # optional, default shown
@@ -645,35 +645,121 @@ explains how the two tiers interact and which stores work.
 |------------------|---------|-------|
 | `type`           | (unset) | Required. `s3` is the only type. |
 | `bucket`         | (unset) | Required. |
-| `prefix`         | (unset) | Prepended to every object key. Empty, or ending with `/`; directory buckets require the slash. Replicas that share a prefix share entries, so one prefix is one trust domain. |
+| `prefix`         | (unset) | Prepended to every object key. Empty, or ending with `/`. Replicas that share a prefix share entries, so one prefix is one trust domain. The trailing slash keeps one prefix from also matching another in IAM conditions and lifecycle filters (`prod` would match `prod-eu/`), and directory buckets require it. An empty prefix stores entries at the bucket root: the whole bucket is then one trust domain, and a lifecycle rule without a prefix filter covers every object in it. |
 | `region`         | (unset) | Required. The signing region, and the region of the AWS endpoint when `endpoint` is empty. It is never read from `AWS_REGION` or the shared AWS configuration. |
 | `endpoint`       | (unset) | Service base URL. Must be `https`; `http` is accepted only for a loopback host. It must not carry credentials, a query or a fragment. Empty selects `https://s3.<region>.amazonaws.com`. |
 | `forcePathStyle` | `false` | Addresses the bucket in the URL path (`https://<endpoint>/<bucket>/<key>`) instead of the host name. Most self-hosted stores need it. |
-| `headerTimeout`  | `10s`   | Go duration string: time to first byte of a remote read on the request path, and of each remote existence check, listing and deletion. Uploads and the body of a read are not bounded by it; a read's body falls under `idleTimeout`. `0s` applies no bound. |
+| `headerTimeout`  | `10s`   | Go duration string bounding each remote request except an upload: the response of an existence check, a deletion and each listing page, the response headers of a read, and then the read of a remote entry's 4KiB sealed header before a fill falls through to the upstream. It is also the single deadline for deleting a repository's remote refs entries after a push. The rest of a read's body falls under `idleTimeout`. `0s` removes the per-request bound; the deletion after a push is then bounded at one minute. |
 | `sse`            | (unset) | Server-side encryption requested on upload: `AES256` or `aws:kms`. Optional, because entries are already sealed. |
 | `kmsKeyID`       | (unset) | KMS key for `sse: aws:kms`; rejected with any other `sse`. Empty uses the bucket's default KMS key. |
 
 Validation requires `keyEnv` whenever `remote` is set: under an ephemeral key no
 replica could read another's entries. Like the rest of the block, validation is
-structural and offline. When `haybale serve` starts, it reads the object
-`v1/.probe` under the prefix, which haybale never writes, so a "not found"
-answer means the bucket is usable. An authorization or bucket error (HTTP 401
-or 403, `AccessDenied`, `InvalidAccessKeyId`, `SignatureDoesNotMatch` or
-`NoSuchBucket`) fails startup. Any other failure, such as a network error or a
-5xx response, is logged as a warning and startup continues, so a bucket outage
-cannot stop haybale from starting.
+structural and offline, and `haybale policy check` applies the same rules as
+`haybale serve`. Validation refuses a remote block with one of these errors:
+
+- `cache.remote: type is required (want "s3")`, or `cache.remote: type "..." is
+  not supported (want "s3")`;
+- `cache.remote: bucket is required`;
+- `cache.remote: prefix "..." must end with "/"`;
+- `cache.remote: region is required; it is never taken from AWS_REGION`, and,
+  when `endpoint` is empty, `cache.remote: region "..." is not a valid AWS
+  region name`;
+- an endpoint error such as `cache.remote: endpoint "..." must use https (http
+  is permitted only for a loopback host)`. An endpoint error shows the URL with
+  any password redacted, and an endpoint that carries a user name or password
+  is refused;
+- an `sse`, `kmsKeyID` or `headerTimeout` error naming the field; and
+- `cache: keyEnv is required when cache.remote is set, so that every replica
+  seals and addresses entries under the same key`.
+
+When `haybale serve` or `haybale cache purge --remote` builds the S3 client, it
+refuses three environments with a fixed message that carries no SDK text:
+
+- `AWS_CA_BUNDLE` set to any value: `cache.remote: s3store: AWS_CA_BUNDLE is
+  set, but the remote tier trusts only the system certificate store; unset
+  AWS_CA_BUNDLE and add the CA certificate to the system trust store`;
+- a `ca_bundle` key in the selected shared AWS profile: `cache.remote: s3store:
+  the selected AWS profile sets ca_bundle, but the remote tier trusts only the
+  system certificate store; remove ca_bundle from the profile and add the CA
+  certificate to the system trust store`; and
+- an `AWS_PROFILE` naming a profile the shared configuration files do not hold:
+  `cache.remote: s3store: AWS_PROFILE names a profile that does not exist in the
+  shared AWS configuration files`.
+
+The purge command prefixes these messages with `--remote: `.
+
+**Startup probe.** When `haybale serve` starts, it reads the object
+`v1/.probe` under the prefix, within 30 seconds. haybale never writes that
+object, so a "not found" answer (`NoSuchKey`) means the bucket is usable. The
+probe makes one attempt, and its result decides whether startup continues.
+
+Startup fails when:
+
+- the SDK's default credential chain finds no credentials, with `cache.remote:
+  no AWS credentials were found in the SDK's default chain; configure IRSA, EKS
+  Pod Identity, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or a shared
+  profile: s3store: get v1/.probe: NoCredentials`;
+- the probe reads `v1/.probe` successfully, with `cache.remote: the startup
+  probe read v1/.probe, which haybale never writes, so the endpoint is not
+  behaving as S3-compatible storage`; or
+- the store's certificate does not verify (`TLSVerificationFailed`), the store
+  answers with a redirect (any 3xx, such as `PermanentRedirect` for a bucket in
+  another region), or it answers with any 4xx other than a 404 `NoSuchKey`, 408
+  and 429. That covers `AccessDenied`, `InvalidAccessKeyId`,
+  `SignatureDoesNotMatch`, `NoSuchBucket`, `AuthorizationHeaderMalformed`,
+  `ExpiredToken`, `InvalidToken`, `InvalidBucketName` and plain 401 and 403
+  responses.
+
+These fail with `cache.remote: the bucket cannot be used with these credentials
+and settings: s3store: get v1/.probe: <code> (HTTP <status>)`. The status part
+is left out when no response arrived, as for a certificate failure. Without
+`s3:ListBucket`, S3 answers a missing key with 403 `AccessDenied` instead of
+404, so an identity that lacks it fails the probe.
+
+Startup continues, with a warning `cache.remote: the startup probe of the
+bucket failed; continuing, and remote operations retry on use`, when the probe
+fails in a way that can resolve itself: a network or dial error, a timeout
+(`HeaderTimeout` or `DeadlineExceeded`), cancellation, any other failure to
+send the request (`RequestSendFailed`), a 5xx response, 408, 429 or
+`SlowDown`. Network failures carry no HTTP status. A bucket outage therefore
+cannot stop haybale from starting. The probe cannot detect an endpoint that
+answers every request with 404 `NoSuchKey`: such an endpoint passes, and every
+remote read is then a miss.
+
+The `response cache remote tier enabled` line at Info confirms the tier, with
+`type`, `bucket`, `prefix`, `region` and `endpoint`.
 
 **Endpoint.** haybale always sets the endpoint itself, so `AWS_ENDPOINT_URL`,
 `AWS_ENDPOINT_URL_S3` and `endpoint_url` in the shared AWS configuration are
-ignored. Leave `endpoint` empty only for an AWS S3 general-purpose bucket outside
-the China partitions. Set it for an S3 Express One Zone directory bucket (its
-zonal endpoint, `https://s3express-<zone id>.<region>.amazonaws.com`), for the
-China partitions (`https://s3.<region>.amazonaws.com.cn`), and for any other
-store: Cloudflare R2, Ceph RGW or the Google Cloud Storage interoperability
-endpoint. The S3 client uses its own HTTP transport, so `AWS_CA_BUNDLE` is not
-supported: a store whose certificate is issued by a private authority needs
-that authority in the system trust store. Proxy environment variables are not
-used for the bucket either.
+ignored. When `endpoint` is empty, haybale uses
+`https://s3.<region>.amazonaws.com`, so leave it empty only for an AWS S3
+general-purpose bucket reached through that standard regional endpoint. Set it
+for:
+
+- an S3 Express One Zone directory bucket: its zonal endpoint,
+  `https://s3express-<zone id>.<region>.amazonaws.com`;
+- the China partitions: `https://s3.<region>.amazonaws.com.cn`;
+- FIPS, dual-stack, VPC (PrivateLink) and ISO-partition endpoints, which the
+  default cannot express; and
+- any other store: Cloudflare R2, Ceph RGW or the Google Cloud Storage
+  interoperability endpoint.
+
+A directory bucket needs `forcePathStyle: false`, because directory buckets do
+not support path-style requests, and an empty `sse`, because haybale's
+per-request encryption setting is not supported there: configure the bucket's
+default encryption instead.
+
+The S3 client uses its own HTTP transport and trusts only the system
+certificate store, so a store whose certificate is issued by a private
+authority needs that authority in the system trust store; `AWS_CA_BUNDLE` and
+a profile `ca_bundle` stop startup, as above. Proxy environment variables are
+not used for the bucket either.
+
+Cloudflare R2, Ceph RGW and the Google Cloud Storage interoperability endpoint
+are untested in this release. The settings in the [caching
+guide](caching.md#supported-stores) are expected to work, but have not been
+verified against those stores.
 
 **Credentials.** Credentials come from the AWS SDK's default chain: the
 `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` environment variables, the
@@ -681,22 +767,54 @@ shared credentials and configuration files, web identity (IRSA), the EKS Pod
 Identity agent, the ECS container endpoint, and EC2 instance metadata. On
 Kubernetes, prefer workload identity (IRSA or Pod Identity) to static keys, and
 on EC2 nodes require IMDSv2 with a hop limit of 1, so pods cannot use the node's
-instance role. The identity needs `s3:GetObject`, `s3:PutObject` and
-`s3:DeleteObject` on `<bucket>/<prefix>*` and `s3:ListBucket` on the bucket for
-the prefix, plus `kms:GenerateDataKey` and `kms:Decrypt` on the key when `sse`
-is `aws:kms`.
+instance role.
+
+The server's identity and the identity that runs `haybale cache purge
+--remote` both need `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on
+`<bucket>/<prefix>*`, and `s3:ListBucket` on the bucket for the prefix. The
+purge command writes the purge marker, so it needs `s3:PutObject` as well as
+the read, list and delete permissions. Add `kms:GenerateDataKey` and
+`kms:Decrypt` on the key when `sse` is `aws:kms`. For a bucket
+`haybale-cache` and the prefix `prod/`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::haybale-cache/prod/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::haybale-cache",
+      "Condition": { "StringLike": { "s3:prefix": "prod/*" } }
+    }
+  ]
+}
+```
+
+An S3 Express One Zone directory bucket authorises object requests through
+sessions, so the identity needs `s3express:CreateSession` on the bucket
+instead. A lifecycle rule on a directory bucket also needs the bucket policy
+to allow the S3 lifecycle service principal `s3express:CreateSession` in
+`ReadWrite` session mode.
 
 **Bucket.** Keep the bucket private. Add a lifecycle rule that expires objects
 under the prefix after `retention` plus a margin, for example two days for the
 default `24h`. haybale judges an entry's age from the time sealed into it, so
-the rule is only garbage collection, and lifecycle expiry is day-granular on
-every store. Server-side encryption is optional defence in depth: the entries
-are already encrypted and authenticated under the cache key.
+the rule is only garbage collection. Lifecycle expiry is day-granular on AWS
+S3; the granularity of other stores is not verified. Server-side encryption is
+optional defence in depth: the entries are already encrypted and authenticated
+under the cache key.
 
 ### Reserved field
 
 `staleIfErrorFor` is reserved for a later release and **fails startup if set**
-in this release. It will serve an older entry when the upstream is unavailable.
+in this release. It is intended to serve an older entry when the upstream is
+unavailable.
 Only an empty value or a zero duration such as `0s` is accepted; any other value
 is rejected with `cache: staleIfErrorFor is not supported in this release (got
 "..."); leave it empty or "0s"`.

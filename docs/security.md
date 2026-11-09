@@ -316,11 +316,13 @@ verification. A failed entry is deleted and treated as a miss, or, when bytes
 have already been sent, the connection is closed without a clean ending. Either
 way a `cache_integrity_failed` security event is logged.
 
-Entry names on disk are `v1/<group>/<repoHash>/<requestHash>`. The repository
-hash is keyed. The request hash is an unkeyed SHA-256 of the canonical request.
-A directory listing reveals whether an entry is a refs or pack entry, which
-entries belong to the same repository, and each entry's size and time, but not
-the repository name.
+Entry names on disk are `v1/<group>/<repoHash>/<requestHash>`. Both hashes are
+keyed: the repository hash is an HMAC under the cache key, and the request hash
+is an HMAC-SHA256 of the canonical request's digest under a path key derived
+from the cache key, so a reader of the names cannot confirm a guessed
+repository or request. A directory listing reveals whether an entry is a refs
+or pack entry, which entries belong to the same repository, and each entry's
+size and time, but not the repository name.
 
 An entry's age is the creation time authenticated in its header, not the file
 modification time, so changing a file's time does not extend its life.
@@ -356,14 +358,19 @@ S3-compatible bucket and read each other's. The bucket holds exactly the sealed
 bytes the disk holds, so the properties of [sealed entries](#sealed-entries)
 carry over: whoever can write to the bucket without the cache key cannot read
 repository contents or names and cannot forge an entry, alter one, or move one
-to another key. Every entry read from the bucket is verified segment by segment
-before any byte reaches a client. An entry that fails is deleted from the
-bucket, a `cache_integrity_failed` event with `tier=remote` is logged, and the
-request is answered from the upstream if no byte had been sent. A bucket writer
-can still delete entries, which costs upstream fetches, and restore an earlier
-valid copy of an entry until its `retention` ends. Object names reveal what a
-directory listing does: the group, which entries share a repository, and each
-entry's size and time.
+to another key. An entry read from the bucket is verified segment by segment,
+and each segment is verified before any of its bytes reach a client; if a later
+segment fails, the connection is closed without a clean ending. An entry that
+fails authentication, or whose final segment is missing because the object was
+truncated, is deleted from the bucket, a `cache_integrity_failed` event with
+`tier=remote` is logged, and the request is answered from the upstream if no
+byte had been sent. A read that the network cuts short is a transport failure,
+not an integrity failure: it raises no event and leaves the object in place. A
+bucket writer can still delete entries, which costs upstream fetches, and
+restore an earlier valid copy of an entry until its `retention` ends. Object
+names reveal what a directory listing does: the group, which entries share a
+repository, and each entry's size and time. Both hashes in a name are keyed, so
+a reader of object names or bucket access logs cannot confirm a guessed clone.
 
 The cache key and the bucket credentials are separate secrets. The bucket
 credentials come from the AWS SDK's default credential chain; prefer workload
@@ -376,20 +383,49 @@ replicas with the same key, upstreams and policy.
 The client for the bucket always uses the configured endpoint
 (`AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_S3` and shared-config endpoints are
 ignored), requires `https` except for a loopback host, uses TLS 1.2 or later,
-uses no proxy from the environment, and does not follow redirects, so a signed
-request is never sent to a host the configuration did not name. A failed
-bucket operation is logged as its operation, object key (a hashed path), S3
-error code and HTTP status only: never the SDK's error text, request ids or
-credentials.
+uses no proxy from the environment, and does not follow redirects, so the S3
+client never sends a signed request to a host the configuration did not name.
+That covers the S3 client only: the SDK's credential providers, such as STS for
+web identity, make their own requests and may follow `AWS_ENDPOINT_URL_STS` and
+similar settings. A failed bucket request is logged as its operation, object key
+(a hashed path), S3 error code and HTTP status only: never the SDK's error
+text, request ids or credentials. A read whose body fails mid-stream is logged
+with the network error, which can name the local and remote addresses.
 
 A purge with `--remote` writes a purge marker, an object sealed under the cache
-key that records when each group of the repository was purged. Replicas read it
-alongside each upstream refs request for the repository, and drop local entries
-created before it. A marker sealed under another key or for another repository
-is rejected with a `cache_integrity_failed` event, so a bucket writer cannot
-purge a repository. A bucket writer can delete a marker before the replicas
-read it, in which case their older local entries stay servable until
-`retention`, as they would without the marker.
+key that records when each group of the repository was purged. Replicas check
+it alongside an upstream refs request for the repository, reuse a successful
+check for up to a minute, and drop local entries created before it. A marker sealed under another key or for another repository is rejected
+with a `cache_integrity_failed` event, so a bucket writer cannot purge a
+repository. A replica renews the access record that pack hits depend on only
+after a successful check, so while the marker cannot be read or fails
+verification, its pack hits for the repository lapse within `accessRecheck`
+and go to the upstream instead of outliving a purge.
+
+The host that runs `haybale cache purge --remote` holds the cache key and write
+access to the bucket. Together they are enough to seal entries that every
+replica will serve to clients, so treat that host as inside the trust domain,
+like the replicas themselves.
+
+Residual risks of the remote tier, all requiring write access to the bucket or
+a failure on the replicas' side:
+
+- a bucket writer can append bytes to a valid entry in the bucket. The entry's
+  header still verifies, and its size is capped before a replica reserves
+  local disk for it, but the body is verified only as it arrives, so each
+  local miss on that entry can evict up to about 1GiB of local entries at the
+  default sizes before the object fails verification;
+- a bucket writer can delete a purge marker before the replicas read it, in
+  which case their older local entries stay servable until `retention`, as
+  they would without the marker, or replace it with an invalid object, which
+  stops pack hits for the repository on every replica until `purge --remote`
+  replaces it; and
+- after a push, the replica that handled it deletes the repository's refs
+  entries from the bucket, best effort, and never serves an older refs entry
+  from the bucket itself. When that deletion fails, other replicas, and the
+  same replica after a restart, can serve the pre-push refs from the bucket
+  for up to `refsMaxAge`. With the default `refsMaxAge` of `0s`, refs entries
+  are never read from the bucket.
 
 ### Entries are shared across identities
 
@@ -429,7 +465,8 @@ directory, so run the purge on every replica, or restart every replica that has
 no `keyEnv`, which empties its cache. With a remote tier, `--remote` also
 deletes the repository's entries from the bucket and writes the purge marker
 described under [Remote tier](#remote-tier); each replica then honours the
-purge at its next upstream refs request for the repository.
+purge within about a minute plus its next upstream refs request for the
+repository.
 
 Rewrite the history upstream first and purge afterwards. Some hosts, GitHub
 among them, keep serving unreachable objects by id until garbage collection, so

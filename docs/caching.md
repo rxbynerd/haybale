@@ -18,8 +18,9 @@ The cache:
   repository;
 - collapses concurrent identical requests into one fill: the first request
   starts a fill, later requests join it, and every one of them is served from
-  the same stored copy at its own pace. A fill is one upstream fetch whose
-  response is being written to the cache;
+  the same stored copy at its own pace. A fill is one fetch, from the upstream
+  or from the [remote tier](#remote-tier), whose response is being written to
+  the cache;
 - keeps every stored entry encrypted and authenticated under a key only haybale
   holds; and
 - runs after authentication and policy, so a caller that policy denies learns
@@ -162,7 +163,8 @@ If the space is not free, the requests go straight to the upstream.
 
 Each haybale process needs its own cache directory. Do not mount one volume into
 several replicas: a starting process deletes the temporary files of any other
-process in the directory.
+process in the directory. Replicas share entries only through a [remote
+tier](#remote-tier), never through a shared volume.
 
 haybale creates the last element of `cache.dir` with mode `0700` when it is
 missing; the parent must exist. An existing directory must be owned by the
@@ -243,7 +245,9 @@ entry sealed under another key when it starts. The key therefore matters for
 purging (below) more than for persistence. Without a load balancer that keeps a
 client on one replica, a clone's `ls-refs` and `fetch` can reach different
 replicas; the cost is a lower hit rate, never incorrect results. Prefer client
-affinity where the load balancer offers it.
+affinity where the load balancer offers it. To let the replicas share entries,
+give each pod its own `emptyDir` as above and configure a [remote
+tier](#remote-tier).
 
 ### Podman and Docker
 
@@ -257,16 +261,22 @@ the volume, and creates the child with mode `0700`.
 With [`cache.remote`](configuration.md#remote-tier) set, replicas share entries
 through a prefix of an S3-compatible bucket. Each replica keeps its own disk
 tier, and the bucket is a second tier behind it. All replicas sharing a prefix
-must use the same `keyEnv` key and the same upstreams.
+must use the same `keyEnv` key, the same upstreams and the same policy: one
+prefix is one trust domain, and every replica that can write it can make the
+others serve what it stored.
 
 How the two tiers interact:
 
-- After a fill stores an entry on disk, the replica uploads it in the
-  background. Four uploads run at a time and up to 256 wait; when the queue is
-  full the entry is not uploaded, and `uploads.total` counts it with
-  `result=dropped`. A pack entry the bucket already holds is not uploaded again
-  (`result=skipped`), because its content is fixed by its request. A refs
-  entry always replaces the bucket's copy, so peers see the latest tips.
+- After a fill from the upstream stores an entry on disk, the replica uploads
+  it in the background. Pack entries are always uploaded. Refs entries are
+  uploaded only when `refsMaxAge` is above `0s`, because otherwise no replica
+  reads them from the bucket. Four uploads run at a time and up to 256 wait;
+  when the queue is full the entry is not uploaded, and `uploads.total` counts
+  it with `result=dropped`. A refs entry replaces the bucket's copy, so peers
+  see the latest tips. An upload is skipped (`result=skipped`) when the bucket
+  already holds the pack, whose content is fixed by its request, when the
+  local entry was evicted before its upload ran, or when a push or a purge
+  superseded the entry.
 - On a disk miss, a replica reads the entry from the bucket before it asks the
   upstream, under the same freshness rules as a disk hit: a pack needs a recent
   upstream refs success on this replica (`accessRecheck`), and a refs entry is
@@ -275,19 +285,55 @@ How the two tiers interact:
   and the entry is stored on this replica's disk too. The request is reported
   as a miss (`fwd=miss` in `Cache-Status`, `cache=miss` with `cacheStored` in
   the request log), and its bytes are counted with `tier=remote`.
-- If the bucket has no copy, or the read fails before any byte reaches a
-  client, the same fill asks the upstream. If the read fails or stalls for
-  `idleTimeout` after bytes were sent, haybale resumes it from where it stopped,
-  up to three times, and otherwise closes the clients' connections.
-- Every entry read from the bucket is verified with the cache key before a
-  client receives any of it. An entry that fails verification is deleted from
-  the bucket and logged as a `cache_integrity_failed` security event with
-  `tier=remote`; the request is answered from the upstream when no bytes had
-  been sent.
-- A push also deletes the repository's refs entries from the bucket, in the
-  background.
+- If the bucket has no copy, or the read fails or stalls before the fill starts
+  serving it, the same fill asks the upstream at once, with no retry. That
+  phase covers the read's response headers, bounded by `headerTimeout`, and
+  the entry's 4KiB sealed header, which must arrive within `headerTimeout` of
+  the response headers. Stat and read requests make a single attempt, without
+  the AWS SDK's retries, so `headerTimeout` is the only bound on them; uploads,
+  deletions and listings keep the SDK's default retries.
+- Once the fill has started serving the entry, a read that fails, or stalls for
+  `idleTimeout`, resumes from where it stopped with a ranged read, up to three
+  times, after a pause of 100ms that doubles each time. A resume is conditional
+  on the object's ETag when the store reports one, and otherwise on its size
+  and modification time; an object replaced in the meantime is not resumed. A
+  read that cannot continue ends the fill with `reason=fetch_error`: requests
+  that had received bytes lose the connection, and requests that had received
+  nothing go to the upstream directly. This is a transport failure, so the
+  object is left in the bucket and no security event is logged. A stall inside
+  the entry's first segment, after its header arrived, is also handled this
+  way rather than by falling through.
+- An entry read from the bucket is verified segment by segment with the cache
+  key, and each segment is verified before any of its bytes reach a client. A
+  failed authentication of the header or of a segment, a missing final
+  segment, or bytes after it, is an integrity failure: the entry is deleted
+  from the bucket, within `headerTimeout` (one minute when it is `0s`),
+  before the fill moves on, and a `cache_integrity_failed` security event is
+  logged with `tier=remote`. When
+  the header fails, the same fill asks the upstream. When a segment fails, the
+  fill ends with `reason=store_error`: requests that had received bytes lose
+  the connection, and requests that had received nothing go to the upstream
+  directly. An object truncated in the bucket fails this way, because its
+  final segment is missing.
+- A remote object whose size cannot be a valid entry, or one past `retention`
+  or older than the repository's last purge, is not used, and the fill asks
+  the upstream. An expired or purged object is deleted from the bucket in the
+  background, at most eight such deletions at a time; the rest are dropped
+  with a Debug line. Such a deletion can race the upload that follows the
+  fill, which then finds the old object and is skipped, so the key can stay
+  absent from the bucket until a later miss uploads it again.
+- A push deletes the repository's refs entries from the bucket before the push
+  handler returns, after the local deletion, within one `headerTimeout` (one
+  minute when `headerTimeout` is `0s`) across the listing and the deletions.
+  It is best effort: a failure is logged as `remote cache tier operation
+  failed` with `operation=list` or `operation=delete`, and the push itself is
+  unaffected. The replica also records the push time in memory, and does not
+  serve a refs entry from the bucket created no later than that time. A refs
+  upload that was in flight when the push arrived deletes its object again and
+  counts as `skipped`.
 - At shutdown, `haybale serve` waits for queued uploads within the same bound it
-  gives fills in progress, then abandons the rest.
+  gives fills in progress, then abandons the rest and counts them as
+  `dropped`.
 
 Behind a load balancer without client affinity, a clone's `ls-refs` and `fetch`
 can reach different replicas. The `fetch` then misses on the second replica's
@@ -304,8 +350,10 @@ refs success for the repository, or from the upstream otherwise.
 | Ceph RGW | `endpoint` set to the gateway URL, `forcePathStyle: true` unless the gateway serves bucket host names, and `region` set to the zonegroup's API name. |
 | Google Cloud Storage | The interoperability endpoint, `endpoint: https://storage.googleapis.com`, with an HMAC key supplied as `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; `region` set to the bucket's location or `auto`; no `sse`. |
 
-The MinIO server's community repository is archived, so MinIO is not
-recommended for new deployments. An existing MinIO installation works like any
+Cloudflare R2, Ceph RGW and Google Cloud Storage are untested in this release:
+their rows give the settings those stores document for S3 compatibility. The
+MinIO server's community repository is archived, so MinIO is not recommended
+for new deployments. An existing MinIO installation works like any
 S3-compatible store with `forcePathStyle: true`.
 
 ### Sizing the bucket
@@ -314,22 +362,56 @@ The bucket holds one copy of each entry any replica stored, until the lifecycle
 rule removes it. Its size is roughly the distinct pack entries the fleet creates
 within `retention` plus the lifecycle margin; refs entries are kilobytes.
 Entries over 5GiB are never uploaded, which the default `maxEntrySize` of 1GiB
-already guarantees. Request volume is one read per eligible disk miss, one
-small read of the purge marker per upstream refs response, and one upload per
-stored entry (plus an existence check for a pack). Every read of the bucket
-leaves the store's network, so egress pricing matters when replicas run outside
-the bucket's region or cloud.
+already guarantees. Request volume is one read per eligible disk miss, at most
+one small read of each repository's purge marker per minute (on an upstream
+refs request), and one upload per stored pack entry, plus an existence check
+first, and per stored refs entry when `refsMaxAge` is above `0s`. A push costs
+a listing of the repository's refs entries and a deletion for each one found.
+Every read of the bucket leaves the store's network, so egress pricing matters
+when replicas run outside the bucket's region or cloud.
 
 ### Bucket hygiene
 
 Keep the bucket private and add a lifecycle rule that expires objects under the
 prefix after `retention` plus a margin, for example two days for the default
 `24h`. haybale judges an entry's age from the time sealed into it, so the rule
-is garbage collection only, and lifecycle expiry is day-granular on every
-store. Server-side encryption (`sse`) is optional, because the entries are
-already sealed. Keep the hosts' clocks synchronised: a purge compares the
-purging host's clock with the creation time each replica sealed into its
-entries.
+is garbage collection only. Lifecycle expiry is day-granular on AWS S3; other
+stores have not been checked. Server-side encryption (`sse`) is optional,
+because the entries are already sealed.
+
+Keep the hosts' clocks synchronised, including the host that runs `haybale
+cache purge --remote`. A purge compares the purging host's clock with the
+creation time each replica sealed into its entries. haybale tolerates a
+creation time up to 5 minutes in the future; an entry or purge marker from a
+host whose clock runs further ahead fails verification as an integrity
+failure. For an entry, that costs one upstream fetch. For a purge marker, it
+stops pack hits for that repository on every replica, and the
+`cache_integrity_failed` event with `class=purge` repeats, until the clocks
+catch up or `purge --remote` is run again from a host with a correct clock
+(see [Purging a repository](#purging-a-repository)).
+
+### When the bucket is unavailable
+
+haybale does not track the bucket's health; every operation tries the bucket
+afresh. During an outage:
+
+- each eligible disk miss waits for the bucket before it goes upstream: up to
+  `headerTimeout` for the read's response headers, and up to `headerTimeout`
+  again for the entry's sealed header when the headers arrived;
+- an upstream refs fill waits for the repository's purge marker read, at most
+  30 seconds, and after a failed read the replica does not read that
+  repository's marker again for a minute;
+- while marker reads fail, upstream refs responses do not renew the access
+  record that pack hits depend on, so pack requests stop hitting, on disk as
+  well, within `accessRecheck` and go to the upstream instead;
+- a push's result is unaffected, but the push handler can take up to
+  `headerTimeout` (one minute when it is `0s`) longer to return while it tries
+  to delete the bucket's refs entries; and
+- uploads fail and are counted as `result=failed`.
+
+To shorten the wait on each request, lower `headerTimeout`. `0s` removes the
+per-request bound and leaves each request waiting until the bucket answers or
+the connection fails, so use it only with a store that fails fast.
 
 ## Observing the cache
 
@@ -344,6 +426,11 @@ cache:
   including discarded fills and refs fills. With a remote tier,
   `fill_bytes.total` and `served_bytes.total` with `tier=remote` count what
   replicas read from the bucket instead of the upstream;
+- load on the upstream: `fills.total` with `tier=upstream` counts the fills
+  that fetched from the upstream, and `fill_bytes.total` with `tier=upstream`
+  the bytes they read. A fill that tried the bucket and fell through to the
+  upstream counts once, as an upstream fill. Add the `bypass` results of
+  `lookups.total`, which go straight to the upstream;
 - uploads to the remote tier: `uploads.total` by `result`;
 - coalescing: `collapsed.total` counts requests that joined a fill already in
   flight;
@@ -364,11 +451,18 @@ Log lines to alert on, all at Warn unless noted:
 
 - `fill aborted`: a fill could not continue and its clients were released or
   disconnected. Check the `reason` field.
-- the `cache_integrity_failed` security event: a stored entry failed its
-  integrity check and was deleted. The accompanying `entry failed verification;
-  deleting it` line is logged at Debug, so alert on the event. A single event can
-  be disk corruption. Repeated events, or events after nobody changed the key,
-  suggest someone is writing to the cache directory.
+- the `cache_integrity_failed` security event: a stored entry or purge marker
+  failed its integrity check. The accompanying `entry failed verification;
+  deleting it` line, or `remote entry failed verification; deleting it` for an
+  entry read from the bucket, is logged at Debug, so alert on the event. An
+  entry that fails is deleted. A purge marker that fails (`class=purge`,
+  `tier=remote`) is not deleted: pack hits for that repository stop on every
+  replica within `accessRecheck`, and each replica logs the event again about
+  every minute while it receives refs requests for the repository, until
+  `haybale cache purge --remote` replaces the marker. A single event can
+  be disk corruption or a host clock running more than 5 minutes ahead.
+  Repeated events, or events after nobody changed the key, suggest someone is
+  writing to the cache directory or the bucket.
 - `entry failed mid-stream; aborting the response`: a stored entry failed while
   it was being sent, after the client had received bytes, so that response was
   cut short. The `cache_integrity_failed` event accompanies it only when the
@@ -392,8 +486,10 @@ Log lines to alert on, all at Warn unless noted:
   uploads pending.
 - `remote cache tier operation failed`: a read, upload, existence check,
   listing or deletion against the bucket failed. The `operation` field names
-  it and the `error` field carries the operation, the S3 error code and the
-  HTTP status, never the SDK's message.
+  it. For a failed request the `error` field carries the operation, the S3
+  error code and the HTTP status, never the SDK's message. For a read whose
+  body failed mid-stream it carries the network error, which can name the
+  local and remote addresses.
 - `cache.remote: the startup probe of the bucket failed; continuing, and remote
   operations retry on use`: the bucket could not be reached at startup.
 
@@ -409,17 +505,22 @@ Lines of lower value, all at Warn except where noted:
   temporary file was released after a grace period although a waiting request
   had not yet opened it;
 - `set entry modification time`: a stored entry's file time could not be set.
-  Freshness does not depend on it; and
+  Freshness does not depend on it;
 - `janitor not started: interval and retention must be positive` (Error): the
-  cache runs without its periodic cleanup.
+  cache runs without its periodic cleanup; and
+- `remote entry size is out of range; fetching upstream` (Debug only): a
+  bucket object's size cannot be a valid entry, so it was not read. Something
+  other than haybale may be writing to the prefix.
 
 Informational lines to expect, at Info, in start-up order: the ephemeral-key
 notice (when `keyEnv` is unset), `removed cache entries sealed under another key`
 (after a key change), `response cache enabled` (with `dir`, `keyMode` and the
-sizes) and `response cache remote tier enabled` (with the bucket, prefix, region
-and endpoint); `cache: removed entries older than the repository's purge marker`
-after a purge with `--remote` on another replica; and `response cache closed` at
-shutdown.
+sizes) and `response cache remote tier enabled` (with the type, bucket, prefix,
+region and endpoint); `cache: removed entries older than the repository's purge
+marker` on every replica that reads a purge marker newer than the purges it
+already knew, including the server on the host where the purge command ran,
+and with `entries=0` when it had nothing to remove; and `response cache
+closed` at shutdown.
 
 Metrics to alert on: any increase of `store_errors.total`; a sustained rate of
 `fills.total` with `reason` of `store_error`, `disk_budget` or `encoding`;
@@ -460,7 +561,8 @@ needs three things:
   command cannot address its entries, and restarting haybale deletes them
   instead; and
 - the same user as the server, because the directory must be owned by the
-  process user.
+  process user. With `--remote` and no local directory, the local step is
+  skipped instead.
 
 `purged 0 entries` is reported with exit status 0. It means that nothing is
 cached for that repository in this directory (another replica may hold it), that
@@ -490,20 +592,50 @@ haybale cache purge --config /etc/haybale/haybale.yaml \
   --repo github.com/acme/widgets --remote
 ```
 
-After the local purge, the command records the purge in the repository's purge
-marker in the bucket (`v1/purge/<repoHash>` under the prefix), then deletes the
-repository's entries from the bucket, and prints `purged N entries from the
-remote tier and wrote the purge marker`. It needs the bucket credentials as
-well. The marker is sealed under the cache key and records the purge time of
-each group. Every replica reads it alongside each upstream refs request for the
+The command then works in this order, printing a line as each step finishes:
+
+1. It records the purge in the repository's purge marker in the bucket
+   (`v1/purge/<repoHash>` under the prefix).
+2. It deletes the repository's entries from the bucket and prints `wrote the
+   purge marker and purged N entries from the remote tier`.
+3. It deletes the entries in this host's `cache.dir` and prints `purged N
+   entries`. With `--remote`, a `cache.dir` that does not exist is skipped with
+   `notice: cache.dir "..." does not exist; there are no local entries to
+   purge` on stderr, so the command can run on a host with no local cache.
+   Other directory errors, such as the wrong owner, still fail the command.
+
+It needs the bucket credentials as well, and the whole run is bounded at five
+minutes. If the marker cannot be written, the command exits non-zero with
+`--remote: write the purge marker (nothing was deleted): ...` and deletes
+nothing. If a deletion from the bucket fails, the command still runs the local
+step, then exits non-zero with `--remote: purge the remote tier (N entries
+deleted so far): ...`. Running the command again is safe in both cases. An
+existing marker that fails verification, for example one sealed under another
+key or by a host whose clock ran ahead, is replaced, with `notice: the
+repository's purge marker failed verification and was replaced` on stderr.
+
+The marker is sealed under the cache key and records the purge time of each
+group. A replica checks it alongside an upstream refs request for the
 repository, and drops its local entries created before the purge time; until
 then those entries are still served. Because a pack hit needs a recent refs
 success, a replica that reads the marker on a clone's `ls-refs` also misses that
-clone's `fetch`. A replica therefore honours a purge at its next upstream refs
-request for the repository. If reading the marker fails, the replica does not
-try again for a minute, so the delay is then one minute plus that request. With
+clone's `fetch`. A successful check, which finds the marker or confirms there
+is none, stays current for a minute (or for `accessRecheck` when that is
+shorter), and concurrent refs requests for the repository share one read. A
+replica therefore honours a purge within about a minute plus its next upstream
+refs request for the repository. A check that fails, because the read fails,
+times out after 30 seconds, or finds a marker that fails verification, is not
+retried for a minute, and does not renew the access record that pack hits
+depend on, so the replica's pack hits for the repository lapse within
+`accessRecheck` and go to the upstream until a check succeeds. With
 `refsMaxAge` above `0s`, a refs hit does not read the marker, so cached refs
 entries can be served for up to `refsMaxAge` after the purge.
+
+Without `--remote`, the command reaches only this host's directory. When
+`cache.remote` is configured, it then prints `warning: cache.remote is
+configured but --remote was not given: replicas will refill the purged entries
+from the bucket; use --remote to purge the shared tier` on stderr and exits
+with status 0, because the bucket still holds the entries.
 
 Without a remote tier each replica has its own directory, so purge on every
 replica. On Kubernetes, run the command inside each pod, where the container
@@ -559,7 +691,10 @@ out through the lifecycle rule.
 - With several replicas behind a load balancer, each replica has its own cache
   unless they share a [remote tier](#remote-tier). With a remote tier, check
   `uploads.total` for `failed` or `dropped` results and `store_errors.total`
-  with `tier=remote`.
+  with `tier=remote`. Pack requests also stop hitting, on disk as well, while
+  a replica's purge marker checks fail: see [When the bucket is
+  unavailable](#when-the-bucket-is-unavailable), and a `cache_integrity_failed`
+  event with `class=purge` for a marker that fails verification.
 
 ### Hits are rare after a restart
 
@@ -586,14 +721,16 @@ The `reason` on `fills.total` says why, and what clients see depends on it:
   cacheable `200`. The waiting requests share that one response, or go to the
   upstream if it was over 64KiB.
 - `fetch_error`: a transport failure, a timeout, a failure to obtain a
-  credential, or a failure reading an error body. Requests that had not yet
-  received bytes go to the upstream directly. If the failure comes mid-response,
-  clients that had received bytes lose the connection.
+  credential, a failure reading an error body, or a read from the remote tier
+  that could not continue after three resumes or whose object was replaced
+  during the read. Requests that had not yet received bytes go to the upstream
+  directly. If the failure comes mid-response, clients that had received bytes
+  lose the connection.
 - `encoding`: the upstream answered with a content encoding. The waiting
   requests go to the upstream directly.
-- `store_error`: the disk failed, the fill panicked, or a read from the remote
-  tier failed past its resumes or did not verify. If the entry could not be
-  committed after the whole body was received and sealed, clients still
+- `store_error`: the disk failed, the fill panicked, or an entry read from the
+  remote tier failed verification. If the entry could not be committed after
+  the whole body was received and sealed, clients still
   receive the response. If the disk failed earlier, including while writing the
   entry's trailer, requests that had received bytes lose the connection, and
   requests that had not go to the upstream directly.
@@ -629,14 +766,24 @@ The directory is not owned by the process user or grants group or other access
 (for example the root of a freshly mounted volume); `keyEnv` names a variable
 that is unset or does not hold 32 base64-encoded bytes; `refsMaxAge` is not less
 than `accessRecheck`; `maxEntrySize` exceeds half of `maxDiskSize`; or the
-bucket of the remote tier rejected the startup probe with an authorization or
-bucket error. The error names which.
+startup probe of the remote tier failed in a way that will not resolve itself,
+such as missing credentials, a certificate that does not verify, a redirect or
+an authorization or bucket error; or `AWS_CA_BUNDLE`, a profile `ca_bundle` or
+an `AWS_PROFILE` naming a missing profile stopped the S3 client from being
+built. The error names which, and [Remote tier](configuration.md#remote-tier)
+in the configuration reference lists the messages.
 
 ### A replica serves ref tips from before a push
 
 A push deletes the repository's cached refs entries on the replica that handled
-it, and in the remote tier. Other replicas keep their local copies until
-`refsMaxAge` passes, which matters only when `refsMaxAge` is above `0s`.
+it, and then in the remote tier, best effort. Other replicas keep their local
+copies until `refsMaxAge` passes, which matters only when `refsMaxAge` is above
+`0s`. If the deletion from the bucket fails (`remote cache tier operation
+failed` with `operation=list` or `operation=delete`), pre-push refs entries can
+stay in the bucket for up to `refsMaxAge`. The replica that handled the push
+never serves them, because it remembers the push time, but other replicas can
+read them from the bucket, and so can the same replica after a restart, which
+forgets the push time.
 
 ## Limits and roadmap
 
