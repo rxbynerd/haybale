@@ -30,8 +30,9 @@ The cache does not:
 
 - store pushes, or serve anything for a write;
 - serve incremental fetches, which send `have` lines and always go upstream;
-- serve reads while the upstream is down: stale-if-error is planned, not
-  available;
+- serve reads while the upstream is down, unless
+  [stale-if-error](#serving-through-an-upstream-outage) is enabled, and then only
+  repeats of requests it has already stored;
 - share entries between haybale processes unless a [remote tier](#remote-tier)
   is configured: each process has its own directory and its own copy; or
 - change what clients receive. A cached response is the upstream's own bytes for
@@ -75,8 +76,8 @@ advertisements and `ls-refs` responses are stored too, but they are served from
 the cache only if they are younger than `refsMaxAge`, which defaults to `0s`.
 With the default every clone asks the upstream for the current refs, so in
 practice only the pack is served from the cache. The refs entries are small and
-are kept for stale-if-error, which is planned. See [Request
-flow](#request-flow).
+are kept so that [stale-if-error](#serving-through-an-upstream-outage) can
+answer a whole clone during an outage. See [Request flow](#request-flow).
 
 ## Request flow
 
@@ -117,7 +118,9 @@ to the upstream instead. After a discarded or aborted fill, requests for the
 same key go straight to the upstream for one minute. Two reasons differ: after
 an oversize response (`too_large`) the period is `retention`, and a `generation`
 discard, or a fill cancelled because every request waiting on it left, marks
-nothing.
+nothing. With `staleIfErrorFor` set, an outage-shaped failure is answered from a
+stored entry instead when one qualifies, and marks nothing either; see [Serving
+through an upstream outage](#serving-through-an-upstream-outage).
 
 With the default settings, fifty concurrent clones of one repository cost one
 hundred small upstream requests (the advertisement and `ls-refs` of each clone)
@@ -427,6 +430,102 @@ until the bucket answers or the connection fails, the entry's sealed header is
 bounded by `idleTimeout`, and the deletions a request waits on are bounded at
 one minute. Use `0s` only with a store that fails fast.
 
+## Serving through an upstream outage
+
+`cache.staleIfErrorFor` (default `0s`, off) lets haybale answer a read from a
+stored entry when the upstream cannot answer it, as long as the entry is no
+older than that duration. It is a trade of freshness for availability with a
+security cost, described in the [security model](security.md#stale-if-error): a
+client can receive content up to `staleIfErrorFor` old, and git gives no sign of
+it. Set it only for workloads that are better served by outdated content than
+by a failed clone.
+
+A read is answered stale when all of these hold:
+
+- the upstream request failed in a way that only an outage explains:
+  - the connection to the upstream failed: name resolution, the TCP connection
+    or the TLS handshake;
+  - the credential source could not reach its API (for the GitHub App source, a
+    network error, its own timeout or a `5xx` from the GitHub API);
+  - no response headers arrived within `responseHeaderTimeout`; or
+  - the upstream answered `500`, `502`, `503` or `504`;
+- an entry for the identical request is stored on this replica's disk or in the
+  remote tier, created no more than `staleIfErrorFor` ago and not purged; and
+- the request was offered to the cache: a read that the cache declines (see
+  [Clones always miss](#clones-always-miss)) takes the passthrough path, which
+  never serves stale.
+
+The `accessRecheck` and `refsMaxAge` rules are waived for stale service, since
+both exist to make haybale ask the upstream, and the upstream cannot answer.
+The disk entry is used when it qualifies; otherwise the remote tier's copy is
+read, served and stored on disk like any remote fill. Every request waiting on
+the failed fill is served the stale entry rather than the upstream's error
+response.
+
+These are never answered stale and fail as they do without the setting:
+
+- `401` and `403` from the upstream, including a `403` that signals rate
+  limiting: haybale's credential was rejected, and the client still receives
+  `502`;
+- `404`, `429` and every other `4xx`, which the client receives as the upstream
+  sent them;
+- a credential source that refuses to mint: a bad key, a suspended or removed
+  installation, a repository outside the installation, or rate limiting;
+- any other error, such as a connection reset after the request was sent;
+- every push; and
+- a request with no stored entry, or only one older than `staleIfErrorFor`.
+
+A stale response carries `Cache-Status: haybale; hit; fwd=stale;
+fwd-status=503` when `exposeStatus` is on, where `fwd-status` is the upstream's
+status and is left out when no response arrived. The request log records
+`cache=stale`, `lookups.total` counts it with `result=stale`, and
+`served_bytes.total` counts its bytes under the tier it came from. Every stale
+response also logs a `cache_stale_served` security event at warning level,
+described in [`observability.md`](observability.md#logs).
+
+### What an outage clone can do
+
+Stale service replays stored responses to byte-identical repeat requests; it
+never assembles a response from other entries. A clone during an outage
+therefore succeeds only if the same clone, with the same tips and the same
+options, went through this replica, or a replica sharing the remote tier, within
+`staleIfErrorFor`. In particular:
+
+- a clone with a different `--depth`, filter or branch selection is a different
+  request, and fails;
+- `git fetch` in an existing clone sends `have` lines, which are never cached,
+  and fails;
+- the stored ref advertisement and `ls-refs` response can name tips for which no
+  pack is stored, for example after another replica's incremental fetch
+  refreshed the remote tier's `ls-refs` entry. That clone then fails at its
+  fetch step, as it would without the cache; and
+- the stale tips are the ones stored, so the clone lacks every commit pushed
+  since, including security fixes.
+
+### Health gate
+
+While stale-if-error is enabled, haybale keeps a health gate per upstream host so
+that an outage does not make every request wait out a connection timeout first.
+The gate opens when a request cannot connect to the upstream or the credential
+source reports its API unavailable. A `5xx` response or a response-header
+timeout never opens it: one repository can be slow or failing while the host is
+healthy, and a client can provoke those for its own requests.
+
+While the gate is open:
+
+- a request with a qualifying stored entry is answered from it at once, without
+  contacting the upstream;
+- a request without one still goes to the upstream, since nothing else can answer
+  it; and
+- one request at a time goes to the upstream as a probe, at most once every 5
+  seconds. A failed probe is answered stale like any other request.
+
+Any upstream answer other than `500`, `502`, `503` or `504` closes the gate.
+Probes ride on client requests, so with no traffic the gate stays open until the
+next request finds the upstream reachable. Opening and closing are logged at Info
+with the `host`: `upstream health gate opened; stale entries answer requests
+without contacting upstream` and `upstream health gate closed`.
+
 ## Observing the cache
 
 The metrics are described in [`observability.md`](observability.md). To judge the
@@ -454,10 +553,11 @@ cache:
   `disk_bytes` up/down counter (read it as a gauge) against `maxDiskSize`.
 
 Each `proxied request` log line of a read carries a `cache` field (`hit`,
-`miss` or `bypass`), plus `cacheCollapsed` and `cacheStored` on a miss. To see
-the result on a single response, enable `exposeStatus` and read its
-`Cache-Status` header; the [security model](security.md#cache-status-disclosure)
-explains why that is off by default.
+`miss`, `stale` or `bypass`), plus `cacheCollapsed` and `cacheStored` on a
+miss. To see the result on a single response, enable `exposeStatus` and read
+its `Cache-Status` header; the [security
+model](security.md#cache-status-disclosure) explains why that is off by
+default.
 
 ### What to alert on
 
@@ -507,6 +607,11 @@ Log lines to alert on, all at Warn unless noted:
   local and remote addresses.
 - `cache.remote: the startup probe of the bucket failed; continuing, and remote
   operations retry on use`: the bucket could not be reached at startup.
+- the `cache_stale_served` security event: a read was answered from a stale
+  entry because the upstream could not answer. Alert on any occurrence where
+  `staleIfErrorFor` is set; its `reason` field tells an outage (`connect`,
+  `credential_unavailable`, `health_gate`) from a failing repository
+  (`upstream_status`, `header_timeout`).
 
 Lines of lower value, all at Warn except where noted:
 
@@ -530,12 +635,13 @@ Lines of lower value, all at Warn except where noted:
 Informational lines to expect, at Info, in start-up order: the ephemeral-key
 notice (when `keyEnv` is unset), `removed cache entries sealed under another key`
 (after a key change), `response cache enabled` (with `dir`, `keyMode` and the
-sizes) and `response cache remote tier enabled` (with the type, bucket, prefix,
-region and endpoint); `cache: removed entries older than the repository's purge
-marker` on every replica that reads a purge marker newer than the purges it
-already knew, including the server on the host where the purge command ran,
-and with `entries=0` when it had nothing to remove; and `response cache
-closed` at shutdown.
+sizes and `staleIfErrorFor`) and `response cache remote tier enabled` (with the
+type, bucket, prefix, region and endpoint); `cache: removed entries older than
+the repository's purge marker` on every replica that reads a purge marker newer
+than the purges it already knew, including the server on the host where the
+purge command ran, and with `entries=0` when it had nothing to remove; the
+[health gate](#health-gate) opening and closing; and `response cache closed` at
+shutdown.
 
 Metrics to alert on: any increase of `store_errors.total`; a sustained rate of
 `fills.total` with `reason` of `store_error`, `disk_budget` or `encoding`;
@@ -845,11 +951,10 @@ In this release:
   the remote tier's entries unreadable until the lifecycle rule removes them;
 - stored content can be older than the upstream's by up to `retention`, and
   shallow clones can miss newer annotated tags for the same time; and
-- when the upstream is unavailable, requests fail as they do without the cache.
-
-Planned for a later release, and rejected by the configuration until then:
-serving a recently stored response when the upstream is unavailable
-(`cache.staleIfErrorFor`), as an explicit operator opt-in.
+- when the upstream is unavailable, requests fail as they do without the cache,
+  unless `staleIfErrorFor` is set; then only repeats of stored requests succeed,
+  as [Serving through an upstream outage](#serving-through-an-upstream-outage)
+  describes.
 
 When haybale shuts down, fills still running after in-flight requests have
 drained are cancelled.

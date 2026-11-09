@@ -1,8 +1,8 @@
 # Design: response cache for Git smart HTTP reads
 
 Status: accepted; the first pull request implements Decisions 1 to 7 and 9
-(tier 1 only), the second pull request implements the remote tier, and
-Decision 8 follows in a later pull request. Revised 2026-11-09 after
+(tier 1 only), the second pull request implements the remote tier, and the
+third pull request implements Decision 8. Revised 2026-11-09 after
 design review (pressure test, security threat model, API design review,
 adversarial document review) and a research survey of prior art. This document records the design
 decisions behind haybale's optional response cache so that future changes
@@ -722,6 +722,28 @@ stored (for example after a peer's incremental fetch refreshed `ls-refs`);
 that clone then fails at the fetch step as it would without the cache.
 Both limits are stated in the documentation.
 
+> Implemented as: A connection failure is recognised by the error the
+> transport returns: a dial or name-resolution error, a TLS handshake error
+> (including an untrusted certificate and the handshake timeout), or a TLS
+> alert. An error that can arise after a connection exists, such as a reset
+> or an EOF, is not eligible. The proxy's fetcher rewrites an upstream 401 or
+> 403 into a 502 before the cache sees it, so it names the original status in
+> an internal `Haybale-Upstream-Status` header that the cache classifies by
+> and strips. The tier-1 entry is used whenever it qualifies, and tier 2 is
+> read only when it does not, so a newer remote refs entry does not replace a
+> qualifying local one. Purge markers and retention still apply. A failure
+> answered stale leaves the key cacheable, so later requests during the outage
+> are answered stale too. The proxy passes the verified identity to `Serve`
+> as a parameter. The `cache_stale_served` event also carries `tier`,
+> `reason` (`connect`, `credential_unavailable`, `header_timeout`,
+> `upstream_status` or `health_gate`) and `entryAgeSeconds`. The gate exists
+> only while `staleIfErrorFor` is above zero. Any upstream answer other than
+> 500, 502, 503 or 504 counts as a success. Probes ride on client requests:
+> at most one at a time, admitted no sooner than 5 s after the previous probe
+> began or the gate opened. A request the gate holds back that has no
+> qualifying entry goes upstream, and a held request answered stale records no
+> fill metric.
+
 ## Decision 9: what the client sees
 
 Responses served through the cache path carry the stored `Content-Type`,
@@ -745,7 +767,8 @@ The request log's `cache` field carries the same values for operators.
 > response relays the upstream headers other than hop-by-hop headers, with
 > `Content-Length` recomputed. The `fwd=bypass` `Cache-Status` is written by
 > the cache when it declines a request, not by the proxy. The stale form is
-> not implemented.
+> `haybale; hit; fwd=stale` also when the health gate kept the request from
+> upstream, with `fwd-status` only when an upstream status arrived.
 
 ## Operator controls
 
@@ -873,17 +896,16 @@ configuration error fails startup (matching the fail-fast JWKS
 behaviour), and a transient network or 5xx error logs a warning and
 continues, so a bucket outage cannot stop haybale from starting.
 
-> Implemented as: This release rejects a non-zero `staleIfErrorFor` outright.
-> `BuildCache(ctx, logger, metrics)` takes no upstream list. An explicit zero
-> size or count selects the default. Validation also requires `maxEntrySize`
-> not above half of `maxDiskSize`, and `remote.region` is always required. The
-> startup probe is a `Get` of a random key under `v1/.probe/`, new at every
-> start so a bucket writer cannot plant it, rather than a `Stat`, because a
-> HEAD response has no body to tell a missing bucket from a missing object.
-> A not-found 404 passes, a 307, 308, 408 or 429 warns, and any other 3xx
-> or 4xx fails startup. A credential-chain failure that can pass (a
-> timeout, a send failure, or a provider answering 5xx or 429) warns, while
-> a chain that finds no provider or is refused fails startup. With
+> Implemented as: `BuildCache(ctx, logger, metrics)` takes no upstream list.
+> An explicit zero size or count selects the default. Validation also requires
+> `maxEntrySize` not above half of `maxDiskSize`, and `remote.region` is
+> always required. The startup probe is a `Get` of a random key under
+> `v1/.probe/`, new at every start so a bucket writer cannot plant it, rather
+> than a `Stat`, because a HEAD response has no body to tell a missing bucket
+> from a missing object. A not-found 404 passes, a 307, 308, 408 or 429 warns,
+> and any other 3xx or 4xx fails startup. A credential-chain failure that can
+> pass (a timeout, a send failure, or a provider answering 5xx or 429) warns,
+> while a chain that finds no provider or is refused fails startup. With
 > `headerTimeout: 0s` the sealed-header read is bounded by `idleTimeout`,
 > and the deletions after a push, after a failed verification and after a
 > refs upload that a push superseded by one minute.

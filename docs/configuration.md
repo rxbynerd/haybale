@@ -458,6 +458,7 @@ cache:
   responseHeaderTimeout: 60s       # optional, default shown
   idleTimeout: 2m                  # optional, default shown
   exposeStatus: false              # optional, default shown
+  staleIfErrorFor: 0s              # optional, default shown; 0s disables stale-if-error
 ```
 
 The `cache` block turns on a response cache for Git smart HTTP reads
@@ -495,7 +496,7 @@ the block is rejected as an unknown field.
 | `idleTimeout`           | `2m`     | Go duration string bounding the gap between body bytes from the upstream during a cache fill. `0s` leaves the gap unbounded. Does not affect requests that bypass the cache. |
 | `exposeStatus`          | `false`  | Emits a `Cache-Status` response header describing how the cache handled the request. See [Cache-Status](security.md#cache-status-disclosure). |
 | `remote`                | (unset)  | Optional remote tier that replicas share, in an S3-compatible bucket. Requires `keyEnv`. See "Remote tier". |
-| `staleIfErrorFor`       | (unset)  | Reserved for a later release; fails startup unless empty or `0s`. See "Reserved field".                  |
+| `staleIfErrorFor`       | `0s`     | Go duration string: the maximum age of an entry served when the upstream cannot answer a read (stale-if-error). `0s` or empty disables it. Must not exceed `retention`. **Serves possibly outdated content; read "Stale-if-error" before setting it.** |
 
 ### Sizes and durations
 
@@ -509,8 +510,8 @@ and so selects the default. Any other bare integer (`1073741824`), an SI unit
 can never be misread by a factor of 1024.
 
 Durations (`retention`, `refsMaxAge`, `accessRecheck`,
-`responseHeaderTimeout`, `idleTimeout`) are Go duration strings such as `30s`
-or `24h` and must not be negative.
+`responseHeaderTimeout`, `idleTimeout`, `staleIfErrorFor`) are Go duration
+strings such as `30s` or `24h` and must not be negative.
 
 ### Validation
 
@@ -518,17 +519,19 @@ Validation of the `cache` block is structural: it checks that no key is
 unknown, the syntax of every size and duration, that `dir` is set, that
 `retention` is greater than zero, that `maxEntrySize` does not exceed half of
 `maxDiskSize`, that `refsMaxAge` is less than `accessRecheck` when both are
-non-zero, and, when `remote` is set, the remote fields and that `keyEnv` is set
-(see "Remote tier"). An explicit `0` for `maxDiskSize`, `maxEntrySize`,
-`maxConcurrentFills` or `maxRequestBody` is replaced by the default before
-validation. Negative and malformed values fail startup.
+non-zero, that `staleIfErrorFor` does not exceed `retention`, and, when `remote`
+is set, the remote fields and that `keyEnv` is set (see "Remote tier"). An
+explicit `0` for `maxDiskSize`, `maxEntrySize`, `maxConcurrentFills` or
+`maxRequestBody` is replaced by the default before validation. Negative and malformed values fail startup.
 
 A `maxEntrySize` above half of `maxDiskSize` fails with `cache: maxEntrySize
 <size> must not exceed half of maxDiskSize <size>`, because a fill reserves its
 sealed size before it starts. The `refsMaxAge` rule exists because a refs
 response served from the cache does not renew the upstream access check that
 cached packs depend on; with `refsMaxAge` at or above `accessRecheck`, packs
-would stop being served while refs were still cached.
+would stop being served while refs were still cached. A `staleIfErrorFor` above
+`retention` fails with `cache: staleIfErrorFor "<value>" must not exceed
+retention "<value>"`, because no entry is kept longer than `retention`.
 
 Validation does not touch the filesystem, the network or the environment, so
 `haybale policy check` stays offline when a cache block is present, with or
@@ -840,13 +843,30 @@ S3; the granularity of other stores is not verified. Server-side encryption is
 optional defence in depth: the entries are already encrypted and authenticated
 under the cache key.
 
-### Reserved field
+### Stale-if-error
 
-`staleIfErrorFor` is reserved for a later release and **fails startup if set**
-in this release. It is intended to serve an older entry when the upstream is
-unavailable. Only an empty value or a zero duration such as `0s` is accepted;
-any other value is rejected with `cache: staleIfErrorFor is not supported in
-this release (got "..."); leave it empty or "0s"`.
+`staleIfErrorFor` lets haybale answer a read from a stored entry up to that old
+when the upstream cannot answer it: the connection to the upstream fails, the
+credential source cannot reach its API, no response headers arrive within
+`responseHeaderTimeout`, or the upstream answers `500`, `502`, `503` or `504`.
+It is off by default.
+
+**The risk.** A client served stale receives the repository as it was when the
+entry was stored, with nothing in git's output to say so. That clone can lack a
+security fix pushed since, and can still contain a reverted commit or a secret
+that a history rewrite removed. It also lets haybale keep serving a repository
+for up to `staleIfErrorFor` after its own upstream access was revoked, while
+the upstream is failing. Choose the shortest value that covers the outages the
+workloads must ride out, and run `haybale cache purge` after any history
+rewrite. The [security model](security.md#stale-if-error) states exactly what
+can and cannot trigger stale service, and the [caching
+guide](caching.md#serving-through-an-upstream-outage) describes what an outage
+clone can do and the health gate that keeps requests from waiting out a
+connection timeout.
+
+Every stale response is logged as a `cache_stale_served` security event, and
+the `response cache enabled` startup line reports the configured
+`staleIfErrorFor`.
 
 ## Worked example
 

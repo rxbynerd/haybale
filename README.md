@@ -20,8 +20,9 @@ client.
 - streaming Git smart-HTTP proxying with no pack-size limit
 - an optional, encrypted on-disk response cache that serves the pack transfer
   of repeated identical clones and fetches from disk instead of fetching it
-  from the upstream again, and can share entries between replicas through an
-  S3-compatible bucket
+  from the upstream again, can share entries between replicas through an
+  S3-compatible bucket, and can optionally answer repeated clones from stored
+  entries while the upstream is down
 - TLS, graceful draining, structured security logs, and optional OpenTelemetry
   traces, metrics, and logs
 
