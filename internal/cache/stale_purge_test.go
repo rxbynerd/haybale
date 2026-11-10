@@ -388,6 +388,121 @@ func TestProbeWithoutACurrentMarkerCheckWaitsForUpstream(t *testing.T) {
 	}
 }
 
+// TestAHeldRequestWhoseClientLeftStartsNoFill: a held request whose client
+// leaves while it waits for the purge marker read ends there, without
+// starting a fill or contacting the upstream.
+func TestAHeldRequestWhoseClientLeftStartsNoFill(t *testing.T) {
+	store := newMemBlobStore()
+	c, clock, _ := newRemoteStaleReplica(t, store)
+	if out, handled, _ := serve(c, newCollectWriter(), otherFetchRequest(t), &failing{err: errDialRefused}); handled {
+		t.Fatalf("refused fetch without an entry = %+v, want a release", out)
+	}
+	if _, err := purgeRemote(store, c.keyring, bothGroups, clock.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	markerRead := make(chan struct{})
+	defer close(markerRead)
+	store.set(func(m *memBlobStore) {
+		m.wrapBody = func(ctx context.Context, key string, _ int64, body io.Reader) io.Reader {
+			if strings.HasPrefix(key, purgePrefix) {
+				select {
+				case <-markerRead:
+				case <-ctx.Done():
+				}
+			}
+			return body
+		}
+	})
+	clock.Advance(markerCheckInterval(c.opts.AccessRecheck))
+	before := store.count("get", purgePrefix)
+	ctx, cancel := context.WithCancel(context.Background())
+	r := fetchRequest(t).WithContext(ctx)
+	untouched := &failing{err: errDialRefused}
+	done := make(chan served, 1)
+	go func() {
+		out, handled, _ := serve(c, newCollectWriter(), r, untouched)
+		done <- served{out: out, handled: handled}
+	}()
+	waitFor(t, "the marker read to start", func() bool { return store.count("get", purgePrefix)-before == 1 })
+	cancel()
+	res := receive(t, done, "the request whose client left")
+	if !res.handled || res.out.Result == observability.ResultStale {
+		t.Errorf("request whose client left = %+v handled %v, want it ended unanswered", res.out, res.handled)
+	}
+	if untouched.count() != 0 {
+		t.Errorf("upstream requests = %d, want none", untouched.count())
+	}
+	c.mu.Lock()
+	fills := len(c.fills)
+	c.mu.Unlock()
+	if fills != 0 {
+		t.Errorf("fills in flight = %d, want none", fills)
+	}
+}
+
+// TestAJoinerWithoutACurrentMarkerCheckIsNotServedFromTheProbe: once a
+// probe's deadline has answered its client stale, a later request for the
+// same key whose own purge marker check fails is not served that stale
+// answer by joining the probe's fill; it fails closed with the upstream's
+// answer.
+func TestAJoinerWithoutACurrentMarkerCheckIsNotServedFromTheProbe(t *testing.T) {
+	faults := map[string]func(c *Cache, store *memBlobStore){
+		"marker read fails": func(_ *Cache, store *memBlobStore) {
+			store.set(func(m *memBlobStore) {
+				m.getHook = func(key string, _ int64) error {
+					if strings.HasPrefix(key, purgePrefix) {
+						return errors.New("memblob: 503 SlowDown")
+					}
+					return nil
+				}
+			})
+		},
+		"marker fails verification": func(c *Cache, store *memBlobStore) {
+			store.set(func(m *memBlobStore) { m.objects[markerKey(c)] = memObject{data: []byte("not a sealed marker")} })
+		},
+	}
+	for name, fault := range faults {
+		t.Run(name, func(t *testing.T) {
+			const interval = 50 * time.Millisecond
+			store := newMemBlobStore()
+			c, clock, logs := newRemoteStaleReplica(t, store)
+			c.gates.interval = interval
+			if out, handled, _ := serve(c, newCollectWriter(), otherFetchRequest(t), &failing{err: errDialRefused}); handled {
+				t.Fatalf("refused fetch without an entry = %+v, want a release", out)
+			}
+			clock.Advance(interval)
+			deadlines := probeDeadlines(c)
+			hang := newHangingFetch()
+			defer close(hang.release)
+			probeDone := make(chan Outcome, 1)
+			probeReq := fetchRequest(t)
+			go func() {
+				out, _, _ := serve(c, newCollectWriter(), probeReq, hang)
+				probeDone <- out
+			}()
+			if !awaitDeadline(t, deadlines) {
+				t.Fatal("the deadline did not answer the probe stale")
+			}
+			if out := receive(t, probeDone, "the probe's client"); out.Result != observability.ResultStale {
+				t.Fatalf("probe = %+v, want stale", out)
+			}
+			staleBefore := len(logs.securityEvents(t, security.EventCacheStaleServed))
+
+			fault(c, store)
+			clock.Advance(markerCheckInterval(c.opts.AccessRecheck))
+			if !gateProbing(c) {
+				t.Fatal("the probe ended before the later request")
+			}
+			if out, _, _ := serve(c, newCollectWriter(), fetchRequest(t), &failing{status: 503}); out.Result != observability.ResultMiss || out.Status != 503 {
+				t.Errorf("later request without a current marker check = %+v, want the shared 503", out)
+			}
+			if n := len(logs.securityEvents(t, security.EventCacheStaleServed)) - staleBefore; n != 0 {
+				t.Errorf("stale events after the fault = %d, want none", n)
+			}
+		})
+	}
+}
+
 // TestSharedMarkerReadOutlivesALeaderThatLeaves: a held request that
 // leads the purge marker read and then disconnects neither cuts the read
 // short nor fails it for a refs fill waiting on the same read, which still

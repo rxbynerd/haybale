@@ -666,6 +666,37 @@ func TestHealthGateAdmitsTheNextProbeAfterAFailedOrLeftOne(t *testing.T) {
 	}
 }
 
+// countingBody is an endless response body that counts the bytes read
+// from it and records whether it was closed.
+type countingBody struct {
+	mu     sync.Mutex
+	n      int
+	closed bool
+}
+
+func (b *countingBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return 0, io.ErrClosedPipe
+	}
+	b.n += len(p)
+	return len(p), nil
+}
+
+func (b *countingBody) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.closed = true
+	return nil
+}
+
+func (b *countingBody) state() (int, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.n, b.closed
+}
+
 // gateProbing reports whether testRepo's host has a probe in flight.
 func gateProbing(c *Cache) bool {
 	c.gates.mu.Lock()
@@ -714,15 +745,21 @@ func TestHealthGateProbeDeadline(t *testing.T) {
 		return sumWhere(t, h.reader, "haybale.response_cache.fills.total", nil)
 	}
 
-	t.Run("a late answer closes the gate after the client was answered stale", func(t *testing.T) {
+	t.Run("a late answer closes the gate and is discarded with no client attached", func(t *testing.T) {
 		h := setup(t, nil)
 		storedBefore := fillsWithReason(t, h.reader, observability.FillResultStored, "")
+		discardedBefore := fillsWithReason(t, h.reader, observability.FillResultDiscarded, observability.FillReasonFetchError)
+		var decided atomic.Bool
+		h.c.hooks.afterDecision = func(entryKey) { decided.Store(true) }
 		release := make(chan struct{})
 		cancelled := make(chan error, 1)
+		body := &countingBody{}
 		late := fetchFunc(func(ctx context.Context, _ Request) (*http.Response, error) {
 			select {
 			case <-release:
-				return response(http.StatusOK, contentTypeResult, h.pack), nil
+				resp := response(http.StatusOK, contentTypeResult, nil)
+				resp.Body, resp.ContentLength = body, 512<<20
+				return resp, nil
 			case <-ctx.Done():
 				cancelled <- ctx.Err()
 				return nil, ctx.Err()
@@ -751,13 +788,77 @@ func TestHealthGateProbeDeadline(t *testing.T) {
 		}
 		close(release)
 		waitFor(t, "the late answer to close the gate", func() bool { return len(h.logs.records(t, gateClosedMsg)) == 1 })
+		waitFor(t, "the probe's fill to end", func() bool { return len(h.c.slots) == 0 })
+		if n, closed := body.state(); n != 0 || !closed {
+			t.Errorf("late body: read %d bytes, closed %v; want it closed unread", n, closed)
+		}
+		if decided.Load() {
+			t.Error("the late answer was spooled")
+		}
 		assertStoreIdle(t, h.c)
-		if n := fillsWithReason(t, h.reader, observability.FillResultStored, "") - storedBefore; n != 1 {
-			t.Errorf("stored fills = %d, want the late answer stored once", n)
+		if n := fillsWithReason(t, h.reader, observability.FillResultStored, "") - storedBefore; n != 0 {
+			t.Errorf("stored fills = %d, want none", n)
+		}
+		if n := fillsWithReason(t, h.reader, observability.FillResultDiscarded, observability.FillReasonFetchError) - discardedBefore; n != 1 {
+			t.Errorf("discarded fills = %d, want the late answer counted once", n)
+		}
+		if h.c.marks.marked(entryKeyFor(t, h.c, fetchRequest(t)), h.c.now()) {
+			t.Error("the discarded late answer marked its key")
 		}
 		if h.c.gates.held(testRepo.Host, h.c.now()) {
 			t.Error("the gate still holds requests after the late answer")
 		}
+	})
+
+	t.Run("requests after the gate closed do not join the probe's fill", func(t *testing.T) {
+		h := setup(t, nil)
+		deadlines := probeDeadlines(h.c)
+		pr, pw := io.Pipe()
+		defer func() { _ = pw.Close() }()
+		release := make(chan struct{})
+		streaming := fetchFunc(func(ctx context.Context, _ Request) (*http.Response, error) {
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			resp := response(http.StatusOK, contentTypeResult, nil)
+			resp.Body, resp.ContentLength = pr, -1
+			return resp, nil
+		})
+		// The probe's client is still reading its stale answer, so the fill
+		// keeps a subscriber and streams the upstream body.
+		w := newGatedWriter()
+		probeReq := fetchRequest(t)
+		probeDone := make(chan Outcome, 1)
+		go func() {
+			out, _, _ := serve(h.c, w, probeReq, streaming)
+			probeDone <- out
+		}()
+		if !awaitDeadline(t, deadlines) {
+			t.Fatal("the deadline did not answer the probe stale")
+		}
+		receive(t, w.writing, "the stale answer to start")
+		close(release)
+		waitFor(t, "the probe's 200 to close the gate", func() bool { return len(h.logs.records(t, gateClosedMsg)) == 1 })
+
+		upstream := packFetcher(h.pack)
+		for i := range 3 {
+			out, _, _ := serve(h.c, newCollectWriter(), fetchRequest(t), upstream)
+			if out.Result == observability.ResultStale || out.Collapsed {
+				t.Errorf("request %d after the gate closed = %+v, want its own upstream answer", i, out)
+			}
+		}
+		if n := upstream.calls.Load(); n != 3 {
+			t.Errorf("upstream requests = %d, want one per later request", n)
+		}
+		_, _ = pw.Write(h.pack)
+		_ = pw.Close()
+		close(w.open)
+		if out := receive(t, probeDone, "the probe"); out.Result != observability.ResultStale {
+			t.Errorf("probe = %+v, want stale", out)
+		}
+		assertStoreIdle(t, h.c)
 	})
 
 	t.Run("a sequential client is answered stale while the probe runs", func(t *testing.T) {

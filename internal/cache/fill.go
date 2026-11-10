@@ -272,7 +272,17 @@ func (f *fill) perform() {
 	}
 	res := classifyStatus(upstreamStatus(resp))
 	f.reportHealth(res, started)
+	probed := probing
 	endProbe()
+	// A probe that no client holds any longer has told the gate what it
+	// needed; its body is not read, so it reserves and evicts nothing.
+	if probed && f.abandonIfUnheld() {
+		_ = resp.Body.Close()
+		done()
+		f.logger().Debug("probe ended with no subscriber; its response is discarded")
+		f.release(observability.FillReasonFetchError, 0)
+		return
+	}
 	body := newIdleReader(resp.Body, f.c.opts.IdleTimeout, f.cancel)
 	// Closing the body stops its idle timer, which would otherwise cancel
 	// the fill while it serves a stale entry instead.
@@ -401,12 +411,12 @@ func (f *fill) reportHealth(res upstreamResult, started time.Time) {
 }
 
 // answerAtProbeDeadline runs beside a probe's upstream request until stop
-// is closed, then closes exited. Once the probe interval has passed and
-// the repository's purge state is known current, it answers the fill's
-// subscribers from the key's qualifying tier-1 entry with reason
-// health_gate. The upstream request carries on either way, so its result
-// still reaches the gate and the fill continues as one without
-// subscribers.
+// is closed, then closes exited. Once the probe interval has passed, if
+// no response headers have arrived and the repository's purge state is
+// known current, it answers the fill's subscribers from the key's
+// qualifying tier-1 entry with reason health_gate and unregisters the
+// fill. The upstream request carries on either way, so its result still
+// reaches the gate.
 func (f *fill) answerAtProbeDeadline(stop <-chan struct{}, exited chan<- struct{}) {
 	defer close(exited)
 	defer func() {
@@ -432,10 +442,37 @@ func (f *fill) answerAtProbeDeadline(stop <-chan struct{}, exited chan<- struct{
 	}
 	released := fillOutcome{kind: fillReleased}
 	st := &staleService{reason: staleReasonHealthGate, fallback: released}
-	if f.purge.current && f.tier1Stale(st) {
+	if f.purge.current && f.headerCut.Load() == headerCutNone && f.tier1Stale(st) {
 		f.publishStale(st, released)
+		f.unregister()
 		answered = true
 	}
+}
+
+// unregister removes a shared fill from Cache.fills, so later requests
+// for its key no longer join it: once a probe's subscribers have been
+// answered stale, a later request is held by the gate or starts its own
+// fill, and never inherits that answer.
+func (f *fill) unregister() {
+	c := f.c
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if f.shared && c.fills[f.key] == f {
+		delete(c.fills, f.key)
+	}
+}
+
+// abandonIfUnheld reports whether no subscriber holds the fill any longer,
+// and if so marks it abandoned, so that finishing it marks nothing.
+func (f *fill) abandonIfUnheld() bool {
+	c := f.c
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if f.subscribers > 0 || f.ended {
+		return false
+	}
+	f.abandoned.Store(true)
+	return true
 }
 
 // setProbing records whether the fill is its host's probe. Once the probe

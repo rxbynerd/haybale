@@ -178,9 +178,10 @@ type fillHooks struct {
 	// beforeStaleOutcome runs in a fill that has found a qualifying
 	// tier-1 entry, before it tells its subscribers to serve it.
 	beforeStaleOutcome func(key entryKey)
-	// afterProbeDeadline runs beside a probe once its deadline has passed
-	// and the purge state is known, reporting whether its subscribers were
-	// answered stale.
+	// afterProbeDeadline runs beside a probe once its deadline has passed,
+	// reporting whether its subscribers were answered stale; answered is
+	// also false when the probe ended while its purge check was still
+	// outstanding.
 	afterProbeDeadline func(key entryKey, answered bool)
 }
 
@@ -349,6 +350,9 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo
 		if out, ok := c.serveHeld(w, r, key, repo, class, identity, release, false); ok {
 			return out, true
 		}
+		if r.Context().Err() != nil {
+			return Outcome{Result: observability.ResultMiss}, true
+		}
 		f, ok := c.startSingle(key, req, repo, baseURL, fetch)
 		if !ok {
 			if out, ok := c.serveHeld(w, r, key, repo, class, identity, release, true); ok {
@@ -368,6 +372,11 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo
 	}
 	if out, ok := c.serveHeld(w, r, key, repo, class, identity, release, false); ok {
 		return out, true
+	}
+	// A client that left while the held path waited for the purge marker
+	// starts no fill and cannot become the probe.
+	if r.Context().Err() != nil {
+		return Outcome{Result: observability.ResultMiss}, true
 	}
 	// A stored entry that fails verification before any byte is written
 	// has been deleted, so the request joins or starts a fill instead; a

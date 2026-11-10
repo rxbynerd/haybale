@@ -833,7 +833,8 @@ func (c *Cache) dropPurged(repoHash [32]byte, times purgeTimes) int {
 	return n
 }
 
-// purgeCheck is a purge marker check running alongside a refs fill.
+// purgeCheck is a purge marker check running alongside the upstream
+// request of a refs fill or a gate probe.
 // current is valid once done is closed.
 type purgeCheck struct {
 	done    chan struct{}
