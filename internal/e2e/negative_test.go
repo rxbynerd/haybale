@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -122,10 +124,12 @@ func TestPolicyDeniedRepoCloneFailsWith404(t *testing.T) {
 	clientEnv := isolatedGitEnv(t.TempDir())
 	cloneDir := filepath.Join(t.TempDir(), "clone")
 	out := runGitExpectError(t, gitPath, t.TempDir(), clientEnv, "clone", "--quiet", cloneURL, cloneDir)
-	if !strings.Contains(out, "404") {
+	// The clone URL carries a random loopback port, so the status codes
+	// are matched as whole words rather than as substrings.
+	if !httpStatusWord(404).MatchString(out) {
 		t.Errorf("git clone output = %q, want it to mention HTTP 404", out)
 	}
-	if strings.Contains(out, "403") {
+	if httpStatusWord(403).MatchString(out) {
 		t.Errorf("git clone output = %q, must never mention HTTP 403 — policy denial must look like a 404, not a 403", out)
 	}
 }
@@ -272,4 +276,10 @@ func TestReadOnlyIdentityCanCloneButNotPush(t *testing.T) {
 	if gotAfter != wantSHA {
 		t.Errorf("bare repo HEAD after denied push = %s, want unchanged %s", gotAfter, wantSHA)
 	}
+}
+
+// httpStatusWord matches an HTTP status code appearing as a whole word in
+// git's output, so that digits inside a port number or a hash never match.
+func httpStatusWord(code int) *regexp.Regexp {
+	return regexp.MustCompile(`\b` + strconv.Itoa(code) + `\b`)
 }
