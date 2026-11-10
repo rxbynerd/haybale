@@ -1,0 +1,210 @@
+package s3store
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+
+	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
+
+	"github.com/rxbynerd/haybale/internal/cache"
+)
+
+// ErrTooLarge is returned by Put for an object larger than the 5 GiB
+// limit of a single PutObject request. No request is sent. It is
+// cache.ErrTooLarge, so the cache can recognise it without importing this
+// package.
+var ErrTooLarge = cache.ErrTooLarge
+
+// errHeaderTimeout is the cancellation cause of a request whose response
+// did not arrive within Config.HeaderTimeout.
+var errHeaderTimeout = errors.New("s3store: header timeout")
+
+// Code is the error code of a failed Store operation: an S3 error code,
+// or one of the codes below that the store assigns when the service sent
+// none.
+type Code string
+
+// Codes the store assigns to failures that carry no service error code.
+const (
+	// CodeHeaderTimeout: no response within Config.HeaderTimeout.
+	CodeHeaderTimeout Code = "HeaderTimeout"
+	// CodeCanceled: the caller's context was cancelled.
+	CodeCanceled Code = "Canceled"
+	// CodeDeadline: the caller's deadline passed.
+	CodeDeadline Code = "DeadlineExceeded"
+	// CodeSendFailed: the request could not be sent, such as a dial error.
+	CodeSendFailed Code = "RequestSendFailed"
+	// CodeRequestFailed: any other failure without a service code.
+	CodeRequestFailed Code = "RequestFailed"
+	// CodeInvalidResponse: a response the store cannot use.
+	CodeInvalidResponse Code = "InvalidResponse"
+	// CodeNoCredentials: the credential chain found no provider or was
+	// refused.
+	CodeNoCredentials Code = "NoCredentials"
+	// CodeCredentialsUnavailable: a credential provider failed in a way
+	// that can pass (a timeout, a send failure, a 5xx or 429).
+	CodeCredentialsUnavailable Code = "CredentialsUnavailable"
+	// CodeTLSVerificationFailed: the server certificate did not verify.
+	CodeTLSVerificationFailed Code = "TLSVerificationFailed"
+)
+
+// S3 error codes the cache and its configuration act on.
+const (
+	CodeNoSuchKey                    Code = "NoSuchKey"
+	CodeNotFound                     Code = "NotFound"
+	CodeNoSuchBucket                 Code = "NoSuchBucket"
+	CodeAccessDenied                 Code = "AccessDenied"
+	CodeInvalidAccessKeyID           Code = "InvalidAccessKeyId"
+	CodeSignatureDoesNotMatch        Code = "SignatureDoesNotMatch"
+	CodePermanentRedirect            Code = "PermanentRedirect"
+	CodeAuthorizationHeaderMalformed Code = "AuthorizationHeaderMalformed"
+	CodeExpiredToken                 Code = "ExpiredToken"
+	CodeInvalidToken                 Code = "InvalidToken"
+)
+
+// Error is the error a Store operation returns when a request fails. It
+// holds only the operation, the object key (a hashed path) or list
+// prefix, the service error code and the HTTP status: never the SDK's
+// error text, request ids or credential material.
+//
+// errors.Is reports cache.ErrNotFound for a missing object,
+// cache.ErrObjectChanged for a failed If-Match condition,
+// context.DeadlineExceeded for a header timeout or caller deadline, and
+// context.Canceled for a cancelled caller context.
+type Error struct {
+	// Op is the operation: "stat", "get", "put", "delete" or "list".
+	Op string
+	// Key is the object key, or the prefix for "list", without the
+	// store prefix.
+	Key string
+	// Code is the S3 error code, such as CodeNoSuchKey or
+	// CodeAccessDenied, or a store-assigned code when the service sent
+	// none.
+	Code Code
+	// Status is the HTTP status of the response, or 0 when none arrived.
+	Status int
+
+	sentinel error
+}
+
+// Error formats e as "s3store: <op> <key>: <code> (HTTP <status>)",
+// omitting the status when no response arrived.
+func (e *Error) Error() string {
+	if e.Status == 0 {
+		return fmt.Sprintf("s3store: %s %s: %s", e.Op, e.Key, e.Code)
+	}
+	return fmt.Sprintf("s3store: %s %s: %s (HTTP %d)", e.Op, e.Key, e.Code, e.Status)
+}
+
+// Unwrap returns the sentinel e matches, or nil.
+func (e *Error) Unwrap() error { return e.sentinel }
+
+// wrapError converts an SDK error from op on key into an *Error. ctx is
+// the request context, whose cancellation cause distinguishes a header
+// timeout from the caller's own cancellation.
+func wrapError(ctx context.Context, op, key string, err error) error {
+	e := &Error{Op: op, Key: key}
+	var statusErr interface{ HTTPStatusCode() int }
+	if errors.As(err, &statusErr) {
+		e.Status = statusErr.HTTPStatusCode()
+	}
+	var apiErr smithy.APIError
+	var sendErr *smithyhttp.RequestSendError
+	switch {
+	case errors.Is(context.Cause(ctx), errHeaderTimeout):
+		e.Code, e.sentinel = CodeHeaderTimeout, context.DeadlineExceeded
+	case errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded):
+		e.Code, e.sentinel = CodeDeadline, context.DeadlineExceeded
+	case errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled):
+		e.Code, e.sentinel = CodeCanceled, context.Canceled
+	case isCredentialsError(err) && transientCredentialsError(err, e.Status):
+		e.Code, e.Status = CodeCredentialsUnavailable, 0
+	case isCredentialsError(err):
+		e.Code, e.Status = CodeNoCredentials, 0
+	case isTLSVerificationError(err):
+		e.Code, e.Status = CodeTLSVerificationFailed, 0
+	case errors.As(err, &apiErr) && apiErr.ErrorCode() != "":
+		e.Code = Code(apiErr.ErrorCode())
+	case errors.As(err, &sendErr):
+		e.Code = CodeSendFailed
+	default:
+		e.Code = CodeRequestFailed
+	}
+	switch {
+	case isNotFound(e):
+		e.sentinel = cache.ErrNotFound
+	case e.Status == 412:
+		e.sentinel = cache.ErrObjectChanged
+	}
+	return e
+}
+
+// isCredentialsError reports whether err is a failure to obtain
+// credentials, which credentialsProvider marks.
+func isCredentialsError(err error) bool {
+	var ce *credentialsError
+	return errors.As(err, &ce)
+}
+
+// transientCredentialsError reports whether a credential-chain failure
+// with HTTP status (0 when none) can pass: a network timeout, a request
+// that could not be sent, or a provider answering 5xx or 429.
+func transientCredentialsError(err error, status int) bool {
+	var netErr net.Error
+	var sendErr *smithyhttp.RequestSendError
+	switch {
+	case errors.As(err, &netErr) && netErr.Timeout():
+		return true
+	case errors.As(err, &sendErr):
+		return true
+	default:
+		return status >= 500 || status == http.StatusTooManyRequests
+	}
+}
+
+// isTLSVerificationError reports whether err is a server certificate that
+// failed verification.
+func isTLSVerificationError(err error) bool {
+	var (
+		verifyErr    *tls.CertificateVerificationError
+		authorityErr x509.UnknownAuthorityError
+		hostnameErr  x509.HostnameError
+		invalidErr   x509.CertificateInvalidError
+	)
+	return errors.As(err, &verifyErr) || errors.As(err, &authorityErr) ||
+		errors.As(err, &hostnameErr) || errors.As(err, &invalidErr)
+}
+
+// credentialsError marks an error from the SDK's credential chain, which
+// the SDK otherwise reports as untyped text.
+type credentialsError struct{ err error }
+
+func (e *credentialsError) Error() string { return e.err.Error() }
+
+func (e *credentialsError) Unwrap() error { return e.err }
+
+// isNotFound reports whether e is the service saying the object does not
+// exist. An error body names a missing bucket NoSuchBucket, which is not
+// a miss; a HEAD response has no body, so its 404 is a miss whether the
+// key or the bucket is missing.
+func isNotFound(e *Error) bool {
+	switch e.Code {
+	case CodeNoSuchKey:
+		return true
+	case CodeNotFound:
+		return e.Status == 404
+	default:
+		return false
+	}
+}
+
+// responseError reports a response the store cannot use.
+func responseError(op, key string, status int) error {
+	return &Error{Op: op, Key: key, Code: CodeInvalidResponse, Status: status}
+}

@@ -214,7 +214,7 @@ func TestNewResponseCacheDisabled(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
-	c, opts, err := newResponseCache(cfg, discardLogger(), observability.NewNoopMetrics())
+	c, opts, err := newResponseCache(context.Background(), cfg, discardLogger(), observability.NewNoopMetrics())
 	if err != nil {
 		t.Fatalf("newResponseCache: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestNewResponseCacheEnabled(t *testing.T) {
 
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
-	c, opts, err := newResponseCache(cfg, logger, observability.NewNoopMetrics())
+	c, opts, err := newResponseCache(context.Background(), cfg, logger, observability.NewNoopMetrics())
 	if err != nil {
 		t.Fatalf("newResponseCache: %v", err)
 	}

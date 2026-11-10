@@ -5,13 +5,19 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
+	"github.com/spf13/cobra"
+
 	"github.com/rxbynerd/haybale/internal/cache"
+	"github.com/rxbynerd/haybale/internal/cache/s3store/s3fake"
 	"github.com/rxbynerd/haybale/internal/gitproto"
 )
 
@@ -242,11 +248,11 @@ func TestRunCachePurgeErrors(t *testing.T) {
 		makeDir  bool
 	}{
 		{
-			name:     "remote tier",
+			name:     "remote tier not configured",
 			keyValue: validKey,
 			repo:     "github.com/acme/widgets",
 			remote:   true,
-			wantErr:  "not supported in this release",
+			wantErr:  "--remote: cache.remote is not configured",
 		},
 		{
 			name:     "bad group",
@@ -396,5 +402,250 @@ func TestCachePurgeCommandWiredIntoRootCmd(t *testing.T) {
 		if cachePurgeTestExists(dir, rel) {
 			t.Errorf("%s still exists after purge", rel)
 		}
+	}
+}
+
+// cachePurgeRemoteBlock is an enabled cache block on dir whose remote tier
+// is fake's bucket under the "tenant/" prefix.
+func cachePurgeRemoteBlock(dir string, fake *s3fake.Server) string {
+	return "cache:\n  enabled: true\n  dir: " + dir + "\n  keyEnv: " + cachePurgeTestKeyEnv + "\n" +
+		"  remote:\n    type: s3\n    bucket: " + s3fake.Bucket + "\n    prefix: tenant/\n    region: us-east-1\n" +
+		"    endpoint: " + fake.URL() + "\n    forcePathStyle: true\n"
+}
+
+// newPurgeTestCommand returns a command with its stdout and stderr
+// captured.
+func newPurgeTestCommand() (*cobra.Command, *bytes.Buffer, *bytes.Buffer) {
+	cmd := &cobra.Command{}
+	var stdout, stderr bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	return cmd, &stdout, &stderr
+}
+
+// remotePurgeFixture is a remote-configured purge setup: two local pack
+// entries and remote refs and pack entries for acme/widgets, and a remote
+// pack entry for acme/gadgets that must survive.
+type remotePurgeFixture struct {
+	fake     *s3fake.Server
+	dir      string
+	cfgPath  string
+	widgets  string
+	local    []string
+	survivor string
+}
+
+func newRemotePurgeFixture(t *testing.T, dir string) *remotePurgeFixture {
+	t.Helper()
+	s3fake.IsolateAWSEnv(t)
+	fake := s3fake.New(t)
+	key := cachePurgeTestKey(t)
+	t.Setenv(cachePurgeTestKeyEnv, base64.StdEncoding.EncodeToString(key))
+	f := &remotePurgeFixture{
+		fake:    fake,
+		dir:     dir,
+		cfgPath: cachePurgeTestConfig(t, cachePurgeRemoteBlock(dir, fake)),
+		widgets: cachePurgeTestRepoHash(t, key, "acme", "widgets"),
+	}
+	if _, err := os.Stat(dir); err == nil {
+		f.local = cachePurgeTestPlace(t, dir, "pack", f.widgets, 2)
+	}
+	entry := strings.Repeat("e", 64)
+	fake.PutObject("tenant/v1/refs/"+f.widgets+"/"+entry, []byte("sealed"))
+	fake.PutObject("tenant/v1/pack/"+f.widgets+"/"+entry, []byte("sealed"))
+	f.survivor = "tenant/v1/pack/" + cachePurgeTestRepoHash(t, key, "acme", "gadgets") + "/" + entry
+	fake.PutObject(f.survivor, []byte("sealed"))
+	return f
+}
+
+func (f *remotePurgeFixture) markerKey() string { return "tenant/v1/purge/" + f.widgets }
+
+// remoteEntries returns the widgets entries left in the bucket.
+func (f *remotePurgeFixture) remoteEntries() []string {
+	var out []string
+	for k := range f.fake.Objects() {
+		if strings.Contains(k, f.widgets) && k != f.markerKey() {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+func TestRunCachePurgeRemote(t *testing.T) {
+	f := newRemotePurgeFixture(t, cachePurgeTestDir(t))
+	var order []string
+	var mu sync.Mutex
+	f.fake.Intercept(func(_ http.ResponseWriter, r *http.Request) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/v1/purge/"):
+			order = append(order, "marker")
+		case r.Method == http.MethodDelete:
+			step := "delete"
+			if cachePurgeTestExists(f.dir, f.local[0]) {
+				step += " with local entries present"
+			}
+			order = append(order, step)
+		}
+		return false
+	})
+
+	cmd, stdout, stderr := newPurgeTestCommand()
+	if err := runCachePurge(cmd, f.cfgPath, "github.com/acme/widgets", "", true); err != nil {
+		t.Fatalf("runCachePurge() unexpected error: %v", err)
+	}
+	want := "wrote the purge marker and purged 2 entries from the remote tier\npurged 2 entries\n"
+	if out := stdout.String(); out != want {
+		t.Errorf("output = %q, want %q", out, want)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want nothing", stderr.String())
+	}
+	mu.Lock()
+	got := strings.Join(order, ", ")
+	mu.Unlock()
+	if want := "marker, delete with local entries present, delete with local entries present"; got != want {
+		t.Errorf("step order = %q, want %q", got, want)
+	}
+	if _, ok := f.fake.Objects()[f.markerKey()]; !ok {
+		t.Error("no purge marker was written")
+	}
+	if left := f.remoteEntries(); len(left) != 0 {
+		t.Errorf("remote entries %v survived the purge", left)
+	}
+	if _, ok := f.fake.Objects()[f.survivor]; !ok {
+		t.Error("another repository's remote entry was deleted")
+	}
+	for _, rel := range f.local {
+		if cachePurgeTestExists(f.dir, rel) {
+			t.Errorf("%s still exists after the purge", rel)
+		}
+	}
+}
+
+func TestRunCachePurgeRemoteWithoutALocalDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "absent")
+	f := newRemotePurgeFixture(t, dir)
+	cmd, stdout, stderr := newPurgeTestCommand()
+	if err := runCachePurge(cmd, f.cfgPath, "github.com/acme/widgets", "", true); err != nil {
+		t.Fatalf("runCachePurge() unexpected error: %v", err)
+	}
+	if want := "wrote the purge marker and purged 2 entries from the remote tier\n"; stdout.String() != want {
+		t.Errorf("output = %q, want %q", stdout.String(), want)
+	}
+	if !strings.Contains(stderr.String(), "does not exist") {
+		t.Errorf("stderr = %q, want a notice that cache.dir is missing", stderr.String())
+	}
+	if _, ok := f.fake.Objects()[f.markerKey()]; !ok {
+		t.Error("no purge marker was written")
+	}
+	if left := f.remoteEntries(); len(left) != 0 {
+		t.Errorf("remote entries %v survived the purge", left)
+	}
+}
+
+func TestRunCachePurgeRemoteOneGroupAtATime(t *testing.T) {
+	f := newRemotePurgeFixture(t, cachePurgeTestDir(t))
+	for _, group := range []string{"pack", "refs"} {
+		cmd, stdout, _ := newPurgeTestCommand()
+		if err := runCachePurge(cmd, f.cfgPath, "github.com/acme/widgets", group, true); err != nil {
+			t.Fatalf("runCachePurge(--group %s) unexpected error: %v", group, err)
+		}
+		if !strings.Contains(stdout.String(), "purged 1 entry from the remote tier") {
+			t.Errorf("--group %s output = %q, want one remote entry purged", group, stdout.String())
+		}
+	}
+	if left := f.remoteEntries(); len(left) != 0 {
+		t.Errorf("remote entries %v survived both purges", left)
+	}
+}
+
+func TestRunCachePurgeRemoteMarkerFailureDeletesNothing(t *testing.T) {
+	f := newRemotePurgeFixture(t, cachePurgeTestDir(t))
+	f.fake.Intercept(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/v1/purge/") {
+			s3fake.WriteError(w, http.StatusForbidden, "AccessDenied", "Access Denied")
+			return true
+		}
+		return false
+	})
+	cmd, stdout, _ := newPurgeTestCommand()
+	err := runCachePurge(cmd, f.cfgPath, "github.com/acme/widgets", "", true)
+	if err == nil || !strings.Contains(err.Error(), "nothing was deleted") || !strings.Contains(err.Error(), "AccessDenied (HTTP 403)") {
+		t.Fatalf("runCachePurge() error = %v, want the marker failure with nothing deleted", err)
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("output = %q, want nothing", stdout.String())
+	}
+	if left := f.remoteEntries(); len(left) != 2 {
+		t.Errorf("remote entries = %v, want both kept", left)
+	}
+	for _, rel := range f.local {
+		if !cachePurgeTestExists(f.dir, rel) {
+			t.Errorf("%s was deleted", rel)
+		}
+	}
+}
+
+func TestRunCachePurgeRemoteDeleteFailureStillPurgesLocally(t *testing.T) {
+	f := newRemotePurgeFixture(t, cachePurgeTestDir(t))
+	var deletes atomic.Int32
+	f.fake.Intercept(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == http.MethodDelete && deletes.Add(1) > 1 {
+			s3fake.WriteError(w, http.StatusForbidden, "AccessDenied", "Access Denied")
+			return true
+		}
+		return false
+	})
+	cmd, stdout, _ := newPurgeTestCommand()
+	err := runCachePurge(cmd, f.cfgPath, "github.com/acme/widgets", "", true)
+	if err == nil || !strings.Contains(err.Error(), "--remote: the purge marker was written, but purging the remote tier failed (1 entry deleted so far)") {
+		t.Fatalf("runCachePurge() error = %v, want the remote failure with the count so far", err)
+	}
+	if out := stdout.String(); out != "purged 2 entries\n" {
+		t.Errorf("output = %q, want the local step's line only", out)
+	}
+	if _, ok := f.fake.Objects()[f.markerKey()]; !ok {
+		t.Error("the purge marker is missing")
+	}
+	for _, rel := range f.local {
+		if cachePurgeTestExists(f.dir, rel) {
+			t.Errorf("%s still exists after the purge", rel)
+		}
+	}
+}
+
+func TestRunCachePurgeWarnsWithoutRemote(t *testing.T) {
+	f := newRemotePurgeFixture(t, cachePurgeTestDir(t))
+	cmd, stdout, stderr := newPurgeTestCommand()
+	if err := runCachePurge(cmd, f.cfgPath, "github.com/acme/widgets", "", false); err != nil {
+		t.Fatalf("runCachePurge() unexpected error: %v", err)
+	}
+	if out := stdout.String(); out != "purged 2 entries\n" {
+		t.Errorf("output = %q, want %q", out, "purged 2 entries\n")
+	}
+	if !strings.Contains(stderr.String(), "will refill the purged entries") || !strings.Contains(stderr.String(), "--remote") {
+		t.Errorf("stderr = %q, want the refill warning", stderr.String())
+	}
+	if len(f.fake.Requests()) != 0 {
+		t.Error("a purge without --remote reached the bucket")
+	}
+}
+
+func TestRunCachePurgeRemoteReportsAFailingBucket(t *testing.T) {
+	s3fake.IsolateAWSEnv(t)
+	fake := s3fake.New(t)
+	fake.Intercept(func(w http.ResponseWriter, _ *http.Request) bool {
+		s3fake.WriteError(w, http.StatusForbidden, "AccessDenied", "Access Denied")
+		return true
+	})
+	t.Setenv(cachePurgeTestKeyEnv, base64.StdEncoding.EncodeToString(cachePurgeTestKey(t)))
+	cfgPath := cachePurgeTestConfig(t, cachePurgeRemoteBlock(cachePurgeTestDir(t), fake))
+
+	cmd, _, _ := newPurgeTestCommand()
+	err := runCachePurge(cmd, cfgPath, "github.com/acme/widgets", "", true)
+	if err == nil || !strings.Contains(err.Error(), "--remote: write the purge marker") || !strings.Contains(err.Error(), "AccessDenied (HTTP 403)") {
+		t.Fatalf("runCachePurge() error = %v, want the remote failure reported with its code", err)
 	}
 }

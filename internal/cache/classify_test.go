@@ -129,7 +129,7 @@ func v0Body(t testing.TB, caps string) []byte {
 	return pkts(t, "want "+oidA+" "+caps+"\n", pktline.Flush, "done\n")
 }
 
-func wantKeyHash(class Class, protocol string, body []byte) [32]byte {
+func wantDigest(class Class, protocol string, body []byte) [32]byte {
 	return sha256.Sum256(append([]byte(string(class)+"\n"+protocol+"\n"), body...))
 }
 
@@ -222,8 +222,8 @@ func TestClassifyCapturedRequests(t *testing.T) {
 				t.Errorf("classify() upstream request shape = %q %q %q %q",
 					req.Method, req.Endpoint, req.ContentType, req.Accept)
 			}
-			if want := wantKeyHash(tt.class, tt.protocol, tt.canonical); req.KeyHash != want {
-				t.Errorf("KeyHash = %x, want %x", req.KeyHash, want)
+			if want := wantDigest(tt.class, tt.protocol, tt.canonical); req.Digest != want {
+				t.Errorf("Digest = %x, want %x", req.Digest, want)
 			}
 		})
 	}
@@ -244,14 +244,14 @@ func TestClassifyAdvertisement(t *testing.T) {
 			req.ContentType != "" || req.Accept != "*/*" {
 			t.Errorf("advertisement request = %+v", req)
 		}
-		if want := wantKeyHash(classAdvertisement, req.Protocol, nil); req.KeyHash != want {
-			t.Errorf("KeyHash = %x, want %x", req.KeyHash, want)
+		if want := wantDigest(classAdvertisement, req.Protocol, nil); req.Digest != want {
+			t.Errorf("Digest = %x, want %x", req.Digest, want)
 		}
 	}
 	if v0.Protocol != "" || v2.Protocol != "version=2" {
 		t.Errorf("protocols = %q and %q", v0.Protocol, v2.Protocol)
 	}
-	if v0.KeyHash == v2.KeyHash {
+	if v0.Digest == v2.Digest {
 		t.Error("v0 and v2 advertisements share a key")
 	}
 }
@@ -447,7 +447,7 @@ func TestClassifyGzipMatchesIdentity(t *testing.T) {
 			if bypass {
 				t.Fatalf("classify() bypassed with reason %q", reason)
 			}
-			if req.Class != classFetch || req.KeyHash != plain.KeyHash || !bytes.Equal(req.Body, plain.Body) {
+			if req.Class != classFetch || req.Digest != plain.Digest || !bytes.Equal(req.Body, plain.Body) {
 				t.Errorf("classify() = %+v, want the identity twin %+v", req, plain)
 			}
 		})
@@ -482,7 +482,7 @@ func TestClassifyIgnoresInformationalCapabilities(t *testing.T) {
 			if bypassA || bypassB {
 				t.Fatalf("classify() bypassed with reasons %q and %q", reasonA, reasonB)
 			}
-			if a.KeyHash != b.KeyHash || !bytes.Equal(a.Body, b.Body) {
+			if a.Digest != b.Digest || !bytes.Equal(a.Body, b.Body) {
 				t.Errorf("keys differ:\n%q\n%q", a.Body, b.Body)
 			}
 			if bytes.Contains(a.Body, []byte("agent=")) || bytes.Contains(a.Body, []byte("session-id=")) {
@@ -499,7 +499,7 @@ func TestClassifyKeyDistinguishesRequests(t *testing.T) {
 		if bypass {
 			t.Fatalf("classify() bypassed with reason %q", reason)
 		}
-		return req.KeyHash
+		return req.Digest
 	}
 	base := key(postV2(fetchBody(t, "want "+oidA+"\n", "want "+oidB+"\n", "done\n")))
 	others := map[string][32]byte{

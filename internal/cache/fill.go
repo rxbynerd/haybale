@@ -81,12 +81,16 @@ const (
 type fillOutcome struct {
 	kind        fillOutcomeKind
 	contentType string
-	status      int
-	header      http.Header
-	body        []byte
+	// tier is where a streaming fill's body comes from: TierUpstream or
+	// TierRemote.
+	tier   string
+	status int
+	header http.Header
+	body   []byte
 }
 
-// fill is one upstream round trip spooled on disk for its subscribers. Its
+// fill is one response spooled on disk for its subscribers, read from the
+// remote tier when it holds a usable copy and otherwise from upstream. Its
 // context derives from the cache's lifetime, not from any request, so it
 // outlives the subscriber that started it.
 type fill struct {
@@ -111,9 +115,15 @@ type fill struct {
 	outcomeOnce sync.Once
 	outcome     fillOutcome // valid once headerReady is closed
 	done        chan struct{}
-	stored      bool  // valid once done is closed
-	fetched     int64 // body bytes read from upstream; fill goroutine only
-	finished    bool  // the fill metric has been recorded; fill goroutine only
+	stored      bool // valid once done is closed
+	// The fields below belong to the fill goroutine. fetched counts body
+	// bytes read from source, the tier the body came from; createdAt is
+	// the creation time sealed into the entry's header; finished records
+	// that the fill metric has been recorded.
+	fetched   int64
+	source    string
+	createdAt time.Time
+	finished  bool
 
 	// seal guards the sealed writer, which the fill goroutine and the
 	// flush timer share.
@@ -152,6 +162,7 @@ func (c *Cache) newFill(key entryKey, req Request, repo gitproto.Repo, baseURL *
 		fetch:       fetch,
 		shared:      shared,
 		gen:         c.gens.current(key.RepoHash),
+		source:      observability.TierUpstream,
 		ctx:         ctx,
 		cancel:      cancel,
 		headerReady: make(chan struct{}),
@@ -178,6 +189,13 @@ func (f *fill) run() {
 }
 
 func (f *fill) perform() {
+	if f.remoteEligible() && f.fillFromRemote() {
+		return
+	}
+	// A refs fill from upstream renews the repository's access record, so
+	// the purge marker is checked first, alongside the upstream request.
+	purge := f.startPurgeCheck()
+	defer purge.wait()
 	resp, err := f.fetchHeaders()
 	if err != nil {
 		// The error is not logged: a credential source's error may carry
@@ -198,13 +216,15 @@ func (f *fill) perform() {
 		return
 	}
 	now := f.c.now()
-	if f.key.Group == GroupRefs {
+	// While the purge state is not known current, pack hits lapse within
+	// accessRecheck rather than outlive a purge on another replica.
+	if f.key.Group == GroupRefs && purge.wait() {
 		f.c.access.record(f.key.RepoHash, now)
 	}
 	if !f.openSpool(resp.ContentLength, now) {
 		return
 	}
-	f.setOutcome(fillOutcome{kind: fillStreaming, contentType: resp.Header.Get("Content-Type")})
+	f.setOutcome(fillOutcome{kind: fillStreaming, contentType: resp.Header.Get("Content-Type"), tier: observability.TierUpstream})
 	f.streamBody(resp.ContentLength, body)
 }
 
@@ -299,6 +319,7 @@ func (f *fill) openSpool(contentLength int64, now time.Time) bool {
 		return false
 	}
 	f.seal.w = sw
+	f.createdAt = now
 	return true
 }
 
@@ -376,6 +397,9 @@ func (f *fill) commit() {
 	f.stored = true
 	f.c.noteCommit()
 	f.finish(observability.FillResultStored, "", 0)
+	if f.c.remote != nil && f.source == observability.TierUpstream && f.c.uploadsGroup(f.key.Group) {
+		f.c.enqueueUpload(uploadJob{key: f.key, repo: f.repo, gen: f.gen, createdAt: f.createdAt})
+	}
 }
 
 // write seals p into the spool and arms the flush timer so that bytes
@@ -501,15 +525,15 @@ func (f *fill) finish(result, reason string, markFor time.Duration) {
 	}
 	f.finished = true
 	ctx := context.Background()
-	f.c.metrics.RecordResponseCacheFill(ctx, f.repo.Host, string(f.req.Class), result, reason)
+	f.c.metrics.RecordResponseCacheFill(ctx, f.repo.Host, string(f.req.Class), f.source, result, reason)
 	if f.fetched > 0 {
-		f.c.metrics.RecordResponseCacheFillBytes(ctx, f.repo.Host, string(f.req.Class), observability.TierUpstream, f.fetched)
+		f.c.metrics.RecordResponseCacheFillBytes(ctx, f.repo.Host, string(f.req.Class), f.source, f.fetched)
 	}
 	if markFor > 0 && !f.abandoned.Load() {
 		now := f.c.now()
 		f.c.marks.mark(f.key, now, now.Add(markFor))
 	}
-	attrs := []any{"result", result, "bytes", f.fetched}
+	attrs := []any{"result", result, "bytes", f.fetched, "source", f.source}
 	if reason != "" {
 		attrs = append(attrs, "reason", reason)
 	}

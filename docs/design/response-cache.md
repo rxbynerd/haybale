@@ -1,13 +1,13 @@
 # Design: response cache for Git smart HTTP reads
 
 Status: accepted; the first pull request implements Decisions 1 to 7 and 9
-(tier 1 only); Decision 6's remote tier and Decision 8 follow in later pull
-requests. Revised 2026-11-09 after design review (pressure test,
-security threat model, API design review, adversarial document review)
-and a research survey of prior art. This document records the design
+(tier 1 only), the second pull request implements the remote tier, and
+Decision 8 follows in a later pull request. Revised 2026-11-09 after
+design review (pressure test, security threat model, API design review,
+adversarial document review) and a research survey of prior art. This document records the design
 decisions behind haybale's optional response cache so that future changes
 can be checked against the reasoning, not only the code. Paragraphs marked
-"Implemented as" record where the first pull request differs from the
+"Implemented as" record where the implementation differs from the
 decision text.
 
 ## Problem
@@ -228,7 +228,12 @@ forwarded inputs, so no unkeyed input can select the response other
 readers receive (this is the cache-poisoning vector the security review
 rated high).
 
-**Key.** `keyHash = sha256(class || "\n" || Git-Protocol value || "\n" || canonical body)`.
+**Key.** The canonical-request digest is
+`sha256(class || "\n" || Git-Protocol value || "\n" || canonical body)`, and
+`keyHash = HMAC-SHA256(pathKey, digest)`, where `pathKey` is derived from
+the cache key with HKDF-SHA256 (info `haybale response cache path key v1`),
+so a reader of object names or bucket access logs cannot confirm a guessed
+request.
 `repoHash = HMAC-SHA256(cacheKey, upstream base URL || "\n" || owner || "/" || name)`,
 where `cacheKey` is the deployment's cache key (Decision 6). Including
 the configured base URL means repointing a host key or sharing a bucket
@@ -270,8 +275,10 @@ no effect on cache behaviour.
   history rewrite, and the operational notes say so.
 - **`refs` entries are served from the cache only if younger than
   `cache.refsMaxAge`** (default `0s`: always revalidate with upstream).
-  They are still stored and uploaded, because stale-if-error needs them
-  and they are a few hundred bytes. Refs requests are coalesced only
+  They are still stored, because stale-if-error needs them and they are a
+  few hundred bytes, and they are uploaded to tier 2 only when a replica
+  can read them back: when `refsMaxAge > 0`, and, once stale-if-error
+  ships, when `staleIfErrorFor > 0`. Refs requests are coalesced only
   when `refsMaxAge > 0`; with the default every refs request reaches
   upstream, so no client ever observes tips older than its own request.
   An operator who wants to absorb a burst of ref lookups sets a few
@@ -442,7 +449,7 @@ key id, per-entry random nonce prefix) is clear text. The header is
 encrypted and authenticated like the body, so repository names are
 hidden from anyone who can read the disk or bucket without the key; it
 records only fields known when the response starts: `repoHash`, group,
-class, `keyHash` (which is the canonical-request digest), plain
+class, `keyHash` (the keyed digest of the canonical request, Decision 2), plain
 repository name and upstream base URL, creation time, `Content-Type`,
 and protocol. The body is encrypted and authenticated with
 AES-256-GCM in a STREAM-style construction (nonce = prefix || segment
@@ -512,22 +519,23 @@ above `maxDiskSize` so a full cache can never evict unrelated pods.
 **Tier 2, remote object storage (`cache.remote`), optional.** After a
 tier-1 commit, the sealed file is uploaded by a bounded worker pool from
 its finalised length (for `pack` entries a `Stat` first skips the upload
-when a peer already stored the key; `refs` entries are always uploaded so
-the shared copy is refreshed). On a tier-1 miss, tier 2 is consulted before upstream
-under `cache.remote.headerTimeout` (a time-to-first-byte bound; body
+when a peer already stored the key; `refs` entries replace the shared copy so
+it is refreshed, and are uploaded only under the condition in Decision 3).
+On a tier-1 miss, tier 2 is consulted before upstream under
+`cache.remote.headerTimeout` (a time-to-first-byte bound; body
 reads fall under the fill's idle timeout); a tier-2 hit is streamed into the tier-1
 spool as a fill source, so subscribers coalesce on it exactly as on an
 upstream fill. A tier-2 failure before the first byte falls through to
 upstream inside the same fill; a failure mid-stream resumes with a ranged
 `Get` from the current offset a bounded number of times, since the object
 is immutable and its length is known from the header, and only then
-aborts. Bucket lifecycle expiry is day-granular on every cloud, so expiry
-is decided from the header's creation time and lifecycle rules are
-garbage collection only. Objects are stored as `application/octet-stream`
-with no user metadata (limits and encoding rules differ per vendor; the
-in-object header is the only metadata). Entries over 5 GiB are not
-uploaded (single-request PUT limit), which the default `maxEntrySize`
-already guarantees.
+aborts. Bucket lifecycle expiry is day-granular on AWS S3, and other
+stores were not checked, so expiry is decided from the header's creation
+time and lifecycle rules are garbage collection only. Objects are stored
+as `application/octet-stream` with no user metadata (limits and encoding
+rules differ per vendor; the in-object header is the only metadata).
+Entries over 5 GiB are not uploaded (single-request PUT limit), which the
+default `maxEntrySize` already guarantees.
 
 ```go
 // BlobStore is the remote tier. Implementations are safe for concurrent
@@ -562,7 +570,9 @@ always set explicitly from configuration so `AWS_ENDPOINT_URL*` cannot
 redirect the cache; the SDK's HTTP client uses an explicit transport with
 no environment proxy; request and response checksums are set to `WhenRequired`
 (the SDK's default CRC32 checksums break several non-AWS stores);
-`prefix` must end with `/` (directory buckets require it); optional `sse` and `kmsKeyID`
+`prefix` is empty (the bucket root, one trust domain for the whole bucket) or
+ends with `/` (so one prefix cannot also match another in IAM conditions and
+lifecycle filters); optional `sse` and `kmsKeyID`
 fields request server-side encryption where the store supports it (R2
 has none); errors are logged by operation,
 error code and status only; and the log scrubber gains AWS access-key-id
@@ -571,6 +581,55 @@ Identity) with IMDSv2 hop limit 1, and names Cloudflare R2 as the
 zero-egress vendor-neutral option. Azure Blob Storage and native Google
 Cloud Storage are future `BlobStore` implementations; the MinIO server is
 archived and is not recommended for new deployments.
+
+> Implemented as: The upload pool is four workers behind a queue of 256
+> entries; an entry committed while the queue is full is not uploaded and is
+> counted as `dropped`. Entries filled from tier 2 are not uploaded again. A
+> refs upload is skipped once a push has bumped the repository's generation,
+> and any upload is skipped once a purge marker covers it. Tier 2 is consulted
+> only under the tier-1 hit rules: a pack needs a recent upstream refs success
+> (`accessRecheck`), and a refs entry needs a positive `refsMaxAge`. A tier-2
+> fill is reported to the client as `fwd=miss`, like any fill.
+
+> Implemented as: There is no fill-source interface. Reading tier 2 is a
+> separate path at the start of the fill, which spools the sealed object as
+> it is and verifies it as it passes; on a miss or an early failure the same
+> fill continues with the upstream request.
+
+> Implemented as: "Before the first byte" is the point where the fill
+> publishes its outcome to subscribers: after the `Get` returns and the
+> 4 KiB sealed header has been read and verified, within `headerTimeout` of
+> the `Get` returning (within `idleTimeout` when `headerTimeout` is `0s`),
+> with no resume. A failure up to that point falls
+> through to upstream. After it, a failed or idle body resumes with a ranged
+> `Get` from the current offset, up to three times, with a backoff from
+> 100 ms that doubles; a resume always checks that size, modification time
+> and ETag are unchanged, and is conditional on the ETag (`If-Match`) when
+> the store reports one.
+> A stall inside the first sealed segment therefore resumes rather than
+> falls through, and if the read cannot continue the fill aborts and
+> subscribers that received nothing are released to the passthrough path.
+> `Stat` and `Get` make a single SDK attempt, so `headerTimeout` is their
+> only bound and the three resumes are the only retries; `Put`, `Delete`
+> and `List` keep the SDK's default retryer.
+
+> Implemented as: A read that cannot continue after its resumes, or whose
+> object changed or was deleted, ends the fill with `fetch_error` and
+> leaves the object; it is not an integrity failure. A failure of the
+> sealed reader itself (header or segment authentication, a missing final
+> segment, bytes after it) is an integrity failure: the object is deleted
+> from tier 2 within `headerTimeout` (one minute when it is `0s`) before
+> the fill moves on. A tier-2 entry past `retention` or older than a purge
+> is deleted in the background, each deletion bounded at one minute and at
+> most eight such tasks at a time, and the fill falls through to upstream.
+
+> Implemented as: Push invalidation deletes the repository's tier-2 refs
+> entries before `Invalidate` returns, after the tier-1 deletion, with one
+> deadline of `headerTimeout` (one minute when it is `0s`) across the `List`
+> and the `Delete`s, best effort. The push time is kept in memory per
+> repository, and a tier-2 refs entry created no later than it is a miss on
+> that replica. A refs upload whose generation moved during its `Put`
+> deletes the object again.
 
 Memcached and Redis were rejected as the remote tier: packs are routinely
 hundreds of megabytes, memcached's item limit is 1 MiB by default, and
@@ -706,8 +765,25 @@ miss and is deleted. Without a remote tier, the procedure is to run the
 purge in every replica (or restart every replica when the key is
 ephemeral), and the documentation says so.
 
-> Implemented as: `haybale cache purge --remote` and the purge marker are
-> planned with the remote tier. This release rejects `--remote`.
+> Implemented as: The marker is sealed in the entry format and records the
+> purge time of each group, so purging one group keeps the other group's time.
+> A replica checks it alongside an upstream refs fill for the repository,
+> before renewing the access record that pack hits depend on. A successful
+> check (the marker read and verified, or confirmed absent) stays current for
+> one minute, or for `accessRecheck` when that is shorter, and concurrent refs
+> fills share one read, so a replica honours a purge within about a minute
+> plus its next upstream refs request. A failed or skipped check leaves the
+> access record unrenewed, so pack hits lapse within `accessRecheck`; after a
+> failed read the marker is not read again for one minute. Entries read from
+> tier 2 are checked against the marker as well.
+
+> Implemented as: `purge --remote` writes the marker first, then deletes the
+> tier-2 entries, then the tier-1 entries. A marker that cannot be written
+> stops the purge before anything is deleted; a failed tier-2 deletion still
+> lets the tier-1 step run, and a rerun is safe. A missing local directory
+> is skipped with `--remote`. Without `--remote` and with a remote tier
+> configured, the command warns that replicas will refill the entries from
+> the bucket.
 
 ## Observability
 
@@ -716,7 +792,9 @@ Metrics (host and class only, never owner or repository), under the
 
 - `lookups.total` labels host, class, result (`hit`, `miss`, `stale`,
   `bypass`);
-- `fills.total` labels host, class, result (`stored`, `discarded`),
+- `fills.total` labels host, class, tier (`upstream`, `remote`: where the
+  fill read the response; a tier-2 attempt that falls through counts once,
+  as `upstream`), result (`stored`, `discarded`),
   reason (`error_packet`, `sideband_error`, `framing`, `truncated`,
   `too_large`, `disk_budget`, `store_error`, `generation`,
   `upstream_status`, `fetch_error`, `encoding`);
@@ -762,11 +840,11 @@ cache:
   remote:                          # optional tier 2
     type: s3
     bucket: haybale-cache
-    prefix: prod/
+    prefix: prod/                  # empty (bucket root) or ending with "/"
     region: us-east-1
     endpoint: ""                   # https; set for R2, Ceph, GCS interop
     forcePathStyle: false
-    headerTimeout: 10s             # time to first byte for remote Stat/Get on the miss path
+    headerTimeout: 10s             # each remote Stat, Get, List page and Delete, and the sealed-header read; 0s = no per-request bound
     sse: ""                        # "AES256" or "aws:kms"
     kmsKeyID: ""
   staleIfErrorFor: 0s              # 0s = disabled; must not exceed retention
@@ -795,10 +873,20 @@ configuration error fails startup (matching the fail-fast JWKS
 behaviour), and a transient network or 5xx error logs a warning and
 continues, so a bucket outage cannot stop haybale from starting.
 
-> Implemented as: This release rejects `remote` and a non-zero
-> `staleIfErrorFor` outright. `BuildCache(logger, metrics)` takes no context
-> or upstream list. An explicit zero size or count selects the default.
-> Validation also requires `maxEntrySize` not above half of `maxDiskSize`.
+> Implemented as: This release rejects a non-zero `staleIfErrorFor` outright.
+> `BuildCache(ctx, logger, metrics)` takes no upstream list. An explicit zero
+> size or count selects the default. Validation also requires `maxEntrySize`
+> not above half of `maxDiskSize`, and `remote.region` is always required. The
+> startup probe is a `Get` of a random key under `v1/.probe/`, new at every
+> start so a bucket writer cannot plant it, rather than a `Stat`, because a
+> HEAD response has no body to tell a missing bucket from a missing object.
+> A not-found 404 passes, a 307, 308, 408 or 429 warns, and any other 3xx
+> or 4xx fails startup. A credential-chain failure that can pass (a
+> timeout, a send failure, or a provider answering 5xx or 429) warns, while
+> a chain that finds no provider or is refused fails startup. With
+> `headerTimeout: 0s` the sealed-header read is bounded by `idleTimeout`,
+> and the deletions after a push, after a failed verification and after a
+> refs upload that a push superseded by one minute.
 
 ## Operational notes
 

@@ -225,7 +225,8 @@ end-to-end headers continue to follow reverse-proxy forwarding rules.
 ## Response cache
 
 The optional [response cache](caching.md) serves the pack transfer of repeated
-identical clones and fetches from local disk. It is off by default. This
+identical clones and fetches from local disk and, when a remote tier is
+configured, from a bucket shared by replicas. It is off by default. This
 section describes what it changes about haybale's security properties; the
 properties above hold for every request, cached or not. Stale-if-error is
 reserved for a later release and is not available.
@@ -245,7 +246,7 @@ Only the `read` verb is ever offered to the cache. A push, including the
 served from the cache and never has its body read. A completed
 `git-receive-pack` request, whatever its status and even if the client
 disconnects before the response ends, deletes that repository's cached ref
-entries on this instance.
+entries on this instance and, with a remote tier, in the bucket.
 
 ### What is cached
 
@@ -315,16 +316,18 @@ verification. A failed entry is deleted and treated as a miss, or, when bytes
 have already been sent, the connection is closed without a clean ending. Either
 way a `cache_integrity_failed` security event is logged.
 
-Entry names on disk are `v1/<group>/<repoHash>/<requestHash>`. The repository
-hash is keyed. The request hash is an unkeyed SHA-256 of the canonical request.
-A directory listing reveals whether an entry is a refs or pack entry, which
-entries belong to the same repository, and each entry's size and time, but not
-the repository name.
+Entry names on disk are `v1/<group>/<repoHash>/<requestHash>`. Both hashes are
+keyed: the repository hash is an HMAC under the cache key, and the request hash
+is an HMAC-SHA256 of the canonical request's digest under a path key derived
+from the cache key, so a reader of the names cannot confirm a guessed
+repository or request. A directory listing reveals whether an entry is a refs
+or pack entry, which entries belong to the same repository, and each entry's
+size and time, but not the repository name.
 
 An entry's age is the creation time authenticated in its header, not the file
 modification time, so changing a file's time does not extend its life.
 
-The key protects a cache directory (or, in a later release, a bucket) against
+The key protects a cache directory, and the remote tier's bucket, against
 someone who can read or write it but does not hold the key: such a party cannot
 read repository contents or names and cannot forge, alter or move an entry,
 although it can restore an earlier valid copy of one until `retention` ends. It
@@ -347,6 +350,118 @@ Handle the key as a credential:
 When `keyEnv` is unset, haybale generates a key at startup and discards it on
 exit. At the next start it deletes every entry in the directory, because none
 can be read, so the cache is empty after every restart.
+
+### Remote tier
+
+With `cache.remote` set, replicas upload their sealed entries to an
+S3-compatible bucket and read each other's. The bucket holds exactly the sealed
+bytes the disk holds, so the properties of [sealed entries](#sealed-entries)
+carry over: whoever can write to the bucket without the cache key cannot read
+repository contents or names and cannot forge an entry, alter one, or move one
+to another key. An entry read from the bucket is verified segment by segment,
+and each segment is verified before any of its bytes reach a client; if a later
+segment fails, the connection is closed without a clean ending. An entry that
+fails authentication, or whose final segment is missing because the object was
+truncated, is deleted from the bucket, a `cache_integrity_failed` event with
+`tier=remote` is logged, and the request is answered from the upstream if no
+byte had been sent. A read that the network cuts short is a transport failure,
+not an integrity failure: it raises no event and leaves the object in place. A
+bucket writer can still delete entries, which costs upstream fetches, and
+restore an earlier valid copy of an entry until its `retention` ends. Object
+names reveal what a directory listing does: the group, which entries share a
+repository, and each entry's size and time. Both hashes in a name are keyed, so
+a reader of object names or bucket access logs cannot confirm a guessed clone.
+
+The cache key and the bucket credentials are separate secrets. The bucket
+credentials come from the AWS SDK's default credential chain; prefer workload
+identity (IRSA or EKS Pod Identity) to static keys, and on EC2 nodes require
+IMDSv2 with a hop limit of 1 so that pods cannot use the node's role. Keep the
+bucket private. One prefix is one trust domain: every replica that can write it
+can make the others serve what it stored, so share a prefix only between
+replicas with the same key, upstreams and policy.
+
+The client for the bucket always uses the configured endpoint
+(`AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_S3` and shared-config endpoints are
+ignored), requires `https` except for a loopback host, uses TLS 1.2 or later,
+uses no proxy from the environment, and does not follow redirects, so the S3
+client never sends a signed request to a host the configuration did not name.
+That covers the S3 client only: the SDK's credential providers, such as STS for
+web identity, make their own requests and may follow `AWS_ENDPOINT_URL_STS` and
+similar settings. A failed bucket request is logged as its operation, object key
+(a hashed path), S3 error code and HTTP status only: never the SDK's error
+text, request ids or credentials. A read whose body fails mid-stream is logged
+with the network error, which can name the local and remote addresses. An
+endpoint that carries userinfo, a query or a fragment is refused, and the error
+shows only its scheme and host.
+
+At startup, `haybale serve` checks the bucket by reading a random key under
+`v1/.probe/`, new at every start, and refuses to start if the read succeeds.
+A bucket writer cannot plant that key in advance, so it cannot stop replicas
+from starting.
+
+A purge with `--remote` writes a purge marker, an object sealed under the cache
+key that records when each group of the repository was purged. Replicas check
+it alongside an upstream refs request for the repository, reuse a successful
+check for up to a minute, and drop local entries created before it. After a
+failed check a replica does not read the marker again for a minute, so a
+replica whose checks are failing honours a purge up to that minute later. A
+marker sealed under another key or for another repository is rejected with a
+`cache_integrity_failed` event, so a bucket writer cannot purge a repository.
+A replica renews the access record that pack hits depend on only after a
+successful check, so while the marker cannot be read or fails verification,
+its pack hits for the repository lapse within `accessRecheck` and go to the
+upstream instead of outliving a purge. Setting `accessRecheck` to `0s`
+disables that rule, and pack hits then continue while marker checks fail.
+
+The host that runs `haybale cache purge --remote` holds the cache key and write
+access to the bucket. Together they are enough to seal entries that every
+replica will serve to clients, so treat that host as inside the trust domain,
+like the replicas themselves.
+
+Residual risks of the remote tier, all requiring write access to the bucket or
+a failure on the replicas' side:
+
+- a bucket writer can append bytes to a valid entry in the bucket. The entry's
+  header still verifies, and its size is capped before a replica reserves
+  local disk for it, but the body is verified only as it arrives, so each
+  local miss on that entry can evict up to about 1GiB of local entries at the
+  default sizes before the object fails verification;
+- a bucket writer can delete a purge marker before the replicas read it, in
+  which case their older local entries stay servable until `retention`, as
+  they would without the marker, or replace it with an invalid object, which
+  stops pack hits for the repository on every replica until `purge --remote`
+  replaces it. The replacement records only the groups purged then, so the
+  other group's earlier purge time is lost for replicas that had not read it.
+  When the purge that printed `notice: the repository's purge marker failed
+  verification and was replaced` used `--group`, run it again for both
+  groups; and
+- after a push, the replica that handled it deletes the repository's refs
+  entries from the bucket, best effort, and never serves an older refs entry
+  from the bucket itself. When that deletion fails, other replicas, and the
+  same replica after a restart, can serve the pre-push refs from the bucket
+  for up to `refsMaxAge`.
+
+Pre-push refs can reach clients from the bucket in three more ways, none of
+which needs write access to the bucket:
+
+- another replica's refs upload that was queued before the push still runs,
+  because that replica did not see the push. It can land after the pushing
+  replica's successful deletion, and every replica except the pushing one can
+  then serve it until it is older than `refsMaxAge`;
+- the push time is the pushing replica's local wall-clock time, and an entry's
+  creation time comes from the clock of the replica that sealed it. A replica
+  whose clock runs a few seconds ahead, within the 5-minute tolerance, can seal
+  an entry fetched before the push with a creation time after the push time,
+  and the pushing replica then serves it as well; and
+- a refs upload that a push superseded deletes its object again. That deletion
+  can remove another replica's newer object at the same key, which costs a
+  miss. If shutdown cancels the deletion and the replica restarts, the
+  pre-push object survives, and the restarted replica, which has forgotten the
+  push time, can serve it until it is older than `refsMaxAge`.
+
+With the default `refsMaxAge` of `0s`, refs entries are never uploaded to or
+read from the bucket, so none of the push cases apply. The marker replacement
+case applies at any `refsMaxAge`.
 
 ### Entries are shared across identities
 
@@ -381,9 +496,13 @@ rewrite; lower it where that window is too long.
 
 To end the exposure immediately, run `haybale cache purge` for the repository
 (see [Purging a repository](caching.md#purging-a-repository)). The command
-works on one cache directory. In this release every replica has its own
+works on one cache directory. Without a remote tier every replica has its own
 directory, so run the purge on every replica, or restart every replica that has
-no `keyEnv`, which empties its cache.
+no `keyEnv`, which empties its cache. With a remote tier, `--remote` also
+deletes the repository's entries from the bucket and writes the purge marker
+described under [Remote tier](#remote-tier); each replica then honours the
+purge within about a minute plus its next upstream refs request for the
+repository.
 
 Rewrite the history upstream first and purge afterwards. Some hosts, GitHub
 among them, keep serving unreachable objects by id until garbage collection, so
@@ -445,8 +564,10 @@ by a scrubber that redacts:
 - Basic and Bearer authorization values;
 - credentials in URL userinfo;
 - compact JWTs;
-- known GitHub token prefixes; and
-- PEM private-key headers.
+- known GitHub token prefixes;
+- PEM private-key headers; and
+- AWS access key ids (`AKIA` and `ASIA` followed by 16 characters) and the
+  value of an `x-amz-security-token` header or query parameter.
 
 The scrubber applies to log messages, string attributes, error attributes, and
 grouped values before records reach stderr or OTLP. It is defense in depth, not
@@ -464,9 +585,10 @@ haybale emits warning-level structured events for:
 - `policy_denied`
 - `upstream_auth_failed`
 - `token_minted`
-- `cache_integrity_failed`: a stored cache entry failed verification, was
-  relocated, or carried an implausible creation time. It carries the host,
-  owner, repository and request class and never key material.
+- `cache_integrity_failed`: a stored cache entry or purge marker failed
+  verification, was relocated, or carried an implausible creation time. It
+  carries the host, owner, repository and request class, and `tier=remote` when
+  the entry came from the remote tier, and never key material.
 
 Monitor repeated authentication failures, policy probes, upstream credential
 failures, token-mint spikes, JWKS refresh warnings, and any

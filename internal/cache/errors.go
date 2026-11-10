@@ -17,6 +17,12 @@ var (
 	// truncation, reordering, relocation under another key, or
 	// modification.
 	ErrIntegrity = errors.New("cache: entry failed integrity check")
+	// ErrTooLarge is returned by a BlobStore's Put for an object larger
+	// than the store accepts in one request.
+	ErrTooLarge = errors.New("cache: object exceeds the remote store's upload size limit")
+	// ErrObjectChanged is returned by a ConditionalGetter when the object
+	// no longer carries the requested ETag.
+	ErrObjectChanged = errors.New("cache: remote object no longer matches the requested version")
 )
 
 // ObjectInfo describes one object held by a BlobStore.
@@ -24,6 +30,9 @@ type ObjectInfo struct {
 	Key     string
 	Size    int64
 	ModTime time.Time
+	// ETag identifies the object's content version; it is empty when the
+	// store reports none.
+	ETag string
 }
 
 // BlobStore is the optional remote storage tier. Keys are entryKey.Path
@@ -34,12 +43,21 @@ type BlobStore interface {
 	Stat(ctx context.Context, key string) (ObjectInfo, error)
 	// Get reads key from offset to its end.
 	Get(ctx context.Context, key string, offset int64) (io.ReadCloser, ObjectInfo, error)
-	// Put stores size bytes from body under key.
+	// Put stores size bytes from body under key. An object over the
+	// store's size limit returns an error matching ErrTooLarge.
 	Put(ctx context.Context, key string, body io.ReadSeeker, size int64) error
 	// Delete removes key and returns nil when it is already absent.
 	Delete(ctx context.Context, key string) error
 	// List yields every object whose key begins with prefix.
 	List(ctx context.Context, prefix string) iter.Seq2[ObjectInfo, error]
+}
+
+// ConditionalGetter is an optional BlobStore extension that a remote fill
+// uses to resume a read only from the same version of the object.
+type ConditionalGetter interface {
+	// GetIfMatch is Get, failing with an error matching ErrObjectChanged
+	// when key no longer carries etag.
+	GetIfMatch(ctx context.Context, key string, offset int64, etag string) (io.ReadCloser, ObjectInfo, error)
 }
 
 // Fetcher performs the upstream round trip for a classified request. It

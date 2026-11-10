@@ -118,6 +118,31 @@ const (
 	OperationEvict  = "evict"
 	OperationExpire = "expire"
 	OperationSweep  = "sweep"
+	// The remote-tier operations, labelled with TierRemote.
+	OperationStat = "stat"
+	OperationGet  = "get"
+	OperationPut  = "put"
+	OperationList = "list"
+)
+
+// Response-cache upload result values for the attrResult label on
+// haybale.response_cache.uploads.total.
+const (
+	// UploadResultUploaded — the entry was stored in the remote tier.
+	UploadResultUploaded = "uploaded"
+	// UploadResultSkipped — the upload was unnecessary: a pack entry was
+	// already present remotely, the local entry was gone, or the entry
+	// was superseded by a push or a purge before its turn.
+	UploadResultSkipped = "skipped"
+	// UploadResultDropped — the upload queue was full, so the entry was
+	// not queued.
+	UploadResultDropped = "dropped"
+	// UploadResultTooLarge — the entry exceeds the remote store's
+	// single-request size limit.
+	UploadResultTooLarge = "too_large"
+	// UploadResultFailed — the remote store rejected or did not answer
+	// the upload.
+	UploadResultFailed = "failed"
 )
 
 // ClassBypass is the attrClass value for a response-cache lookup of a
@@ -168,8 +193,9 @@ type Metrics struct {
 	// request class, and result (hit|miss|stale|bypass).
 	ResponseCacheLookups metric.Int64Counter
 	// ResponseCacheFills counts finished cache fills tagged by host,
-	// class, result (stored|discarded), and, for a discarded fill, the
-	// reason it was not stored.
+	// class, tier (upstream|remote: where the fill read the response),
+	// result (stored|discarded), and, for a discarded fill, the reason it
+	// was not stored.
 	ResponseCacheFills metric.Int64Counter
 	// ResponseCacheFillBytes counts bytes written into the cache by fills,
 	// and ResponseCacheServedBytes counts response bytes served to clients
@@ -461,14 +487,16 @@ func (m *Metrics) RecordResponseCacheLookup(ctx context.Context, host, class, re
 	))
 }
 
-// RecordResponseCacheFill counts one finished cache fill with the given
-// result (FillResultStored or FillResultDiscarded). reason is one of the
+// RecordResponseCacheFill counts one finished cache fill that read its
+// response from tier (TierUpstream or TierRemote), with the given result
+// (FillResultStored or FillResultDiscarded). reason is one of the
 // FillReason* values for a discarded fill and empty for a stored one, in
 // which case the reason label is omitted.
-func (m *Metrics) RecordResponseCacheFill(ctx context.Context, host, class, result, reason string) {
+func (m *Metrics) RecordResponseCacheFill(ctx context.Context, host, class, tier, result, reason string) {
 	attrs := []attribute.KeyValue{
 		attribute.String(attrHost, host),
 		attribute.String(attrClass, class),
+		attribute.String(attrTier, tier),
 		attribute.String(attrResult, result),
 	}
 	if reason != "" {

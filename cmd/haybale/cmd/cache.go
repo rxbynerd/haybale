@@ -1,15 +1,23 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"net/url"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/rxbynerd/haybale/internal/cache"
 	"github.com/rxbynerd/haybale/internal/config"
 )
+
+// cachePurgeRemoteTimeout bounds `haybale cache purge --remote`: writing
+// the purge marker and deleting the remote and local entries.
+const cachePurgeRemoteTimeout = 5 * time.Minute
 
 var (
 	cachePurgeConfigPath string
@@ -25,13 +33,19 @@ var cacheCmd = &cobra.Command{
 
 var cachePurgeCmd = &cobra.Command{
 	Use:   "purge",
-	Short: "Delete one repository's entries from the local cache directory",
+	Short: "Delete one repository's entries from the cache",
 	Long: "Loads --config and deletes every cache entry for --repo (or only its refs or pack " +
 		"entries with --group) from cache.dir. The cache key named by cache.keyEnv must be set " +
 		"to the key the entries were sealed under, because entries are addressed by a keyed " +
-		"hash of the repository. The command is offline and safe to run while a server is " +
-		"using the directory; the server treats a purged entry as a miss. Run it on every " +
-		"replica that holds entries for the repository.",
+		"hash of the repository. The command is safe to run while a server is using the " +
+		"directory; the server treats a purged entry as a miss.\n\n" +
+		"Without --remote the command is offline and reaches only this directory, so run it " +
+		"on every replica; when cache.remote is configured it warns that replicas will refill " +
+		"the purged entries from the bucket. With --remote it first writes the repository's " +
+		"purge marker to cache.remote, then deletes the repository's remote entries, then " +
+		"the local ones; a missing cache.dir is skipped. Every replica sharing the remote tier " +
+		"drops its older local entries at its next purge-marker check, within about a minute " +
+		"plus its next upstream refs request for the repository. A failed run is safe to repeat.",
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		return runCachePurge(cmd, cachePurgeConfigPath, cachePurgeRepo, cachePurgeGroup, cachePurgeRemote)
@@ -42,7 +56,7 @@ func init() {
 	cachePurgeCmd.Flags().StringVar(&cachePurgeConfigPath, "config", "haybale.yaml", "path to haybale's YAML config file")
 	cachePurgeCmd.Flags().StringVar(&cachePurgeRepo, "repo", "", "repo to purge, as host/owner/repo (required)")
 	cachePurgeCmd.Flags().StringVar(&cachePurgeGroup, "group", "", `entries to purge: "refs" or "pack" (default: both)`)
-	cachePurgeCmd.Flags().BoolVar(&cachePurgeRemote, "remote", false, "purge the remote tier (not supported in this release)")
+	cachePurgeCmd.Flags().BoolVar(&cachePurgeRemote, "remote", false, "also purge cache.remote and write the purge marker other replicas honour")
 	if err := cachePurgeCmd.MarkFlagRequired("repo"); err != nil {
 		// Unreachable: the StringVar call above registers "repo".
 		panic(err)
@@ -52,9 +66,6 @@ func init() {
 }
 
 func runCachePurge(cmd *cobra.Command, cfgPath, repoArg, groupArg string, remote bool) error {
-	if remote {
-		return errors.New("--remote: purging the remote cache tier is not supported in this release")
-	}
 	groups, err := cache.ParseGroups(groupArg)
 	if err != nil {
 		return fmt.Errorf("--group: %w", err)
@@ -65,7 +76,7 @@ func runCachePurge(cmd *cobra.Command, cfgPath, repoArg, groupArg string, remote
 	}
 
 	// config.Load validates structurally and never touches the filesystem
-	// or the environment, so the purge stays offline.
+	// or the environment, so without --remote the purge stays offline.
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
@@ -88,20 +99,96 @@ func runCachePurge(cmd *cobra.Command, cfgPath, repoArg, groupArg string, remote
 		return fmt.Errorf("--repo %q: host %q is not a configured upstream", repoArg, repo.Host)
 	}
 
-	// The server hashes the same key and the same parsed base URL.
-	repoHash := keyring.RepoHash(baseURL, repo)
-
-	purged := 0
-	for _, group := range groups {
-		n, err := cache.PurgeDiskPrefix(cc.Dir, cache.RepoPrefix(group, repoHash))
-		purged += n
-		if err != nil {
-			return fmt.Errorf("purge %s entries (%s purged so far): %w", group, pluralEntries(purged), err)
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
+	var remoteStore cache.BlobStore
+	if remote {
+		if remoteStore, err = cc.BuildRemote(ctx); err != nil {
+			return fmt.Errorf("--remote: %w", err)
 		}
+		if remoteStore == nil {
+			return errors.New("--remote: cache.remote is not configured")
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cachePurgeRemoteTimeout)
+		defer cancel()
+	} else if cc.HasRemote() {
+		_, _ = fmt.Fprintln(stderr, "warning: cache.remote is configured but --remote was not given: "+
+			"replicas will refill the purged entries from the bucket; use --remote to purge the shared tier")
 	}
 
-	_, err = fmt.Fprintf(cmd.OutOrStdout(), "purged %s\n", pluralEntries(purged))
-	return err
+	localMissing := false
+	var writeErr error
+	report := func(w io.Writer, format string, args ...any) {
+		if _, err := fmt.Fprintf(w, format, args...); err != nil && writeErr == nil {
+			writeErr = err
+		}
+	}
+	// The server hashes the same key and the same parsed base URL.
+	res, err := cache.PurgeRepository(ctx, keyring, cache.PurgeRequest{
+		Repo:    repo,
+		BaseURL: baseURL,
+		Groups:  groups,
+		Now:     time.Now(),
+		Remote:  remoteStore,
+		DeleteLocal: func(prefix string) (int, error) {
+			n, err := cache.PurgeDiskPrefix(cc.Dir, prefix)
+			if remote && errors.Is(err, fs.ErrNotExist) {
+				localMissing = true
+				return 0, nil
+			}
+			return n, err
+		},
+		StepDone: func(step cache.PurgeStep, res cache.PurgeResult) {
+			switch step {
+			case cache.PurgeStepMarker:
+				if res.MarkerReplaced {
+					report(stderr, "notice: the repository's purge marker failed verification and was replaced\n")
+				}
+			case cache.PurgeStepRemote:
+				report(stdout, "wrote the purge marker and purged %s from the remote tier\n", pluralEntries(res.Remote))
+			case cache.PurgeStepLocal:
+				if localMissing {
+					report(stderr, "notice: cache.dir %q does not exist; there are no local entries to purge\n", cc.Dir)
+					return
+				}
+				report(stdout, "purged %s\n", pluralEntries(res.Local))
+			}
+		},
+	})
+	if err != nil {
+		return purgeCommandError(err, res)
+	}
+	return writeErr
+}
+
+// purgeCommandError phrases each failed step of a purge for the operator,
+// with how far the step got.
+func purgeCommandError(err error, res cache.PurgeResult) error {
+	errs := []error{err}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		errs = joined.Unwrap()
+	}
+	out := make([]error, 0, len(errs))
+	for _, e := range errs {
+		var pe *cache.PurgeError
+		if !errors.As(e, &pe) {
+			out = append(out, e)
+			continue
+		}
+		switch pe.Step {
+		case cache.PurgeStepMarker:
+			out = append(out, fmt.Errorf("--remote: write the purge marker (nothing was deleted): %w", pe.Err))
+		case cache.PurgeStepRemote:
+			out = append(out, fmt.Errorf("--remote: the purge marker was written, but purging the remote tier failed (%s deleted so far): %w", pluralEntries(res.Remote), pe.Err))
+		default:
+			out = append(out, fmt.Errorf("purge %s entries (%s purged so far): %w", pe.Group, pluralEntries(res.Local), pe.Err))
+		}
+	}
+	return errors.Join(out...)
 }
 
 // pluralEntries renders a count of cache entries with the right number.

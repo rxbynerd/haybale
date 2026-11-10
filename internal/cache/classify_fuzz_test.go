@@ -49,14 +49,14 @@ func FuzzClassify(f *testing.F) {
 		if err != nil || bypass {
 			t.Fatalf("canonical body did not reclassify: bypass %v reason %q err %v", bypass, reason, err)
 		}
-		if again.KeyHash != req.KeyHash || !bytes.Equal(again.Body, req.Body) || again.Class != req.Class {
+		if again.Digest != req.Digest || !bytes.Equal(again.Body, req.Body) || again.Class != req.Class {
 			t.Fatalf("canonical body is not a fixed point: %+v vs %+v", again, req)
 		}
 		zipped, bypass, reason, err := classify(withProtocol(post(gzipped(t, body), "Content-Encoding", "gzip"), protocol), testRepo, testMaxBody)
 		if err != nil || bypass {
 			t.Fatalf("gzip twin bypassed: reason %q err %v", reason, err)
 		}
-		if zipped.KeyHash != req.KeyHash {
+		if zipped.Digest != req.Digest {
 			t.Fatal("gzip twin has a different key")
 		}
 	})

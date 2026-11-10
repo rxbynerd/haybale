@@ -97,13 +97,13 @@ carry a repository owner or name.
 | Instrument                                    | Type            | Attributes                         | Meaning                                                                 |
 |-----------------------------------------------|-----------------|------------------------------------|-------------------------------------------------------------------------|
 | `haybale.response_cache.lookups.total`        | counter         | `host`, `class`, `result`          | Response-cache lookups; `result` is `hit`, `miss` or `bypass`. `stale` is reserved: not emitted while `staleIfErrorFor` is unsupported. |
-| `haybale.response_cache.fills.total`          | counter         | `host`, `class`, `result`, `reason`| Finished cache fills; `result` is `stored` or `discarded`. `reason` is present only on a discarded fill. |
-| `haybale.response_cache.fill_bytes.total`     | counter         | `host`, `class`, `tier`            | Bytes fetched from the upstream by fills, including fills that were discarded and refs fills. `tier` is always `upstream`. |
+| `haybale.response_cache.fills.total`          | counter         | `host`, `class`, `tier`, `result`, `reason`| Finished cache fills; `result` is `stored` or `discarded`. `reason` is present only on a discarded fill. `tier` is where the fill read the response: `upstream`, or `remote` for a fill from the remote tier. A fill that tried the remote tier and fell through to the upstream counts once, as `upstream`. |
+| `haybale.response_cache.fill_bytes.total`     | counter         | `host`, `class`, `tier`            | Response body bytes fills read from their source, including fills that were discarded or aborted and refs fills. `tier` is `upstream` for a fill from the upstream and `remote` for a fill from the remote tier, which counts the verified bytes read from the bucket. |
 | `haybale.response_cache.served_bytes.total`   | counter         | `host`, `class`, `tier`            | Response bytes served to clients through the cache path.                |
 | `haybale.response_cache.collapsed.total`      | counter         | `host`                             | Requests that joined a fill already in flight instead of fetching upstream. |
-| `haybale.response_cache.store_errors.total`   | counter         | `tier`, `operation`                | Cache storage failures.                                                 |
+| `haybale.response_cache.store_errors.total`   | counter         | `tier`, `operation`                | Cache storage failures. With `tier=remote` it counts failed requests to the bucket, every remote read that failed or stalled, including one a fill then resumed or fell through on, and remote entries and purge markers that failed verification (`operation=get`). Uploads, background deletions and push invalidation that shutdown cuts short are not counted. |
 | `haybale.response_cache.evictions.total`      | counter         | (none)                             | Entries evicted to stay within the disk budget or retention.            |
-| `haybale.response_cache.uploads.total`        | counter         | `result`                           | Reserved: not emitted while the remote tier is unsupported.             |
+| `haybale.response_cache.uploads.total`        | counter         | `result`                           | Entries offered to the remote tier after they were stored on disk, by result. Recorded only when `cache.remote` is set. |
 | `haybale.response_cache.disk_bytes`           | up/down counter | (none)                             | Bytes currently held by the disk tier: committed entries plus bytes pinned by readers of removed entries. Space reserved for fills in progress is not counted, so the gauge can sit below the `maxDiskSize` budget the cache enforces. |
 
 The `class` attribute is the request class the cache recognised
@@ -119,16 +119,18 @@ again. The other closed sets are:
 | `result` on `lookups.total` | `hit`, `miss`, `bypass`; `stale` is reserved and not emitted |
 | `result` on `fills.total` | `stored`, `discarded` |
 | `reason` on `fills.total` | `error_packet`, `sideband_error`, `framing`, `truncated`, `too_large`, `disk_budget`, `store_error`, `generation`, `upstream_status`, `fetch_error`, `encoding` |
-| `tier` | `disk`, `upstream` (the origin of the bytes; `fill_bytes.total` is always `upstream`); `remote` is reserved and not emitted while the remote tier is unsupported. On `store_errors.total` it names the tier that failed. |
-| `operation` on `store_errors.total` | `open`, `create`, `write`, `commit`, `abort`, `delete`, `evict`, `expire`, `sweep` |
+| `tier` | `disk`, `remote`, `upstream`: the origin of the bytes. `fills.total` and `fill_bytes.total` carry `upstream` or `remote`. On `store_errors.total` it names the tier that failed, `disk` or `remote`. |
+| `operation` on `store_errors.total` | `open`, `create`, `write`, `commit`, `abort`, `delete`, `evict`, `expire`, `sweep` for the disk tier; `stat`, `get`, `put`, `list`, `delete` for the remote tier |
+| `result` on `uploads.total` | `uploaded`; `skipped` (the bucket already held the pack, the local entry was evicted before the upload ran, or a push or purge superseded the entry); `dropped` (the upload queue was full, or shutdown reached its deadline before the upload ran or finished); `too_large` (over the 5GiB single-request limit); `failed` (the existence check or the upload failed, also counted in `store_errors.total` with `tier=remote`) |
 
 A cache hit keeps `outcome=proxied` on `haybale.requests.total` and
 `haybale.request.duration`, so existing dashboards and SLOs include hits.
 Because `proxied` no longer implies an upstream transfer, panels that track
-load on the upstream host should use `fills.total` and `fill_bytes.total` (one
-fill is one upstream fetch, however many clients it served) together with the
-`bypass` results of `lookups.total`, which are proxied straight to the
-upstream.
+load on the upstream host should use `fills.total` and `fill_bytes.total` with
+`tier=upstream` (one such fill is one upstream fetch, however many clients it
+served) together with the `bypass` results of `lookups.total`, which are
+proxied straight to the upstream. A fill with `tier=remote` read the bucket,
+not the upstream.
 
 The `haybale.outcome` values, spanning every terminal path a request can
 take, so `sum by (haybale.outcome)` accounts for all traffic:
@@ -175,8 +177,15 @@ so both sinks receive identical records that are:
 The per-request `proxied request` log line and the security events
 (`authn_failed`, `policy_denied`, `upstream_auth_failed`, `token_minted`,
 `cache_integrity_failed`) are emitted through this same chain.
-`cache_integrity_failed` carries `host`, `owner`, `repo` and `class`, and no key
-material or entry path.
+`cache_integrity_failed` carries `host`, `owner`, `repo` and `class`, plus
+`tier=remote` for an entry or purge marker read from the remote tier, and no
+key material or entry path. A failed entry is deleted. A purge marker that
+fails verification has `class=purge`; it is not deleted, so each replica logs
+the event again about every minute while it receives refs requests for the
+repository, and its pack hits for the repository lapse within `accessRecheck`
+(unless `accessRecheck` is `0s`, which disables the rule), until `haybale cache
+purge --remote` replaces the marker (see [Purging a
+repository](caching.md#purging-a-repository)).
 
 Operational cache log lines worth alerting on are listed in the caching guide
 under [What to alert on](caching.md#what-to-alert-on).
@@ -190,7 +199,7 @@ handled it:
 | `cache` value | Meaning                                                                                  |
 |---------------|------------------------------------------------------------------------------------------|
 | `hit`         | Served from a stored entry; the upstream was not contacted for the response body.        |
-| `miss`        | Not served from a stored entry. The response came from a fill, an upstream fetch, which stored an entry if it completed cleanly (see `cacheStored`). |
+| `miss`        | Not served from a stored entry on this replica's disk. The response came from a fill, an upstream fetch or a read from the remote tier, which stored an entry if it completed cleanly (see `cacheStored`). |
 | `stale`       | A stale entry was served because the upstream could not answer. Reserved: it is not emitted while `staleIfErrorFor` is unsupported. |
 | `bypass`      | Not eligible for the cache; proxied straight to the upstream.                            |
 
