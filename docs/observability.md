@@ -38,7 +38,7 @@ Span attributes haybale adds:
 | `haybale.issuer`           | The verified JWT issuer, when available.                   |
 | `haybale.outcome`          | One of the outcomes listed under [Metrics](#metrics).      |
 | `http.response.status_code`| The client-visible status of a proxied request.            |
-| `haybale.cache.result`     | `hit`, `miss` or `bypass`, on every read the cache was offered. `stale` is reserved and not emitted. |
+| `haybale.cache.result`     | `hit`, `miss`, `stale` or `bypass`, on every read the cache was offered. |
 | `haybale.cache.collapsed`  | `true` when the request joined a fill already in flight. Present on a miss only. |
 | `haybale.cache.stored`     | `true` when the fill committed an entry. Present on a miss only. |
 
@@ -96,10 +96,10 @@ carry a repository owner or name.
 
 | Instrument                                    | Type            | Attributes                         | Meaning                                                                 |
 |-----------------------------------------------|-----------------|------------------------------------|-------------------------------------------------------------------------|
-| `haybale.response_cache.lookups.total`        | counter         | `host`, `class`, `result`          | Response-cache lookups; `result` is `hit`, `miss` or `bypass`. `stale` is reserved: not emitted while `staleIfErrorFor` is unsupported. |
-| `haybale.response_cache.fills.total`          | counter         | `host`, `class`, `tier`, `result`, `reason`| Finished cache fills; `result` is `stored` or `discarded`. `reason` is present only on a discarded fill. `tier` is where the fill read the response: `upstream`, or `remote` for a fill from the remote tier. A fill that tried the remote tier and fell through to the upstream counts once, as `upstream`. |
+| `haybale.response_cache.lookups.total`        | counter         | `host`, `class`, `result`          | Response-cache lookups; `result` is `hit`, `miss`, `stale` or `bypass`. `stale` is recorded only with `staleIfErrorFor` set. |
+| `haybale.response_cache.fills.total`          | counter         | `host`, `class`, `tier`, `result`, `reason`| Finished cache fills; `result` is `stored` or `discarded`. `reason` is present only on a discarded fill. `tier` is where the fill read the response: `upstream`, or `remote` for a fill from the remote tier. A fill that tried the remote tier and fell through to the upstream counts once, as `upstream`. A disk entry answered stale after an upstream attempt records `discarded` with the failure's `reason`; a request the health gate held records no fill; a remote copy served stale records `stored` or `discarded` with `tier=remote`. |
 | `haybale.response_cache.fill_bytes.total`     | counter         | `host`, `class`, `tier`            | Response body bytes fills read from their source, including fills that were discarded or aborted and refs fills. `tier` is `upstream` for a fill from the upstream and `remote` for a fill from the remote tier, which counts the verified bytes read from the bucket. |
-| `haybale.response_cache.served_bytes.total`   | counter         | `host`, `class`, `tier`            | Response bytes served to clients through the cache path.                |
+| `haybale.response_cache.served_bytes.total`   | counter         | `host`, `class`, `tier`            | Response bytes served to clients through the cache path, stale responses included. |
 | `haybale.response_cache.collapsed.total`      | counter         | `host`                             | Requests that joined a fill already in flight instead of fetching upstream. |
 | `haybale.response_cache.store_errors.total`   | counter         | `tier`, `operation`                | Cache storage failures. With `tier=remote` it counts failed requests to the bucket, every remote read that failed or stalled, including one a fill then resumed or fell through on, and remote entries and purge markers that failed verification (`operation=get`). Uploads, background deletions and push invalidation that shutdown cuts short are not counted. |
 | `haybale.response_cache.evictions.total`      | counter         | (none)                             | Entries evicted to stay within the disk budget or retention.            |
@@ -116,7 +116,7 @@ again. The other closed sets are:
 
 | Attribute | Values |
 |-----------|--------|
-| `result` on `lookups.total` | `hit`, `miss`, `bypass`; `stale` is reserved and not emitted |
+| `result` on `lookups.total` | `hit`, `miss`, `stale`, `bypass` |
 | `result` on `fills.total` | `stored`, `discarded` |
 | `reason` on `fills.total` | `error_packet`, `sideband_error`, `framing`, `truncated`, `too_large`, `disk_budget`, `store_error`, `generation`, `upstream_status`, `fetch_error`, `encoding` |
 | `tier` | `disk`, `remote`, `upstream`: the origin of the bytes. `fills.total` and `fill_bytes.total` carry `upstream` or `remote`. On `store_errors.total` it names the tier that failed, `disk` or `remote`. |
@@ -176,16 +176,32 @@ so both sinks receive identical records that are:
 
 The per-request `proxied request` log line and the security events
 (`authn_failed`, `policy_denied`, `upstream_auth_failed`, `token_minted`,
-`cache_integrity_failed`) are emitted through this same chain.
-`cache_integrity_failed` carries `host`, `owner`, `repo` and `class`, plus
-`tier=remote` for an entry or purge marker read from the remote tier, and no
-key material or entry path. A failed entry is deleted. A purge marker that
-fails verification has `class=purge`; it is not deleted, so each replica logs
-the event again about every minute while it receives refs requests for the
-repository, and its pack hits for the repository lapse within `accessRecheck`
-(unless `accessRecheck` is `0s`, which disables the rule), until `haybale cache
-purge --remote` replaces the marker (see [Purging a
-repository](caching.md#purging-a-repository)).
+`cache_integrity_failed`, `cache_stale_served`) are emitted through this same
+chain, the security events at Warn. `cache_integrity_failed` carries `host`,
+`owner`, `repo` and `class`, plus `tier=remote` for an entry or purge marker
+read from the remote tier, and no key material or entry path. A failed entry is
+deleted. A purge marker that fails verification has `class=purge`; it is not
+deleted, so each replica logs the event again about every minute while it
+receives refs requests for the repository, and its pack hits for the
+repository lapse within `accessRecheck` (unless `accessRecheck` is `0s`, which
+disables the rule), until `haybale cache purge --remote` replaces the marker
+(see [Purging a repository](caching.md#purging-a-repository)). With
+`staleIfErrorFor` set, nothing is served stale for the repository meanwhile
+either (see [Purges and stale
+service](caching.md#purges-and-stale-service)).
+
+`cache_stale_served` is logged once for every response the cache answers from a
+stale entry because the upstream could not answer (see [Serving through an
+upstream outage](caching.md#serving-through-an-upstream-outage)). It carries:
+
+| Field             | Meaning |
+|-------------------|---------|
+| `identity`        | The authenticated identity the response was served to. |
+| `host`, `owner`, `repo` | The repository. |
+| `class`           | The request class: `advertisement`, `ls-refs` or `fetch`. |
+| `tier`            | Where the entry came from: `disk` or `remote`. |
+| `reason`          | Why the request was eligible: `connect` (the upstream connection failed), `credential_unavailable` (the credential source could not reach its API), `header_timeout` (no response headers within `responseHeaderTimeout`), `upstream_status` (the upstream answered `500`, `502`, `503` or `504`), or `health_gate` (answered stale while the host's health gate was open, or when a probe's 5-second deadline for response headers expired). |
+| `entryAgeSeconds` | The entry's age in whole seconds, from the creation time sealed into it. |
 
 Operational cache log lines worth alerting on are listed in the caching guide
 under [What to alert on](caching.md#what-to-alert-on).
@@ -200,15 +216,19 @@ handled it:
 |---------------|------------------------------------------------------------------------------------------|
 | `hit`         | Served from a stored entry; the upstream was not contacted for the response body.        |
 | `miss`        | Not served from a stored entry on this replica's disk. The response came from a fill, an upstream fetch or a read from the remote tier, which stored an entry if it completed cleanly (see `cacheStored`). |
-| `stale`       | A stale entry was served because the upstream could not answer. Reserved: it is not emitted while `staleIfErrorFor` is unsupported. |
+| `stale`       | Served from a stored entry older than the freshness rules allow, because the upstream could not answer and `staleIfErrorFor` is set. A `cache_stale_served` security event accompanies it. |
 | `bypass`      | Not eligible for the cache; proxied straight to the upstream.                            |
 
 A `miss` line also carries two boolean fields. `cacheCollapsed` is `true` when
 the request joined a fill already in flight rather than starting its own, and
 `cacheStored` is `true` when that fill committed an entry. The field is absent
 when the cache is disabled and on writes. With `cache.exposeStatus` the
-`Cache-Status` response header carries the same `hit`, `miss` and `bypass`
-values in RFC 9211 form (`hit`, `fwd=miss`, `fwd=bypass`) and adds `collapsed`
-for a request that joined an in-flight fill. A read the cache passed through
-unserved carries `fwd=bypass`. The header is written before a fill
-ends, so it never says whether the entry was stored; only the log does.
+`Cache-Status` response header carries the same values in RFC 9211 form
+(`hit`, `fwd=miss`, `hit; fwd=stale`, `fwd=bypass`) and, on a miss, adds
+`collapsed` for a request that joined an in-flight fill; the stale form never
+carries it. A stale response adds `fwd-status=<n>`
+with the upstream status that made it eligible, as in `haybale; hit; fwd=stale;
+fwd-status=503`, and leaves it out when no upstream response arrived. A read
+the cache passed through unserved carries `fwd=bypass`. The header is written
+before a fill ends, so it never says whether the entry was stored; only the log
+does.

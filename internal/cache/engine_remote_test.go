@@ -394,7 +394,7 @@ func seedPeerWith(t *testing.T, store *memBlobStore, pack []byte, mutate func(*O
 		t.Fatalf("peer fetch = %+v, want a stored miss", out)
 	}
 	wantRefs := 0
-	if peer.opts.RefsMaxAge > 0 {
+	if peer.uploadsGroup(GroupRefs) {
 		wantRefs = 1
 	}
 	waitFor(t, "the peer's uploads", func() bool {

@@ -246,3 +246,29 @@ func subscribersAre(c *Cache, n int) bool {
 
 // shortly is a bound for events that should happen promptly.
 const shortly = 5 * time.Second
+
+// receive returns the next value from ch, failing the test if none
+// arrives shortly.
+func receive[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(shortly):
+		t.Fatalf("timed out waiting for %s", what)
+		var zero T
+		return zero
+	}
+}
+
+// waitGroupShortly waits for wg, failing the test if it is not done
+// shortly.
+func waitGroupShortly(t *testing.T, wg *sync.WaitGroup, what string) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	receive(t, done, what)
+}

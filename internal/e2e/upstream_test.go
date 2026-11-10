@@ -170,6 +170,11 @@ type upstreamFaults struct {
 	// holdReceivePack delays every receive-pack response, headers
 	// included, by this many nanoseconds after the backend has run.
 	holdReceivePack atomic.Int64
+	// rejectCredentials answers every request 401, as an upstream does
+	// when haybale's credential has been revoked.
+	rejectCredentials atomic.Bool
+	// unavailable answers every authenticated request 503.
+	unavailable atomic.Bool
 
 	mu   sync.Mutex
 	held *heldFetch
@@ -221,7 +226,15 @@ func newUpstream(t *testing.T, httpBackendPath, projectRoot string) (*httptest.S
 // newFaultyUpstream is newUpstream with a handle to inject faults.
 func newFaultyUpstream(t *testing.T, httpBackendPath, projectRoot string) (*httptest.Server, *requestRecorder, *upstreamFaults) {
 	t.Helper()
+	handler, rec, faults := newUpstreamHandler(httpBackendPath, projectRoot)
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	return srv, rec, faults
+}
 
+// newUpstreamHandler is the handler behind newFaultyUpstream, for a test
+// that runs it on a server of its own.
+func newUpstreamHandler(httpBackendPath, projectRoot string) (http.Handler, *requestRecorder, *upstreamFaults) {
 	backend := &cgi.Handler{
 		Path: httpBackendPath,
 		Root: "/",
@@ -237,9 +250,13 @@ func newFaultyUpstream(t *testing.T, httpBackendPath, projectRoot string) (*http
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		username, password, ok := r.BasicAuth()
-		if !ok || username != upstreamBasicAuthUsername || password != upstreamBasicAuthToken {
+		if !ok || username != upstreamBasicAuthUsername || password != upstreamBasicAuthToken || faults.rejectCredentials.Load() {
 			w.Header().Set("WWW-Authenticate", `Basic realm="e2e-upstream"`)
 			http.Error(w, "401 Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if faults.unavailable.Load() {
+			http.Error(w, "503 Service Unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		ep := rec.observe(r)
@@ -260,10 +277,7 @@ func newFaultyUpstream(t *testing.T, httpBackendPath, projectRoot string) (*http
 			backend.ServeHTTP(w, r)
 		}
 	})
-
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	return srv, rec, faults
+	return mux, rec, faults
 }
 
 // truncateResponse runs next into a buffer and relays its status and

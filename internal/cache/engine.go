@@ -33,6 +33,10 @@ const (
 // errClientGone reports that the client stopped accepting the response.
 var errClientGone = errors.New("cache: client stopped reading")
 
+// errStaleNeedsHeaderTimeout rejects stale-if-error without a bound on the
+// wait for upstream response headers.
+var errStaleNeedsHeaderTimeout = errors.New("cache: staleIfErrorFor requires a non-zero responseHeaderTimeout; with no header bound a hung upstream would hold requests indefinitely")
+
 // Options configures a Cache.
 type Options struct {
 	// Dir is the cache directory; see openDiskStore for its requirements.
@@ -67,6 +71,10 @@ type Options struct {
 	IdleTimeout time.Duration
 	// ExposeStatus emits the Cache-Status response header.
 	ExposeStatus bool
+	// StaleIfErrorFor is the maximum age of an entry served when upstream
+	// cannot answer a read; zero disables stale service. It must not
+	// exceed Retention, and needs a positive ResponseHeaderTimeout.
+	StaleIfErrorFor time.Duration
 	// Remote is the optional remote tier, shared by every replica that
 	// holds the same key. The implementation bounds the time to first
 	// byte of its Stat and Get calls; nil disables the tier.
@@ -110,11 +118,14 @@ type Cache struct {
 
 	idleGrace     time.Duration
 	flushInterval time.Duration
+	// markerTimeout bounds one read of a repository's purge marker.
+	markerTimeout time.Duration
 
 	gens   generations
 	access accessRecords
 	marks  uncacheableMarks
 	purges purgeRecords
+	gates  healthGates
 
 	// remote is the remote tier, nil when there is none. Uploads and
 	// remote deletions run under remoteCtx, which Close cancels only once
@@ -158,6 +169,20 @@ type fillHooks struct {
 	// markerCheckJoined runs when a refs fill joins another fill's purge
 	// marker read, before it waits for the result.
 	markerCheckJoined func()
+	// afterFetch runs in a fill once its Fetcher has returned a response,
+	// before the fill claims the response from its header timers.
+	afterFetch func(key entryKey)
+	// afterFetchFailed runs in a fill once it has claimed its Fetcher's
+	// error from its header timer.
+	afterFetchFailed func(key entryKey)
+	// beforeStaleOutcome runs in a fill that has found a qualifying
+	// tier-1 entry, before it tells its subscribers to serve it.
+	beforeStaleOutcome func(key entryKey)
+	// afterProbeDeadline runs beside a probe once its deadline has passed,
+	// reporting whether its subscribers were answered stale; answered is
+	// also false when the probe ended while its purge check was still
+	// outstanding.
+	afterProbeDeadline func(key entryKey, answered bool)
 }
 
 // New opens the cache directory, indexes its entries, removes entries
@@ -206,8 +231,10 @@ func New(opts Options) (*Cache, error) {
 		classifySlots: make(chan struct{}, maxClassifications),
 		idleGrace:     fillIdleGrace,
 		flushInterval: sealFlushInterval,
+		markerTimeout: purgeMarkerTimeout,
 		access:        accessRecords{window: opts.AccessRecheck},
 		purges:        purgeRecords{retention: opts.Retention, interval: markerCheckInterval(opts.AccessRecheck)},
+		gates:         healthGates{logger: logger, interval: healthProbeInterval},
 		remote:        opts.Remote,
 		remoteCtx:     remoteCtx,
 		remoteCancel:  remoteCancel,
@@ -245,22 +272,28 @@ func validateOptions(opts Options) error {
 		return fmt.Errorf("cache: max request body must be positive, got %d", opts.MaxRequestBody)
 	case opts.Retention <= 0:
 		return fmt.Errorf("cache: retention must be positive, got %v", opts.Retention)
-	case opts.RefsMaxAge < 0 || opts.AccessRecheck < 0 || opts.ResponseHeaderTimeout < 0 || opts.IdleTimeout < 0 || opts.RemoteHeaderTimeout < 0:
+	case opts.RefsMaxAge < 0 || opts.AccessRecheck < 0 || opts.ResponseHeaderTimeout < 0 || opts.IdleTimeout < 0 || opts.RemoteHeaderTimeout < 0 || opts.StaleIfErrorFor < 0:
 		return errors.New("cache: durations must not be negative")
+	case opts.StaleIfErrorFor > opts.Retention:
+		return fmt.Errorf("cache: stale-if-error age %v must not exceed retention %v", opts.StaleIfErrorFor, opts.Retention)
+	case opts.StaleIfErrorFor > 0 && opts.ResponseHeaderTimeout == 0:
+		return errStaleNeedsHeaderTimeout
 	}
 	return nil
 }
 
 // Serve handles a read that authentication and policy have already
-// allowed. It returns handled=true when the response has been fully
-// written. handled=false means the proxy must run its passthrough path:
-// the request was not cacheable, the key is marked uncacheable, no fill
-// slot was free, or the fill could not serve this request; r.Body then
-// replays the bytes already read, and when the cache exposes its status
-// the Cache-Status bypass header is already set on w. A subscriber whose
-// response fails after bytes were written aborts the connection with
+// allowed for the verified identity, which is recorded on the
+// cache_stale_served event when the read is answered stale. It returns
+// handled=true when the response has been fully written. handled=false
+// means the proxy must run its passthrough path: the request was not
+// cacheable, the key is marked uncacheable, no fill slot was free, or the
+// fill could not serve this request; r.Body then replays the bytes
+// already read, and when the cache exposes its status the Cache-Status
+// bypass header is already set on w. A subscriber whose response fails
+// after bytes were written aborts the connection with
 // panic(http.ErrAbortHandler).
-func (c *Cache) Serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher) (out Outcome, handled bool) {
+func (c *Cache) Serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher, identity string) (out Outcome, handled bool) {
 	release, ok := c.takeClassifySlot(r)
 	if !ok {
 		return c.declined(w, repo.Host, observability.ClassBypass, "body_budget"), false
@@ -269,7 +302,7 @@ func (c *Cache) Serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo
 	// once the request starts streaming a response; this defer releases it
 	// on every other exit, including a panic.
 	defer release()
-	return c.serve(w, r, repo, baseURL, fetch, release)
+	return c.serve(w, r, repo, baseURL, fetch, identity, release)
 }
 
 // takeClassifySlot reserves a classification slot for a request with a
@@ -291,7 +324,7 @@ func (c *Cache) takeClassifySlot(r *http.Request) (release func(), ok bool) {
 // serve classifies the request and answers it from an entry or a fill.
 // release frees the request's classification slot; serve calls it before
 // it starts streaming a response, so a long transfer does not hold a slot.
-func (c *Cache) serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher, release func()) (Outcome, bool) {
+func (c *Cache) serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher, identity string, release func()) (Outcome, bool) {
 	host := repo.Host
 	req, bypass, reason, err := classify(r, repo, c.opts.MaxRequestBody)
 	if err != nil {
@@ -303,40 +336,69 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo
 	}
 	class := string(req.Class)
 	key := entryKey{Group: req.Class.Group(), RepoHash: c.keyring.RepoHash(baseURL, repo), KeyHash: c.keyring.pathHash(req.Digest)}
+	// A request the health gate holds is answered from its stale entry
+	// wherever it would otherwise start or join a fill. A request that
+	// cannot become the probe, because its key is marked uncacheable or no
+	// fill slot is free, is answered from it whenever the gate is open.
 	if c.marks.marked(key, c.now()) {
+		if out, ok := c.serveHeld(w, r, key, repo, class, identity, release, true); ok {
+			return out, true
+		}
 		return c.declined(w, host, class, "uncacheable"), false
 	}
 	if key.Group == GroupRefs && c.opts.RefsMaxAge <= 0 {
+		if out, ok := c.serveHeld(w, r, key, repo, class, identity, release, false); ok {
+			return out, true
+		}
+		if r.Context().Err() != nil {
+			return Outcome{Result: observability.ResultMiss}, true
+		}
 		f, ok := c.startSingle(key, req, repo, baseURL, fetch)
 		if !ok {
+			if out, ok := c.serveHeld(w, r, key, repo, class, identity, release, true); ok {
+				return out, true
+			}
 			return c.declined(w, host, class, "no_slot"), false
 		}
 		release()
-		return c.subscribe(w, r, f, false, repo, class)
+		return c.subscribe(w, r, f, false, repo, class, identity)
 	}
 
 	if e := c.openEntry(key, repo, class, true); e != nil {
 		release()
-		if out, ok := c.serveOpened(w, e, repo, class, observability.ResultHit, false, observability.TierDisk); ok {
+		if out, ok := c.serveOpened(w, e, repo, class, cacheStatus{result: observability.ResultHit}, observability.TierDisk); ok {
 			return out, true
 		}
+	}
+	if out, ok := c.serveHeld(w, r, key, repo, class, identity, release, false); ok {
+		return out, true
+	}
+	// A client that left while the held path waited for the purge marker
+	// starts no fill and cannot become the probe.
+	if r.Context().Err() != nil {
+		return Outcome{Result: observability.ResultMiss}, true
 	}
 	// A stored entry that fails verification before any byte is written
 	// has been deleted, so the request joins or starts a fill instead; a
 	// second failure of a freshly committed entry is declined.
 	for range 2 {
 		f, e, collapsed, declined := c.joinOrStart(key, req, repo, baseURL, fetch, class)
+		if declined == "no_slot" {
+			if out, ok := c.serveHeld(w, r, key, repo, class, identity, release, true); ok {
+				return out, true
+			}
+		}
 		if declined != "" {
 			return c.declined(w, host, class, declined), false
 		}
 		release()
 		if e != nil {
-			if out, ok := c.serveOpened(w, e, repo, class, observability.ResultHit, false, observability.TierDisk); ok {
+			if out, ok := c.serveOpened(w, e, repo, class, cacheStatus{result: observability.ResultHit}, observability.TierDisk); ok {
 				return out, true
 			}
 			continue
 		}
-		return c.subscribe(w, r, f, collapsed, repo, class)
+		return c.subscribe(w, r, f, collapsed, repo, class, identity)
 	}
 	return c.declined(w, host, class, "verification"), false
 }
@@ -345,7 +407,7 @@ func (c *Cache) serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo
 // the passthrough path.
 func (c *Cache) declined(w http.ResponseWriter, host, class, reason string) Outcome {
 	c.metrics.RecordResponseCacheLookup(context.Background(), host, class, observability.ResultBypass)
-	c.setCacheStatus(w.Header(), observability.ResultBypass, false)
+	c.setCacheStatus(w.Header(), cacheStatus{result: observability.ResultBypass})
 	c.logger.Debug("bypass", "host", host, "class", class, "reason", reason)
 	return Outcome{Result: observability.ResultBypass}
 }
@@ -405,14 +467,14 @@ func (c *Cache) openEntry(key entryKey, repo gitproto.Repo, class string, fresh 
 	return &openedEntry{entry: entry, sr: sr}
 }
 
-// serveOpened streams a verified entry to the client, labelled with
-// result and tier. ok is false when the body failed verification before
-// any byte was written; the entry has then been deleted and the caller
-// treats the request as a miss. A failure after bytes were written also
-// deletes the entry and then aborts the response.
-func (c *Cache) serveOpened(w http.ResponseWriter, e *openedEntry, repo gitproto.Repo, class, result string, collapsed bool, tier string) (Outcome, bool) {
+// serveOpened streams a verified entry to the client, labelled with the
+// status's result and with tier. ok is false when the body failed
+// verification before any byte was written; the entry has then been
+// deleted and the caller treats the request as a miss. A failure after
+// bytes were written also deletes the entry and then aborts the response.
+func (c *Cache) serveOpened(w http.ResponseWriter, e *openedEntry, repo gitproto.Repo, class string, st cacheStatus, tier string) (Outcome, bool) {
 	defer e.close()
-	n, started, err := c.stream(w, e.sr, e.sr.Header().ContentType, result, collapsed)
+	n, started, err := c.stream(w, e.sr, e.sr.Header().ContentType, st)
 	switch {
 	case errors.Is(err, errClientGone):
 	case err != nil && !started:
@@ -424,9 +486,9 @@ func (c *Cache) serveOpened(w http.ResponseWriter, e *openedEntry, repo gitproto
 		panic(http.ErrAbortHandler)
 	}
 	ctx := context.Background()
-	c.metrics.RecordResponseCacheLookup(ctx, repo.Host, class, result)
+	c.metrics.RecordResponseCacheLookup(ctx, repo.Host, class, st.result)
 	c.metrics.RecordResponseCacheServedBytes(ctx, repo.Host, class, tier, n)
-	return Outcome{Result: result, Collapsed: collapsed, Status: http.StatusOK, BytesOut: n}, true
+	return Outcome{Result: st.result, Collapsed: st.collapsed, Status: http.StatusOK, BytesOut: n}, true
 }
 
 // verifyHeader checks that a verified header belongs at key and carries a
@@ -595,7 +657,7 @@ func (c *Cache) releaseSlot(group Group) {
 // after the fill committed is served from the committed entry; one that
 // attaches after a discard decision still reads the spool, which the fill
 // keeps until every attached subscriber has opened it.
-func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, collapsed bool, repo gitproto.Repo, class string) (Outcome, bool) {
+func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, collapsed bool, repo gitproto.Repo, class, identity string) (Outcome, bool) {
 	host := repo.Host
 	opened := false
 	defer func() { f.detach(opened) }()
@@ -613,17 +675,22 @@ func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, colla
 	case fillReleased:
 		return c.declined(w, host, class, "fill_released"), false
 	case fillShared:
-		h := w.Header()
-		for k, vs := range out.header {
-			h[k] = append([]string(nil), vs...)
+		return c.writeShared(w, &out, host, class, collapsed), true
+	case fillStale:
+		if res, ok := c.serveStaleEntry(w, f.key, repo, class, collapsed, identity, out.stale); ok {
+			return res, true
 		}
-		c.setCacheStatus(h, observability.ResultMiss, collapsed)
-		w.WriteHeader(out.status)
-		n, _ := w.Write(out.body)
-		c.metrics.RecordResponseCacheLookup(ctx, host, class, observability.ResultMiss)
-		return Outcome{Result: observability.ResultMiss, Collapsed: collapsed, Status: out.status, BytesOut: int64(n)}, true
+		if out.fallback.kind == fillShared {
+			return c.writeShared(w, out.fallback, host, class, collapsed), true
+		}
+		return c.declined(w, host, class, "fill_released"), false
 	}
 
+	st := cacheStatus{result: observability.ResultMiss, collapsed: collapsed}
+	servedAt := c.now()
+	if out.stale != nil {
+		st = cacheStatus{result: observability.ResultStale, collapsed: collapsed, fwdStatus: out.stale.fwdStatus}
+	}
 	if h := c.hooks.beforeOpenReader; h != nil {
 		h(f.key)
 	}
@@ -640,9 +707,12 @@ func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, colla
 		if e == nil {
 			return c.declined(w, host, class, "fill_ended"), false
 		}
-		res, ok := c.serveOpened(w, e, repo, class, observability.ResultMiss, collapsed, out.tier)
+		res, ok := c.serveOpened(w, e, repo, class, st, out.tier)
 		if !ok {
 			return c.declined(w, host, class, "verification"), false
+		}
+		if out.stale != nil {
+			c.logStaleServed(identity, repo, class, out.tier, out.stale, servedAt)
 		}
 		<-f.done
 		res.Stored = f.stored
@@ -660,26 +730,95 @@ func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, colla
 	if err != nil {
 		return c.declined(w, host, class, "fill_failed"), false
 	}
-	n, started, err := c.stream(w, sr, out.contentType, observability.ResultMiss, collapsed)
+	n, started, err := c.stream(w, sr, out.contentType, st)
 	if err != nil && r.Context().Err() != nil {
 		err = errClientGone
 	}
 	switch {
 	case errors.Is(err, errClientGone):
-		c.metrics.RecordResponseCacheLookup(ctx, host, class, observability.ResultMiss)
-		return Outcome{Result: observability.ResultMiss, Collapsed: collapsed, Status: http.StatusOK, BytesOut: n}, true
+		c.metrics.RecordResponseCacheLookup(ctx, host, class, st.result)
+		if out.stale != nil {
+			c.logStaleServed(identity, repo, class, out.tier, out.stale, servedAt)
+		}
+		return Outcome{Result: st.result, Collapsed: collapsed, Status: http.StatusOK, BytesOut: n}, true
 	case err != nil && !started:
 		return c.declined(w, host, class, "fill_failed"), false
 	case err != nil:
 		c.logger.Warn("fill failed mid-stream; aborting the response", "host", host, "class", class, "error", err)
 		panic(http.ErrAbortHandler)
 	}
-	c.metrics.RecordResponseCacheLookup(ctx, host, class, observability.ResultMiss)
+	c.metrics.RecordResponseCacheLookup(ctx, host, class, st.result)
 	c.metrics.RecordResponseCacheServedBytes(ctx, host, class, out.tier, n)
+	if out.stale != nil {
+		c.logStaleServed(identity, repo, class, out.tier, out.stale, servedAt)
+	}
 	// The spool reaches EOF only once the fill has committed or discarded
 	// it, so the fill is about to finish and its result is known.
 	<-f.done
-	return Outcome{Result: observability.ResultMiss, Collapsed: collapsed, Stored: f.stored, Status: http.StatusOK, BytesOut: n}, true
+	return Outcome{Result: st.result, Collapsed: collapsed, Stored: f.stored, Status: http.StatusOK, BytesOut: n}, true
+}
+
+// writeShared writes a fill's shared non-200 response.
+func (c *Cache) writeShared(w http.ResponseWriter, out *fillOutcome, host, class string, collapsed bool) Outcome {
+	h := w.Header()
+	for k, vs := range out.header {
+		h[k] = append([]string(nil), vs...)
+	}
+	c.setCacheStatus(h, cacheStatus{result: observability.ResultMiss, collapsed: collapsed})
+	w.WriteHeader(out.status)
+	n, _ := w.Write(out.body)
+	c.metrics.RecordResponseCacheLookup(context.Background(), host, class, observability.ResultMiss)
+	return Outcome{Result: observability.ResultMiss, Collapsed: collapsed, Status: out.status, BytesOut: int64(n)}
+}
+
+// serveHeld answers a request whose host's health gate holds it from the
+// key's qualifying tier-1 stale entry, before any fill slot, spool or
+// upstream request is taken. With a remote tier the repository's purge
+// state must be known current first; the classification slot is released
+// before that check, since the body is already buffered. noProbe reports
+// that the request cannot become the gate's probe, so an open gate holds
+// it even when a probe is due. ok is false, with nothing written, when
+// stale service is disabled, the gate does not hold the host, the purge
+// state is not current, or no tier-1 entry qualifies; the request then
+// proceeds as it would otherwise.
+func (c *Cache) serveHeld(w http.ResponseWriter, r *http.Request, key entryKey, repo gitproto.Repo, class, identity string, release func(), noProbe bool) (Outcome, bool) {
+	gated := c.gates.held(repo.Host, c.now()) || noProbe && c.gates.isOpen(repo.Host)
+	if !c.staleEnabled() || !gated {
+		return Outcome{}, false
+	}
+	release()
+	if !c.purgeCurrent(r.Context(), repo, key.RepoHash) {
+		return Outcome{}, false
+	}
+	e := c.openStaleEntry(key, repo, class)
+	if e == nil {
+		return Outcome{}, false
+	}
+	return c.serveStaleOpened(w, e, repo, class, false, identity, &staleService{reason: staleReasonHealthGate})
+}
+
+// serveStaleEntry answers the request from the stale tier-1 entry for
+// key and records the cache_stale_served event. ok is false, with nothing
+// written, when no entry qualifies any longer.
+func (c *Cache) serveStaleEntry(w http.ResponseWriter, key entryKey, repo gitproto.Repo, class string, collapsed bool, identity string, st *staleService) (Outcome, bool) {
+	e := c.openStaleEntry(key, repo, class)
+	if e == nil {
+		return Outcome{}, false
+	}
+	return c.serveStaleOpened(w, e, repo, class, collapsed, identity, st)
+}
+
+// serveStaleOpened streams the opened stale entry e as serveStaleEntry
+// does, and closes it.
+func (c *Cache) serveStaleOpened(w http.ResponseWriter, e *openedEntry, repo gitproto.Repo, class string, collapsed bool, identity string, st *staleService) (Outcome, bool) {
+	served := *st
+	served.createdAt = e.sr.Header().CreatedAt
+	servedAt := c.now()
+	res, ok := c.serveOpened(w, e, repo, class, cacheStatus{result: observability.ResultStale, collapsed: collapsed, fwdStatus: st.fwdStatus}, observability.TierDisk)
+	if ok {
+		c.logStaleServed(identity, repo, class, observability.TierDisk, &served, servedAt)
+	}
+	return res, ok
 }
 
 // stream copies verified plaintext from src to w, flushing after every
@@ -687,7 +826,7 @@ func (c *Cache) subscribe(w http.ResponseWriter, r *http.Request, f *fill, colla
 // so a failure before any byte leaves w untouched and started false; a
 // failure after that returns the error with started true. errClientGone
 // reports that the client stopped accepting bytes.
-func (c *Cache) stream(w http.ResponseWriter, src io.Reader, contentType, result string, collapsed bool) (n int64, started bool, err error) {
+func (c *Cache) stream(w http.ResponseWriter, src io.Reader, contentType string, st cacheStatus) (n int64, started bool, err error) {
 	buf := make([]byte, segmentSize)
 	k, rerr := src.Read(buf)
 	if k == 0 && rerr != nil && !errors.Is(rerr, io.EOF) {
@@ -698,7 +837,7 @@ func (c *Cache) stream(w http.ResponseWriter, src io.Reader, contentType, result
 	h.Set("Cache-Control", "no-cache, max-age=0, must-revalidate")
 	h.Set("Pragma", "no-cache")
 	h.Set("Expires", "Fri, 01 Jan 1980 00:00:00 GMT")
-	c.setCacheStatus(h, result, collapsed)
+	c.setCacheStatus(h, st)
 	w.WriteHeader(http.StatusOK)
 	rc := http.NewResponseController(w)
 	for {

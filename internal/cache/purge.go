@@ -32,7 +32,7 @@ const (
 	purgeMarkerTimeout = 30 * time.Second
 	// purgeCheckBackoff is how long after a failed marker read the
 	// repository's marker is not read again, so an unreachable remote tier
-	// costs a refs fill its header timeout at most once per interval.
+	// costs a caller the marker timeout at most once per interval.
 	purgeCheckBackoff = janitorInterval
 )
 
@@ -366,14 +366,15 @@ type purgeRecords struct {
 	inflight map[[32]byte]*markerCheck
 }
 
-// markerCheck is one purge marker read that concurrent refs fills of a
-// repository share. current is valid once done is closed.
+// markerCheck is one purge marker read that concurrent callers for a
+// repository share: refs fills, gate probes, and the fills and held
+// requests deciding on stale service. current is valid once done is closed.
 type markerCheck struct {
 	done    chan struct{}
 	current bool
 }
 
-// checkStart says what a refs fill does about the repository's marker.
+// checkStart says what a caller does about the repository's marker.
 type checkStart uint8
 
 const (
@@ -381,9 +382,10 @@ const (
 	checkCurrent checkStart = iota + 1
 	// checkBackoff: a check failed within purgeCheckBackoff.
 	checkBackoff
-	// checkJoin: another fill's check is in flight; wait for it.
+	// checkJoin: another caller's check is in flight; wait for it.
 	checkJoin
-	// checkLead: this fill reads the marker and must call finishCheck.
+	// checkLead: this caller starts the read, which must end in
+	// finishCheck.
 	checkLead
 )
 
@@ -417,7 +419,7 @@ func (p *purgeRecords) observe(repoHash [32]byte, times purgeTimes, now time.Tim
 	return merged, advanced
 }
 
-// beginCheck decides how a refs fill at now learns whether repoHash's
+// beginCheck decides how a caller at now learns whether repoHash's
 // purge state is current. For checkJoin and checkLead it returns the
 // shared check.
 func (p *purgeRecords) beginCheck(repoHash [32]byte, now time.Time) (checkStart, *markerCheck) {
@@ -443,9 +445,10 @@ func (p *purgeRecords) beginCheck(repoHash [32]byte, now time.Time) (checkStart,
 	return checkLead, mc
 }
 
-// finishCheck ends the check mc a fill led for repoHash at now: a current
+// finishCheck ends the shared check mc for repoHash at now: a current
 // result is remembered for the interval, and failed starts the backoff.
-// A check that is neither, cut short by its fill's end, records nothing.
+// A check that is neither, cut short by the cache closing, records
+// nothing.
 func (p *purgeRecords) finishCheck(repoHash [32]byte, mc *markerCheck, current, failed bool, now time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

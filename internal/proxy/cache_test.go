@@ -28,13 +28,15 @@ import (
 type recordingCache struct {
 	mu          sync.Mutex
 	serves      []gitproto.Repo
+	identities  []string
 	invalidates []gitproto.Repo
 	handle      bool
 }
 
-func (c *recordingCache) Serve(w http.ResponseWriter, _ *http.Request, repo gitproto.Repo, _ *url.URL, _ cache.Fetcher) (cache.Outcome, bool) {
+func (c *recordingCache) Serve(w http.ResponseWriter, _ *http.Request, repo gitproto.Repo, _ *url.URL, _ cache.Fetcher, identity string) (cache.Outcome, bool) {
 	c.mu.Lock()
 	c.serves = append(c.serves, repo)
+	c.identities = append(c.identities, identity)
 	c.mu.Unlock()
 	if !c.handle {
 		return cache.Outcome{Result: observability.ResultBypass}, false
@@ -116,6 +118,9 @@ func TestCacheIsOfferedOnlyAfterAuthnAndPolicyAndNeverReadsDeniedBodies(t *testi
 			serves, _ := rc.counts()
 			if (serves == 1) != tt.wantServe {
 				t.Errorf("cache Serve called %d times, want called = %v", serves, tt.wantServe)
+			}
+			if serves == 1 && rc.identities[0] != testIdentityID {
+				t.Errorf("cache Serve identity = %q, want the verified identity %q", rc.identities[0], testIdentityID)
 			}
 			if (body.reads.Load() > 0) != tt.wantRead {
 				t.Errorf("body read %d times, want read = %v", body.reads.Load(), tt.wantRead)

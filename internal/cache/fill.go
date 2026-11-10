@@ -58,6 +58,17 @@ const (
 	contentTypeAdvertisement = "application/x-git-upload-pack-advertisement"
 )
 
+// Values of fill.headerCut.
+const (
+	headerCutNone uint32 = iota
+	// headerCutTimeout: the response-header timeout expired.
+	headerCutTimeout
+	// headerCutArrived: response headers arrived before the timer.
+	headerCutArrived
+	// headerCutFailed: the upstream request failed before the timer.
+	headerCutFailed
+)
+
 // errOversizeGrowth reports that a response outgrew the entry size limit
 // and the free disk budget could not hold the rest of it.
 var errOversizeGrowth = errors.New("cache: response exceeds the entry size limit and the free budget")
@@ -74,6 +85,10 @@ const (
 	// fillReleased: the fill cannot serve its subscribers, which take the
 	// passthrough path instead.
 	fillReleased
+	// fillStale: upstream could not answer and every subscriber serves the
+	// stale tier-1 entry itself, or the fallback outcome when it cannot
+	// open that entry.
+	fillStale
 )
 
 // fillOutcome is the header outcome of a fill, fixed once headerReady is
@@ -87,6 +102,11 @@ type fillOutcome struct {
 	status int
 	header http.Header
 	body   []byte
+	// stale is set for a fillStale outcome and for a streaming outcome
+	// that spools a stale remote entry.
+	stale *staleService
+	// fallback is the shared or released outcome of a fillStale outcome.
+	fallback *fillOutcome
 }
 
 // fill is one response spooled on disk for its subscribers, read from the
@@ -109,6 +129,10 @@ type fill struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	abandoned atomic.Bool
+	// headerCut records whether response headers arrived or the
+	// response-header timer cancelled the upstream request first;
+	// whichever is set first stands.
+	headerCut atomic.Uint32
 
 	spool       *spool
 	headerReady chan struct{}
@@ -138,17 +162,26 @@ type fill struct {
 
 	// Guarded by Cache.mu. pending counts subscribers that have attached
 	// but not yet opened the spool or left; noPending is closed once the
-	// fill has ended and pending is zero.
+	// fill has ended and pending is zero. probing is set while the fill is
+	// its host's health-gate probe, during which it is not abandoned, so
+	// the probe's result always reaches the gate.
 	subscribers   int
 	pending       int
 	ended         bool
 	idle          *time.Timer
 	noPending     chan struct{}
 	pendingClosed bool
+	probing       bool
 
 	// dropEntry marks a committed refs entry that a push superseded. It is
 	// deleted by releaseSpool once pending subscribers have opened it.
 	dropEntry bool
+
+	// purge is the purge marker check started beside the upstream
+	// request, and remoteUnavailable records that the remote tier held no
+	// readable copy of the entry; both belong to the fill goroutine.
+	purge             *purgeCheck
+	remoteUnavailable bool
 }
 
 func (c *Cache) newFill(key entryKey, req Request, repo gitproto.Repo, baseURL *url.URL, fetch Fetcher, shared bool) *fill {
@@ -189,26 +222,81 @@ func (f *fill) run() {
 }
 
 func (f *fill) perform() {
-	if f.remoteEligible() && f.fillFromRemote() {
+	if f.remoteEligible() && f.fillFromRemote(nil) {
 		return
 	}
-	// A refs fill from upstream renews the repository's access record, so
-	// the purge marker is checked first, alongside the upstream request.
-	purge := f.startPurgeCheck()
-	defer purge.wait()
-	resp, err := f.fetchHeaders()
+	probing := false
+	if f.c.staleEnabled() {
+		held, probe := f.c.gates.admit(f.repo.Host, f.c.now())
+		if held && f.serveStale(upstreamResult{eligible: true, reason: staleReasonHealthGate}, fillOutcome{kind: fillReleased}, "") {
+			return
+		}
+		probing = probe
+	}
+	if probing {
+		f.setProbing(true)
+	}
+	// The probe ends once upstream headers or the fetch error arrive, not
+	// when the body has streamed, so a newer failure can admit the next.
+	endProbe := func() {
+		if probing {
+			probing = false
+			f.c.gates.endProbe(f.repo.Host, f.c.now())
+			f.setProbing(false)
+		}
+	}
+	defer endProbe()
+	// A refs fill from upstream renews the repository's access record, and
+	// a probe may answer stale at its deadline, so for both the purge
+	// marker is checked alongside the upstream request.
+	purge := f.startPurgeCheck(probing)
+	f.purge = purge
+	if purge != nil {
+		defer purge.wait()
+	}
+	started := f.c.now()
+	resp, done, err := f.fetchHeaders(probing)
 	if err != nil {
 		// The error is not logged: a credential source's error may carry
 		// upstream response bytes.
 		f.logger().Debug("upstream fetch failed")
-		f.release(observability.FillReasonFetchError, transientCooldown)
+		var res upstreamResult
+		// A cancelled fill's dial error says nothing about upstream.
+		if f.ctx.Err() == nil {
+			res = classifyFetchError(err, f.headerCut.Load() == headerCutTimeout)
+		}
+		f.reportHealth(res, started)
+		endProbe()
+		f.releaseOrServeStale(res, observability.FillReasonFetchError)
+		return
+	}
+	res := classifyStatus(upstreamStatus(resp))
+	f.reportHealth(res, started)
+	probed := probing
+	endProbe()
+	// A probe that no client holds any longer has told the gate what it
+	// needed; its body is not read, so it reserves and evicts nothing.
+	if probed && f.abandonIfUnheld() {
+		_ = resp.Body.Close()
+		done()
+		f.logger().Debug("probe ended with no subscriber; its response is discarded")
+		f.release(observability.FillReasonFetchError, 0)
 		return
 	}
 	body := newIdleReader(resp.Body, f.c.opts.IdleTimeout, f.cancel)
-	defer func() { _ = body.Close() }()
+	// Closing the body stops its idle timer, which would otherwise cancel
+	// the fill while it serves a stale entry instead.
+	var closeOnce sync.Once
+	closeUpstream := func() {
+		closeOnce.Do(func() {
+			_ = body.Close()
+			done()
+		})
+	}
+	defer closeUpstream()
 
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != responseContentType(f.req.Class) {
-		f.share(resp, body)
+		f.share(resp, body, res, closeUpstream)
 		return
 	}
 	if !identityEncoded(resp.Header) {
@@ -228,35 +316,75 @@ func (f *fill) perform() {
 	f.streamBody(resp.ContentLength, body)
 }
 
-// fetchHeaders performs the upstream round trip, cancelling the fill if
-// response headers do not arrive within the response-header timeout. The
-// timer is stopped once headers arrive so the body is not bounded by it.
-func (f *fill) fetchHeaders() (*http.Response, error) {
+// fetchHeaders performs the upstream round trip under a context of its
+// own, cancelled if response headers do not arrive within the
+// response-header timeout; headerCut records whether they did. The timer
+// is stopped once headers arrive so the body is not bounded by it. A
+// probe's round trip runs beside answerAtProbeDeadline, which has returned
+// by the time fetchHeaders does. The caller calls done once it has
+// finished with the body.
+func (f *fill) fetchHeaders(probing bool) (resp *http.Response, done context.CancelFunc, err error) {
+	ctx, cancel := context.WithCancel(f.ctx)
 	if t := f.c.opts.ResponseHeaderTimeout; t > 0 {
-		timer := time.AfterFunc(t, f.cancel)
+		timer := time.AfterFunc(t, func() {
+			if f.headerCut.CompareAndSwap(headerCutNone, headerCutTimeout) {
+				cancel()
+			}
+		})
 		defer timer.Stop()
 	}
-	resp, err := f.fetch.Fetch(f.ctx, f.req)
+	if probing {
+		stop, exited := make(chan struct{}), make(chan struct{})
+		go f.answerAtProbeDeadline(stop, exited)
+		defer func() {
+			close(stop)
+			<-exited
+		}()
+	}
+	resp, err = f.fetch.Fetch(ctx, f.req)
+	if err == nil && (resp == nil || resp.Body == nil) {
+		err = errors.New("cache: fetcher returned no response body")
+	}
+	if err == nil {
+		if h := f.c.hooks.afterFetch; h != nil {
+			h(f.key)
+		}
+		// A timer that fired after Fetch returned has cancelled the body's
+		// context, so the response is treated as cut by the timer.
+		if !f.headerCut.CompareAndSwap(headerCutNone, headerCutArrived) {
+			_ = resp.Body.Close()
+			err = context.Canceled
+		}
+	} else {
+		// Once claimed, a failure keeps its own classification even if the
+		// timer fires before the caller reads headerCut.
+		f.headerCut.CompareAndSwap(headerCutNone, headerCutFailed)
+		if h := f.c.hooks.afterFetchFailed; h != nil {
+			h(f.key)
+		}
+	}
 	if err != nil {
-		return nil, err
+		cancel()
+		return nil, nil, err
 	}
-	if resp == nil || resp.Body == nil {
-		return nil, errors.New("cache: fetcher returned no response body")
-	}
-	return resp, nil
+	return resp, cancel, nil
 }
 
 // share relays a non-streamable upstream response to every subscriber:
 // the body is buffered up to sharedBodyLimit and, with the response
-// headers and status, becomes the one response they all write.
-func (f *fill) share(resp *http.Response, body io.Reader) {
+// headers and status, becomes the one response they all write. A status
+// eligible for stale service is answered from a stale entry instead when
+// one qualifies. closeUpstream ends the upstream request once the body
+// has been buffered.
+func (f *fill) share(resp *http.Response, body io.Reader, res upstreamResult, closeUpstream func()) {
 	buf, err := io.ReadAll(io.LimitReader(body, sharedBodyLimit+1))
+	closeUpstream()
 	switch {
 	case err != nil:
-		f.release(observability.FillReasonFetchError, transientCooldown)
+		f.releaseOrServeStale(res, observability.FillReasonFetchError)
 		return
 	case len(buf) > sharedBodyLimit:
-		f.release(observability.FillReasonUpstreamStatus, transientCooldown)
+		f.releaseOrServeStale(res, observability.FillReasonUpstreamStatus)
 		return
 	}
 	h := make(http.Header, len(resp.Header))
@@ -266,8 +394,110 @@ func (f *fill) share(resp *http.Response, body io.Reader) {
 		}
 	}
 	h.Set("Content-Length", strconv.Itoa(len(buf)))
+	shared := fillOutcome{kind: fillShared, status: resp.StatusCode, header: h, body: buf}
+	if f.serveStale(res, shared, observability.FillReasonUpstreamStatus) {
+		return
+	}
 	f.finish(observability.FillResultDiscarded, observability.FillReasonUpstreamStatus, transientCooldown)
-	f.setOutcome(fillOutcome{kind: fillShared, status: resp.StatusCode, header: h, body: buf})
+	f.setOutcome(shared)
+}
+
+// reportHealth applies the result of the fill's upstream request, begun
+// at started, to its host's health gate while stale-if-error is enabled.
+func (f *fill) reportHealth(res upstreamResult, started time.Time) {
+	if f.c.staleEnabled() {
+		f.c.gates.report(f.repo.Host, res, started, f.c.now())
+	}
+}
+
+// answerAtProbeDeadline runs beside a probe's upstream request until stop
+// is closed, then closes exited. Once the probe interval has passed, if
+// no response headers have arrived and the repository's purge state is
+// known current, it answers the fill's subscribers from the key's
+// qualifying tier-1 entry with reason health_gate and unregisters the
+// fill. The upstream request carries on either way, so its result still
+// reaches the gate.
+func (f *fill) answerAtProbeDeadline(stop <-chan struct{}, exited chan<- struct{}) {
+	defer close(exited)
+	defer func() {
+		if r := recover(); r != nil {
+			f.c.logger.Error("probe deadline panicked", "class", f.req.Class, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+		}
+	}()
+	timer := time.NewTimer(f.c.gates.interval)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-stop:
+		return
+	}
+	answered := false
+	if h := f.c.hooks.afterProbeDeadline; h != nil {
+		defer func() { h(f.key, answered) }()
+	}
+	select {
+	case <-f.purge.done:
+	case <-stop:
+		return
+	}
+	released := fillOutcome{kind: fillReleased}
+	st := &staleService{reason: staleReasonHealthGate, fallback: released}
+	if f.purge.current && f.headerCut.Load() == headerCutNone && f.tier1Stale(st) {
+		f.publishStale(st, released)
+		f.unregister()
+		answered = true
+	}
+}
+
+// unregister removes a shared fill from Cache.fills, so later requests
+// for its key no longer join it: once a probe's subscribers have been
+// answered stale, a later request is held by the gate or starts its own
+// fill, and never inherits that answer.
+func (f *fill) unregister() {
+	c := f.c
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if f.shared && c.fills[f.key] == f {
+		delete(c.fills, f.key)
+	}
+}
+
+// abandonIfUnheld reports whether no subscriber holds the fill any longer,
+// and if so marks it abandoned, so that finishing it marks nothing.
+func (f *fill) abandonIfUnheld() bool {
+	c := f.c
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if f.subscribers > 0 || f.ended {
+		return false
+	}
+	f.abandoned.Store(true)
+	return true
+}
+
+// setProbing records whether the fill is its host's probe. Once the probe
+// ends, a fill that no subscriber holds any longer is cancelled after the
+// idle grace period, as detach would have scheduled.
+func (f *fill) setProbing(on bool) {
+	c := f.c
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	f.probing = on
+	if !on && f.subscribers == 0 && !f.ended {
+		if f.idle != nil {
+			f.idle.Stop()
+		}
+		f.idle = time.AfterFunc(c.idleGrace, f.abandon)
+	}
+}
+
+// releaseOrServeStale answers the fill's subscribers from a stale entry
+// when res is eligible and one qualifies, and otherwise releases them to
+// the passthrough path.
+func (f *fill) releaseOrServeStale(res upstreamResult, reason string) {
+	if !f.serveStale(res, fillOutcome{kind: fillReleased}, reason) {
+		f.release(reason, transientCooldown)
+	}
 }
 
 // openSpool reserves disk for the response and writes the sealed header.
@@ -519,6 +749,8 @@ func (f *fill) abort(err error, reason string) {
 // finish records the fill's result once and marks the key uncacheable for
 // markFor when it is positive. A fill cancelled because its subscribers
 // left marks nothing: the next request for the key should start afresh.
+// Nor does a fetch error while stale service is enabled, so the next
+// request for the key can still be answered stale.
 func (f *fill) finish(result, reason string, markFor time.Duration) {
 	if f.finished {
 		return
@@ -528,6 +760,9 @@ func (f *fill) finish(result, reason string, markFor time.Duration) {
 	f.c.metrics.RecordResponseCacheFill(ctx, f.repo.Host, string(f.req.Class), f.source, result, reason)
 	if f.fetched > 0 {
 		f.c.metrics.RecordResponseCacheFillBytes(ctx, f.repo.Host, string(f.req.Class), f.source, f.fetched)
+	}
+	if reason == observability.FillReasonFetchError && f.c.staleEnabled() {
+		markFor = 0
 	}
 	if markFor > 0 && !f.abandoned.Load() {
 		now := f.c.now()
@@ -603,9 +838,9 @@ func (f *fill) readerOpened() {
 	f.c.mu.Unlock()
 }
 
-// detach removes a subscriber and, when none remain, schedules the fill's
-// cancellation after the idle grace period. opened reports whether the
-// subscriber called readerOpened.
+// detach removes a subscriber and, when none remain and the fill is not
+// its host's probe, schedules the fill's cancellation after the idle grace
+// period. opened reports whether the subscriber called readerOpened.
 func (f *fill) detach(opened bool) {
 	c := f.c
 	c.mu.Lock()
@@ -615,7 +850,7 @@ func (f *fill) detach(opened bool) {
 		f.pending--
 		f.signalPendingLocked()
 	}
-	if f.subscribers == 0 && !f.ended {
+	if f.subscribers == 0 && !f.ended && !f.probing {
 		f.idle = time.AfterFunc(c.idleGrace, f.abandon)
 	}
 }
@@ -630,12 +865,12 @@ func (f *fill) signalPendingLocked() {
 }
 
 // abandon cancels a fill that still has no subscribers when the grace
-// period ends.
+// period ends, unless it has since become its host's probe.
 func (f *fill) abandon() {
 	c := f.c
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if f.subscribers == 0 && !f.ended {
+	if f.subscribers == 0 && !f.ended && !f.probing {
 		f.abandoned.Store(true)
 		f.cancel()
 	}

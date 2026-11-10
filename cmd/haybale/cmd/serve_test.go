@@ -226,7 +226,8 @@ func TestNewResponseCacheDisabled(t *testing.T) {
 
 // TestNewResponseCacheEnabled confirms an enabled cache block builds a
 // cache under an ephemeral key, creates its directory, yields the proxy
-// option that installs it, and closes cleanly within the bound.
+// options that install it and bound passthrough reads, and closes
+// cleanly within the bound.
 func TestNewResponseCacheEnabled(t *testing.T) {
 	const tokenEnv = "HAYBALE_SERVE_TEST_CACHE_ON_TOKEN" //nolint:gosec // G101: an environment-variable name, not a credential value
 	t.Setenv(tokenEnv, "test-token-value")
@@ -252,8 +253,8 @@ func TestNewResponseCacheEnabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newResponseCache: %v", err)
 	}
-	if c == nil || len(opts) != 1 {
-		t.Fatalf("newResponseCache = %v, %d options; want a cache and one option", c, len(opts))
+	if c == nil || len(opts) != 2 {
+		t.Fatalf("newResponseCache = %v, %d options; want a cache, its option and the passthrough read bound", c, len(opts))
 	}
 	if info, err := os.Stat(cfg.Cache.Dir); err != nil || !info.IsDir() {
 		t.Errorf("cache dir was not created: %v", err)
@@ -350,7 +351,7 @@ func TestCloseResponseCacheWarnsWhenFillsOutlastTheBound(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, "/github.com/acme/widgets.git/info/refs?service=git-upload-pack", nil)
 		repo := gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}
 		baseURL, _ := url.Parse("https://github.com")
-		c.Serve(httptest.NewRecorder(), r, repo, baseURL, fetcher)
+		c.Serve(httptest.NewRecorder(), r, repo, baseURL, fetcher, "serve-test")
 	}()
 	select {
 	case <-fetcher.entered:

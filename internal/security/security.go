@@ -38,6 +38,12 @@ const (
 	// The entry is deleted. The event carries the repository and request
 	// class only, never a key id, path, hash or error text.
 	EventCacheIntegrityFailed = "cache_integrity_failed"
+	// EventCacheStaleServed is emitted for every response the cache
+	// answers with an entry older than its freshness rules allow because
+	// upstream could not answer (stale-if-error). It carries the
+	// identity, the repository, the request class, the entry's age and
+	// why the request was eligible.
+	EventCacheStaleServed = "cache_stale_served"
 )
 
 // Log emits a structured security event on logger. Security events are

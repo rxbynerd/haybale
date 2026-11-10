@@ -67,9 +67,10 @@ var (
 
 // uploadsGroup reports whether committed entries of group are uploaded
 // to the remote tier. Packs always are. Refs are uploaded only when a
-// replica can serve them back, which needs a positive refsMaxAge.
+// replica can serve them back: as hits with a positive refsMaxAge, or as
+// stale answers with stale-if-error enabled.
 func (c *Cache) uploadsGroup(group Group) bool {
-	return group == GroupPack || c.opts.RefsMaxAge > 0
+	return group == GroupPack || c.opts.RefsMaxAge > 0 || c.staleEnabled()
 }
 
 // remoteEligible reports whether a fill may be served from the remote
@@ -92,9 +93,13 @@ func (f *fill) remoteEligible() bool {
 // fillFromRemote serves the fill from the remote tier's sealed copy,
 // spooled as it is and verified as it passes. It returns false, having
 // spooled nothing, when there is no usable copy or the Get or header read
-// fails before the outcome is published; the fill then goes upstream.
-// Once it returns true the fill is settled.
-func (f *fill) fillFromRemote() bool {
+// fails before the outcome is published; the fill then goes upstream, and
+// unless the copy was only refused as not fresh, remoteUnavailable is set
+// so the fill does not read it again. Once it returns true the fill is
+// settled. With st set the copy is stale service: the stale rules decide
+// whether it is usable instead of the hit
+// freshness rules, and subscribers serve it as stale.
+func (f *fill) fillFromRemote(st *staleService) bool {
 	c := f.c
 	path := f.key.Path()
 	src := &remoteReader{
@@ -109,17 +114,21 @@ func (f *fill) fillFromRemote() bool {
 	info, err := src.start()
 	switch {
 	case errors.Is(err, ErrNotFound):
+		f.remoteUnavailable = true
 		return false
 	case err != nil:
 		f.remoteReadFailed(err)
+		f.remoteUnavailable = true
 		return false
 	case info.Size < sealedSize(0) || info.Size > sealedSize(c.opts.MaxEntrySize)+remoteSizeSlack:
 		f.logger().Debug("remote entry size is out of range; fetching upstream", "size", info.Size)
+		f.remoteUnavailable = true
 		return false
 	}
 	// A failed read here has already been recorded by src.
 	prefix := make([]byte, headerFixedPrefix)
 	if _, err := io.ReadFull(src, prefix); err != nil {
+		f.remoteUnavailable = true
 		return false
 	}
 	src.endPrefix()
@@ -130,16 +139,28 @@ func (f *fill) fillFromRemote() bool {
 	}
 	if err != nil {
 		f.remoteIntegrityFailed(err)
+		f.remoteUnavailable = true
 		return false
 	}
 	h := sr.Header()
-	if !f.remoteFresh(h) {
+	usable := f.remoteFresh
+	if st != nil {
+		usable = f.staleAcceptable
+	}
+	if !usable(h) {
 		return false
 	}
 
 	f.source = observability.TierRemote
 	sp, err := c.store.Create(path, info.Size, true)
 	if err != nil {
+		if st != nil {
+			// Stale service's subscribers receive the upstream answer it
+			// replaced.
+			f.finish(observability.FillResultDiscarded, storeReason(err), transientCooldown)
+			f.setOutcome(st.fallback)
+			return true
+		}
 		f.release(storeReason(err), transientCooldown)
 		return true
 	}
@@ -149,7 +170,12 @@ func (f *fill) fillFromRemote() bool {
 		return true
 	}
 	tee.w = sp
-	f.setOutcome(fillOutcome{kind: fillStreaming, contentType: h.ContentType, tier: observability.TierRemote})
+	out := fillOutcome{kind: fillStreaming, contentType: h.ContentType, tier: observability.TierRemote}
+	if st != nil {
+		st.createdAt = h.CreatedAt
+		out.stale = st
+	}
+	f.setOutcome(out)
 	src.enableResumes()
 	f.streamRemote(sr, tee)
 	return true
@@ -176,27 +202,37 @@ func (f *fill) remoteFresh(h entryHeader) bool {
 	age := c.now().Sub(h.CreatedAt)
 	switch {
 	case age > c.opts.Retention || c.purges.covers(f.key, h.CreatedAt):
-		// Deleted in the background so a slow bucket does not delay the
-		// fall-through. It can race the upload that follows, which then
-		// finds the old object, skips, and leaves the key absent until a
-		// later miss uploads it.
-		path := f.key.Path()
-		c.goRemote(func(ctx context.Context) {
-			if err := c.remote.Delete(ctx, path); err != nil {
-				c.remoteErrorUnlessClosed(observability.OperationDelete, err)
-			}
-		})
+		f.expireRemote()
 		return false
 	case f.key.Group == GroupRefs && age > c.opts.RefsMaxAge:
 		return false
-	case f.key.Group == GroupRefs && !h.CreatedAt.After(c.gens.pushedAt(f.key.RepoHash)):
-		// Created no later than this process's last push to the
-		// repository, so it may hold the pre-push tips. A peer may still
-		// serve it until refsMaxAge; it is left for the push's own
-		// deletion.
+	case f.prePushRefs(h):
 		return false
 	}
 	return true
+}
+
+// prePushRefs reports whether h is a refs entry created no later than
+// this process's last push to the repository, so it may hold the
+// pre-push tips. A peer may still serve it; it is left for the push's own
+// deletion.
+func (f *fill) prePushRefs(h entryHeader) bool {
+	return f.key.Group == GroupRefs && !h.CreatedAt.After(f.c.gens.pushedAt(f.key.RepoHash))
+}
+
+// expireRemote deletes the fill's remote object, past retention or
+// covered by a purge, in the background so a slow bucket does not delay
+// the fall-through. It can race the upload that follows, which then finds
+// the old object, skips, and leaves the key absent until a later miss
+// uploads it.
+func (f *fill) expireRemote() {
+	c := f.c
+	path := f.key.Path()
+	c.goRemote(func(ctx context.Context) {
+		if err := c.remote.Delete(ctx, path); err != nil {
+			c.remoteErrorUnlessClosed(observability.OperationDelete, err)
+		}
+	})
 }
 
 // streamRemote reads the remote entry through sr, which verifies every
@@ -679,9 +715,12 @@ func (c *Cache) remoteErrorUnlessClosed(operation string, err error) {
 
 // checkPurgeMarker applies repoHash's purge marker and reports whether
 // the repository's purge state is known current: read and verified, or
-// confirmed absent, now or within the check interval. Concurrent fills of
-// one repository share one read; a failed read or marker starts
-// purgeCheckBackoff, during which the state is not current.
+// confirmed absent, now or within the check interval. Concurrent callers
+// for one repository share one read, which runs under the cache's
+// lifetime; each waits for it only until its own ctx ends, so a caller
+// that gives up neither fails the check for the others nor starts the
+// backoff. A failed read or marker starts purgeCheckBackoff, during which
+// the state is not current.
 func (c *Cache) checkPurgeMarker(ctx context.Context, repo gitproto.Repo, repoHash [32]byte) bool {
 	now := c.now()
 	start, mc := c.purges.beginCheck(repoHash, now)
@@ -694,26 +733,56 @@ func (c *Cache) checkPurgeMarker(ctx context.Context, repo gitproto.Repo, repoHa
 		if h := c.hooks.markerCheckJoined; h != nil {
 			h()
 		}
-		select {
-		case <-mc.done:
-			return mc.current
-		case <-ctx.Done():
-			return false
-		}
+	case checkLead:
+		c.leadMarkerRead(mc, repo, repoHash, now)
 	}
-	// A read that panics finishes as failed, so the joiners wake and the
-	// backoff starts.
-	current, failed := false, true
-	defer func() { c.purges.finishCheck(repoHash, mc, current, failed, now) }()
-	current, failed = c.readMarker(ctx, repo, repoHash, now)
-	return current
+	select {
+	case <-mc.done:
+		return mc.current
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// leadMarkerRead reads repoHash's purge marker in the background and
+// finishes the shared check mc with the result. Once the cache is closed
+// the check finishes at once as neither current nor failed. A read that
+// panics finishes as failed, so the waiters wake and the backoff starts.
+func (c *Cache) leadMarkerRead(mc *markerCheck, repo gitproto.Repo, repoHash [32]byte, now time.Time) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		c.purges.finishCheck(repoHash, mc, false, false, now)
+		return
+	}
+	c.wg.Add(1)
+	c.mu.Unlock()
+	go func() {
+		defer c.wg.Done()
+		current, failed := false, true
+		defer func() { c.purges.finishCheck(repoHash, mc, current, failed, now) }()
+		defer func() {
+			if r := recover(); r != nil {
+				c.logger.Error("purge marker read panicked", "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+			}
+		}()
+		current, failed = c.readMarker(c.ctx, repo, repoHash, now)
+	}()
+}
+
+// purgeCurrent reports whether repoHash's purge state is known current
+// for stale service, checking its purge marker when the cache has a
+// remote tier. Without one, the purges this process made itself are the
+// only ones, and the state is always current.
+func (c *Cache) purgeCurrent(ctx context.Context, repo gitproto.Repo, repoHash [32]byte) bool {
+	return c.remote == nil || c.checkPurgeMarker(ctx, repo, repoHash)
 }
 
 // readMarker reads and applies repoHash's purge marker for
 // checkPurgeMarker. failed reports a read or verification failure, as
 // opposed to a read cut short because ctx ended.
 func (c *Cache) readMarker(ctx context.Context, repo gitproto.Repo, repoHash [32]byte, now time.Time) (current, failed bool) {
-	ctx, cancel := context.WithTimeout(ctx, purgeMarkerTimeout)
+	ctx, cancel := context.WithTimeout(ctx, c.markerTimeout)
 	defer cancel()
 	times, found, err := readPurgeMarker(ctx, c.remote, c.keyring, repoHash, now)
 	switch {
@@ -764,7 +833,8 @@ func (c *Cache) dropPurged(repoHash [32]byte, times purgeTimes) int {
 	return n
 }
 
-// purgeCheck is a purge marker check running alongside a refs fill.
+// purgeCheck is a purge marker check running alongside the upstream
+// request of a refs fill or a gate probe.
 // current is valid once done is closed.
 type purgeCheck struct {
 	done    chan struct{}
@@ -772,11 +842,14 @@ type purgeCheck struct {
 }
 
 // startPurgeCheck begins checking the repository's purge marker for a
-// refs fill from upstream, when the cache has a remote tier. Without a
-// remote tier, or for a pack fill, the check is immediately current.
-func (f *fill) startPurgeCheck() *purgeCheck {
+// refs fill from upstream or a gate probe, and returns nil for any other
+// fill. Without a remote tier the check is immediately current.
+func (f *fill) startPurgeCheck(probing bool) *purgeCheck {
+	if f.key.Group != GroupRefs && !probing {
+		return nil
+	}
 	pc := &purgeCheck{done: make(chan struct{})}
-	if f.c.remote == nil || f.key.Group != GroupRefs {
+	if f.c.remote == nil {
 		pc.current = true
 		close(pc.done)
 		return pc

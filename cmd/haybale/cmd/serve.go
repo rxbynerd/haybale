@@ -369,7 +369,9 @@ func newResponseCache(ctx context.Context, cfg *config.Config, logger *slog.Logg
 	if c == nil {
 		return nil, nil, nil
 	}
-	return c, []proxy.Option{proxy.WithCache(c)}, nil
+	// A read the cache declines takes the passthrough path, which then
+	// waits for upstream headers no longer than the cache's own fetch.
+	return c, []proxy.Option{proxy.WithCache(c), proxy.WithReadHeaderTimeout(cfg.Cache.ParsedResponseHeaderTimeout())}, nil
 }
 
 // closeResponseCache closes c within timeout, logging rather than

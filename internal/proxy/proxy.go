@@ -68,10 +68,10 @@ var errNoCredentialSource = errors.New("proxy: no credential source configured f
 
 // ResponseCache is the consumer-side interface of the response cache;
 // *cache.Cache satisfies it. Serve is offered every policy-allowed read
-// and reports whether it wrote the response; Invalidate is called after
-// every git-receive-pack POST.
+// with the verified identity's ID and reports whether it wrote the
+// response; Invalidate is called after every git-receive-pack POST.
 type ResponseCache interface {
-	Serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo, baseURL *url.URL, fetch cache.Fetcher) (cache.Outcome, bool)
+	Serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo, baseURL *url.URL, fetch cache.Fetcher, identity string) (cache.Outcome, bool)
 	Invalidate(ctx context.Context, repo gitproto.Repo, baseURL *url.URL)
 }
 
@@ -82,6 +82,15 @@ type Option func(*Proxy)
 // proxy a pure passthrough.
 func WithCache(c ResponseCache) Option {
 	return func(p *Proxy) { p.cache = c }
+}
+
+// WithReadHeaderTimeout bounds how long a read on the passthrough path
+// waits for upstream response headers, as the response cache's fetcher
+// does; a read whose headers do not arrive in time is answered 502. Zero
+// leaves reads unbounded. Writes are never bounded, since an upstream may
+// run hooks before it answers a push.
+func WithReadHeaderTimeout(d time.Duration) Option {
+	return func(p *Proxy) { p.readHeaderTimeout = d }
 }
 
 // Proxy is an http.Handler that validates inbound smart-HTTP requests,
@@ -107,6 +116,10 @@ type Proxy struct {
 	metrics       *observability.Metrics
 	authenticator identity.Authenticator
 	policyEngine  policy.Engine
+
+	// readHeaderTimeout bounds the passthrough's wait for the response
+	// headers of a read; zero leaves it unbounded.
+	readHeaderTimeout time.Duration
 
 	// draining is set by BeginDrain, called from cmd/haybale/cmd/serve.go
 	// on SIGTERM/SIGINT before http.Server.Shutdown is invoked. Once true,
@@ -225,6 +238,10 @@ func New(upstreams map[string]*url.URL, credentialSources map[string]upstream.Cr
 		},
 		otelhttp.WithPropagators(propagation.NewCompositeTextMapPropagator()),
 	)
+	passthrough := p.transport
+	if p.readHeaderTimeout > 0 {
+		passthrough = readHeaderBound{next: p.transport, timeout: p.readHeaderTimeout}
+	}
 	p.rp = &httputil.ReverseProxy{
 		Rewrite: p.rewrite,
 		// -1 disables periodic batching and flushes on every write
@@ -232,7 +249,7 @@ func New(upstreams map[string]*url.URL, credentialSources map[string]upstream.Cr
 		// percentages) streams live through the proxy rather than
 		// arriving in bursts.
 		FlushInterval: -1,
-		Transport:     p.transport,
+		Transport:     passthrough,
 		ErrorLog:      slog.NewLogLogger(logger.Handler(), slog.LevelError),
 		// ModifyResponse maps a post-injection upstream 401/403 to a 502
 		// and resets the response headers to a minimal known-safe set
@@ -378,7 +395,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// continues down the passthrough path with its body restored.
 	var cacheAttrs []any
 	if verb == gitproto.Read && p.cache != nil {
-		outcome, handled := p.cache.Serve(rec, r, repo, base, &cacheFetcher{proxy: p, base: base, repo: repo})
+		outcome, handled := p.cache.Serve(rec, r, repo, base, &cacheFetcher{proxy: p, base: base, repo: repo}, id.ID)
 		cacheAttrs = cacheLogAttrs(outcome)
 		span.SetAttributes(cacheSpanAttrs(outcome)...)
 		if handled {
@@ -636,9 +653,11 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 }
 
 // modifyResponse implements httputil.ReverseProxy.ModifyResponse by
-// applying sanitizeUpstreamResponse and logging the security event when
-// the upstream rejected the injected credential.
+// removing any upstream copy of cache.UpstreamStatusHeader, applying
+// sanitizeUpstreamResponse and logging the security event when the
+// upstream rejected the injected credential.
 func (p *Proxy) modifyResponse(resp *http.Response) error {
+	resp.Header.Del(cache.UpstreamStatusHeader)
 	upstreamStatus, sanitized := sanitizeUpstreamResponse(resp)
 	if !sanitized {
 		return nil
@@ -670,8 +689,11 @@ type cacheFetcher struct {
 // Accept-Encoding: identity so the stored body is never encoded, a fixed
 // User-Agent, and the injected Authorization. Nothing from the client's
 // own request is carried. A credential mint failure is returned as an
-// error; the cache then releases the request to the passthrough path,
-// which answers 502 and logs upstream_auth_failed.
+// error; the cache then answers the request stale or releases it to the
+// passthrough path, which answers 502 and logs upstream_auth_failed. An
+// upstream 401 or 403 is returned as the sanitised 502 carrying
+// cache.UpstreamStatusHeader with the status upstream sent; an upstream
+// copy of that header is removed from every response.
 func (f *cacheFetcher) Fetch(ctx context.Context, req cache.Request) (*http.Response, error) {
 	source, ok := f.proxy.credentialSources[f.repo.Host]
 	if !ok || source == nil {
@@ -715,8 +737,10 @@ func (f *cacheFetcher) Fetch(ctx context.Context, req cache.Request) (*http.Resp
 	if err != nil {
 		return nil, err
 	}
+	resp.Header.Del(cache.UpstreamStatusHeader)
 	if upstreamStatus, sanitized := sanitizeUpstreamResponse(resp); sanitized {
 		f.proxy.logUpstreamRejected(f.repo, gitproto.Read, upstreamStatus)
+		resp.Header.Set(cache.UpstreamStatusHeader, strconv.Itoa(upstreamStatus))
 	}
 	return resp, nil
 }

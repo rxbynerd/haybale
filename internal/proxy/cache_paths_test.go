@@ -36,7 +36,7 @@ type invalidationProbe struct {
 	ctxErrs []error
 }
 
-func (c *invalidationProbe) Serve(http.ResponseWriter, *http.Request, gitproto.Repo, *url.URL, cache.Fetcher) (cache.Outcome, bool) {
+func (c *invalidationProbe) Serve(http.ResponseWriter, *http.Request, gitproto.Repo, *url.URL, cache.Fetcher, string) (cache.Outcome, bool) {
 	return cache.Outcome{Result: observability.ResultBypass}, false
 }
 
@@ -395,7 +395,7 @@ type fixedOutcomeCache struct {
 	body    string
 }
 
-func (c fixedOutcomeCache) Serve(w http.ResponseWriter, _ *http.Request, _ gitproto.Repo, _ *url.URL, _ cache.Fetcher) (cache.Outcome, bool) {
+func (c fixedOutcomeCache) Serve(w http.ResponseWriter, _ *http.Request, _ gitproto.Repo, _ *url.URL, _ cache.Fetcher, _ string) (cache.Outcome, bool) {
 	if c.body != "" {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, c.body)
