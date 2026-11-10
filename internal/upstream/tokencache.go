@@ -166,7 +166,7 @@ func (c *tokenCache) get(ctx context.Context, repo gitproto.Repo, verb gitproto.
 // cardinality). A no-op until setMetrics has run.
 func (c *tokenCache) recordLookup(ctx context.Context, repo gitproto.Repo, verb gitproto.Verb, result string) {
 	if m := c.metrics.Load(); m != nil {
-		m.RecordCacheLookup(ctx, repo.Host, verb.String(), result)
+		m.RecordTokenCacheLookup(ctx, repo.Host, verb.String(), result)
 	}
 }
 

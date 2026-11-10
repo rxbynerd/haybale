@@ -23,11 +23,11 @@ import (
 // proxyWithMetrics builds a Proxy over the given upstream map wired to an
 // in-memory metrics reader, so a test can drive requests and assert the
 // emitted instruments.
-func proxyWithMetrics(t *testing.T, byHost map[string]string, auth identity.Authenticator, pol policy.Engine) (*Proxy, *sdkmetric.ManualReader) {
+func proxyWithMetrics(t *testing.T, byHost map[string]string, auth identity.Authenticator, pol policy.Engine, opts ...Option) (*Proxy, *sdkmetric.ManualReader) {
 	t.Helper()
 	upstreams := newUpstreamMap(t, byHost)
 	metrics, reader := observability.NewTestMetrics()
-	p, err := New(upstreams, credentialsForHosts(upstreams), auth, pol, discardLogger(), metrics)
+	p, err := New(upstreams, credentialsForHosts(upstreams), auth, pol, discardLogger(), metrics, opts...)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -177,10 +177,11 @@ func TestProxyRecordsOutcomeMetrics(t *testing.T) {
 // TestClientXForwardedHeadersAreSuppressed: even with a real, sampling
 // TracerProvider installed and the proxy wrapped in otelhttp so an inbound
 // server span exists, haybale must never inject its own W3C traceparent
-// into the request it forwards upstream. The reverse-proxy transport is
-// deliberately given an empty propagator (see New); this pins that choice
-// so a future refactor can't silently start leaking haybale's trace
-// topology onto the upstream leg.
+// into the request it sends upstream, on the passthrough path or from
+// the cache's fetcher. Both share the transport that is deliberately
+// given an empty propagator (see New); this pins that choice so a future
+// refactor can't silently start leaking haybale's trace topology onto
+// the upstream leg.
 func TestUpstreamReceivesNoTraceparent(t *testing.T) {
 	// Install a real sampling tracer + W3C propagator globally for the
 	// duration of the test, then restore the prior globals so other tests
@@ -196,32 +197,37 @@ func TestUpstreamReceivesNoTraceparent(t *testing.T) {
 		otel.SetTextMapPropagator(prevProp)
 	})
 
-	up := &recordingUpstream{}
-	upstreamSrv := httptest.NewServer(up.handler())
-	defer upstreamSrv.Close()
+	for _, path := range proxyPaths() {
+		t.Run(path.name, func(t *testing.T) {
+			up := &recordingUpstream{}
+			upstreamSrv := httptest.NewServer(up.handler())
+			defer upstreamSrv.Close()
 
-	p, _ := proxyWithMetrics(t, map[string]string{"testhost": upstreamSrv.URL}, allowAllAuthenticator{}, allowAllPolicy{})
-	// Wrap exactly as serve.go's instrumentedHandler does, so an inbound
-	// server span is created and would normally be propagated onward.
-	handler := otelhttp.NewHandler(p, "haybale.request")
-	srv := httptest.NewServer(handler)
-	defer srv.Close()
+			p, _ := proxyWithMetrics(t, map[string]string{"testhost": upstreamSrv.URL}, allowAllAuthenticator{}, allowAllPolicy{}, path.options(t)...)
+			// Wrap exactly as serve.go's instrumentedHandler does, so an
+			// inbound server span is created and would normally be
+			// propagated onward.
+			handler := otelhttp.NewHandler(p, "haybale.request")
+			srv := httptest.NewServer(handler)
+			defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
+			resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			_, _ = io.Copy(io.Discard, resp.Body)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200", resp.StatusCode)
+			}
 
-	_, _, _, headers, _ := up.snapshot()
-	for _, h := range []string{"Traceparent", "Tracestate", "Baggage"} {
-		if got := headers.Get(h); got != "" {
-			t.Errorf("upstream saw %s = %q, want it absent (passthrough invariant)", h, got)
-		}
+			_, _, _, headers, _ := up.snapshot()
+			for _, h := range []string{"Traceparent", "Tracestate", "Baggage"} {
+				if got := headers.Get(h); got != "" {
+					t.Errorf("upstream saw %s = %q, want it absent", h, got)
+				}
+			}
+		})
 	}
 }
 

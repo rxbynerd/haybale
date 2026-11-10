@@ -2,7 +2,8 @@
 // Validation resolves policy, upstream URLs and credentials, listener TLS,
 // identity settings, and telemetry settings before the server accepts traffic.
 // Network-backed JWKS sources are initialized separately by BuildAuthenticator
-// so policy checks remain offline.
+// so policy checks remain offline, and the response cache is opened
+// separately by CacheConfig.BuildCache for the same reason.
 package config
 
 import (
@@ -93,6 +94,11 @@ type Config struct {
 	// disables telemetry entirely: haybale emits nothing over OTLP and the
 	// metric instruments become no-ops.
 	Telemetry TelemetryConfig `yaml:"telemetry"`
+	// Cache optionally configures the response cache for Git smart HTTP
+	// reads. It is off by default: leaving the block out (or leaving
+	// enabled false) serves every request straight from upstream, as if
+	// the block did not exist.
+	Cache CacheConfig `yaml:"cache"`
 
 	// parsedDrainTimeout caches the time.Duration Validate() parsed from
 	// DrainTimeout, for the same reuse-not-reparse reason
@@ -558,12 +564,10 @@ type CredentialConfig struct {
 // otlpProtocolGRPC and otlpProtocolHTTP are the two OTLP wire protocols
 // Telemetry.Protocol accepts (an empty value means grpc). They are string
 // literals here rather than an import of internal/observability's own
-// ProtocolGRPC/ProtocolHTTP constants deliberately: keeping config free of
-// the OpenTelemetry SDK dependency means a production build of
-// internal/config — and every package that imports it — does not pull in
-// the otel module graph. cmd/haybale/cmd/serve.go is the single seam that
-// bridges this config into internal/observability. If these values ever
-// diverge from observability's ProtocolGRPC/ProtocolHTTP, the (test-only)
+// ProtocolGRPC/ProtocolHTTP constants so the telemetry block stays a plain
+// description of the YAML; cmd/haybale/cmd/serve.go is the seam that
+// bridges it into internal/observability. If these values ever diverge
+// from observability's ProtocolGRPC/ProtocolHTTP, the (test-only)
 // round-trip check TestOTLPProtocolConstantsMatchObservability in
 // telemetry_test.go fails.
 const (
@@ -668,9 +672,21 @@ func Load(path string, opts ...LoadOption) (*Config, error) {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}
 
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	// The document is parsed once into a node tree so the cache block can
+	// be checked for unknown keys, which the field-by-field decode below
+	// tolerates everywhere else.
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
+	}
+	var cfg Config
+	if doc.Kind != 0 {
+		if err := doc.Decode(&cfg); err != nil {
+			return nil, fmt.Errorf("config: parse %s: %w", path, err)
+		}
+	}
+	if err := validateCacheKeys(&doc); err != nil {
+		return nil, fmt.Errorf("config: %s: %w", path, err)
 	}
 
 	for _, opt := range opts {
@@ -686,7 +702,7 @@ func Load(path string, opts ...LoadOption) (*Config, error) {
 }
 
 // applyDefaults fills in Listen, LogLevel, and DrainTimeout when left
-// empty.
+// empty, and the Cache defaults when the cache is enabled.
 func (c *Config) applyDefaults() {
 	if c.Listen == "" {
 		c.Listen = defaultListen
@@ -697,6 +713,7 @@ func (c *Config) applyDefaults() {
 	if c.DrainTimeout == "" {
 		c.DrainTimeout = defaultDrainTimeout
 	}
+	c.Cache.applyDefaults()
 }
 
 // Validate fail-fasts on anything that would make Config unusable at
@@ -780,6 +797,9 @@ func (c *Config) Validate() error {
 		if parsed.Scheme == "" || parsed.Host == "" {
 			return fmt.Errorf("upstreams[%d] (host %q): baseURL %q must be an absolute URL with scheme and host", i, u.Host, u.BaseURL)
 		}
+		if parsed.User != nil {
+			return fmt.Errorf("upstreams[%d] (host %q): baseURL must not contain credentials", i, u.Host)
+		}
 		u.parsedBaseURL = parsed
 
 		if err := buildCredentialSource(i, u); err != nil {
@@ -804,6 +824,10 @@ func (c *Config) Validate() error {
 	c.Policy.engine = engine
 
 	if err := c.Telemetry.validate(); err != nil {
+		return err
+	}
+
+	if err := c.Cache.validate(); err != nil {
 		return err
 	}
 

@@ -12,7 +12,7 @@ import (
 var rootCmd = &cobra.Command{
 	Use:   "haybale",
 	Short: "An authenticating git smart-HTTP proxy",
-	Long:  "haybale proxies git smart-HTTP traffic to upstream git hosts, streaming pack data through without buffering or parsing it.",
+	Long:  "haybale proxies git smart-HTTP traffic to upstream git hosts, streaming pack data through without buffering it, with an optional response cache for repeated reads.",
 }
 
 // exitCodeDrainTimeoutExceeded is the exit code Execute uses when

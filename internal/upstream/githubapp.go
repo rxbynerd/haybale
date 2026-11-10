@@ -3,10 +3,13 @@ package upstream
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -241,6 +244,10 @@ func (s *GitHubAppSource) Credentials(ctx context.Context, repo gitproto.Repo, v
 // On success it emits security.EventTokenMinted with host/owner/repo/verb
 // and the installation ID — never the token itself, in the event or in
 // any error this returns.
+//
+// An error from the installation lookup or the mint call wraps
+// ErrUnavailable when the GitHub API was unreachable (network error or the
+// client timeout) or answered 5xx; every other failure is returned opaque.
 func (s *GitHubAppSource) mint(ctx context.Context, repo gitproto.Repo, verb gitproto.Verb) (BasicAuth, time.Time, error) {
 	// A span brackets the whole mint — the installation lookup GET and the
 	// token POST (each of which also gets its own client span from the
@@ -289,7 +296,7 @@ func (s *GitHubAppSource) mint(ctx context.Context, repo gitproto.Repo, verb git
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		span.SetStatus(codes.Error, "mint token")
-		return BasicAuth{}, time.Time{}, fmt.Errorf("upstream: github app source: mint token: %w", err)
+		return BasicAuth{}, time.Time{}, fmt.Errorf("upstream: github app source: mint token: %w", markUnavailable(ctx, err))
 	}
 	defer drain(resp.Body)
 
@@ -300,7 +307,7 @@ func (s *GitHubAppSource) mint(ctx context.Context, repo gitproto.Repo, verb git
 		// keeps that guarantee by construction rather than by trusting
 		// GitHub's API shape never to change.
 		span.SetStatus(codes.Error, "mint token: unexpected status")
-		return BasicAuth{}, time.Time{}, fmt.Errorf("upstream: github app source: mint token: unexpected status %d", resp.StatusCode)
+		return BasicAuth{}, time.Time{}, fmt.Errorf("upstream: github app source: mint token: %w", statusError(resp.StatusCode))
 	}
 
 	var tokenResp mintResponse
@@ -455,12 +462,12 @@ func fetchInstallationID(ctx context.Context, client *http.Client, apiBaseURL, o
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("installation lookup: %w", err)
+		return 0, fmt.Errorf("installation lookup: %w", markUnavailable(ctx, err))
 	}
 	defer drain(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("installation lookup: unexpected status %d", resp.StatusCode)
+		return 0, fmt.Errorf("installation lookup: %w", statusError(resp.StatusCode))
 	}
 
 	var lookup installationLookupResponse
@@ -468,6 +475,55 @@ func fetchInstallationID(ctx context.Context, client *http.Client, apiBaseURL, o
 		return 0, fmt.Errorf("installation lookup: decode response: %w", err)
 	}
 	return lookup.ID, nil
+}
+
+// statusError describes an unexpected GitHub API status. A 5xx wraps
+// ErrUnavailable; every other status (401, 403, 404, 422, 429, ...) is
+// left opaque because it signals misconfiguration, revocation or rate
+// limiting rather than an outage.
+func statusError(status int) error {
+	err := fmt.Errorf("unexpected status %d", status)
+	if status >= http.StatusInternalServerError {
+		return fmt.Errorf("%w: %w", ErrUnavailable, err)
+	}
+	return err
+}
+
+// markUnavailable wraps err in ErrUnavailable when a failed GitHub API
+// call indicates the API could not be reached (a dial, DNS or TLS
+// failure, a connection dropped mid-response, or the HTTP client's own
+// timeout). It returns err unchanged when ctx has ended, because the
+// caller going away or hitting its own deadline says nothing about the
+// API's health, and for any other error, such as a malformed API base
+// URL.
+func markUnavailable(ctx context.Context, err error) error {
+	if ctx.Err() != nil || !isUnreachable(err) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrUnavailable, err)
+}
+
+// isUnreachable reports whether err, returned by http.Client.Do, is a
+// transport-level failure rather than a request that was never sent.
+func isUnreachable(err error) bool {
+	var (
+		opErr     *net.OpError
+		dnsErr    *net.DNSError
+		netErr    net.Error
+		certErr   *tls.CertificateVerificationError
+		recordErr tls.RecordHeaderError
+	)
+	switch {
+	case errors.Is(err, context.DeadlineExceeded),
+		errors.Is(err, io.EOF),
+		errors.Is(err, io.ErrUnexpectedEOF):
+		return true
+	case errors.As(err, &opErr), errors.As(err, &dnsErr),
+		errors.As(err, &certErr), errors.As(err, &recordErr):
+		return true
+	default:
+		return errors.As(err, &netErr) && netErr.Timeout()
+	}
 }
 
 // drain reads body to EOF and closes it, letting the Transport reuse the

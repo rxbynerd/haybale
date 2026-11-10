@@ -3,18 +3,15 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"errors"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -89,18 +86,18 @@ func credentialsForHosts(upstreams map[string]*url.URL) map[string]upstream.Cred
 // for every configured upstream host — tests that don't care about the
 // exact credential-injection behaviour (most of this file) never need to
 // know that.
-func mustNew(t *testing.T, upstreams map[string]*url.URL, authenticator identity.Authenticator, policyEngine policy.Engine, logger *slog.Logger) *Proxy {
+func mustNew(t *testing.T, upstreams map[string]*url.URL, authenticator identity.Authenticator, policyEngine policy.Engine, logger *slog.Logger, opts ...Option) *Proxy {
 	t.Helper()
-	return mustNewWithCredentials(t, upstreams, credentialsForHosts(upstreams), authenticator, policyEngine, logger)
+	return mustNewWithCredentials(t, upstreams, credentialsForHosts(upstreams), authenticator, policyEngine, logger, opts...)
 }
 
 // mustNewWithCredentials is mustNew's counterpart for tests that need
 // precise control over the credentialSources map — a missing host entry,
 // an erroringCredentialSource, or a specific injected credential to
 // assert against.
-func mustNewWithCredentials(t *testing.T, upstreams map[string]*url.URL, credentialSources map[string]upstream.CredentialSource, authenticator identity.Authenticator, policyEngine policy.Engine, logger *slog.Logger) *Proxy {
+func mustNewWithCredentials(t *testing.T, upstreams map[string]*url.URL, credentialSources map[string]upstream.CredentialSource, authenticator identity.Authenticator, policyEngine policy.Engine, logger *slog.Logger, opts ...Option) *Proxy {
 	t.Helper()
-	p, err := New(upstreams, credentialSources, authenticator, policyEngine, logger, observability.NewNoopMetrics())
+	p, err := New(upstreams, credentialSources, authenticator, policyEngine, logger, observability.NewNoopMetrics(), opts...)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -218,8 +215,8 @@ func TestInvalidRequestMaps404(t *testing.T) {
 	}
 }
 
-// TestUpstreamUnreachableMaps502 confirms ReverseProxy maps an upstream dial
-// failure to 502.
+// TestUpstreamUnreachableMaps502 confirms an upstream dial failure maps to
+// 502 on both paths.
 func TestUpstreamUnreachableMaps502(t *testing.T) {
 	// Stand up a server and close it immediately: its URL is well-formed
 	// but nothing is listening, so any request against it fails to dial
@@ -231,17 +228,21 @@ func TestUpstreamUnreachableMaps502(t *testing.T) {
 	}
 	deadSrv.Close()
 
-	p := mustNew(t, map[string]*url.URL{"testhost": deadURL}, allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
-	srv := httptest.NewServer(p)
-	defer srv.Close()
+	for _, path := range proxyPaths() {
+		t.Run(path.name, func(t *testing.T) {
+			p := mustNew(t, map[string]*url.URL{"testhost": deadURL}, allowAllAuthenticator{}, allowAllPolicy{}, discardLogger(), path.options(t)...)
+			srv := httptest.NewServer(p)
+			defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Errorf("status = %d, want %d for an unreachable upstream", resp.StatusCode, http.StatusBadGateway)
+			resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
+			if err != nil {
+				t.Fatalf("GET: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusBadGateway {
+				t.Errorf("status = %d, want %d for an unreachable upstream", resp.StatusCode, http.StatusBadGateway)
+			}
+		})
 	}
 }
 
@@ -358,113 +359,6 @@ func TestForwardsToUpstreamStrippingHostSegment(t *testing.T) {
 	}
 	if got := headers.Get("Accept-Encoding"); got != "gzip" {
 		t.Errorf("upstream saw Accept-Encoding = %q, want %q", got, "gzip")
-	}
-}
-
-// TestClientXForwardedHeadersAreSuppressed pins the intentional security
-// posture documented on rewrite(): haybale must never inject client
-// IP/host/proto upstream. A client-supplied X-Forwarded-For (or
-// X-Forwarded-Host/X-Forwarded-Proto) must not reach the upstream —
-// neither the client's original value nor a haybale-originated replacement.
-func TestClientXForwardedHeadersAreSuppressed(t *testing.T) {
-	up := &recordingUpstream{}
-	upstreamSrv := httptest.NewServer(up.handler())
-	defer upstreamSrv.Close()
-
-	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
-	srv := httptest.NewServer(p)
-	defer srv.Close()
-
-	req, err := http.NewRequest(http.MethodGet, srv.URL+"/testhost/acme/widgets.git/info/refs?service=git-upload-pack", nil)
-	if err != nil {
-		t.Fatalf("NewRequest: %v", err)
-	}
-	req.Header.Set("X-Forwarded-For", "203.0.113.7")
-	req.Header.Set("X-Forwarded-Host", "attacker.example")
-	req.Header.Set("X-Forwarded-Proto", "https")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("Do: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-
-	_, _, _, headers, _ := up.snapshot()
-	for _, h := range []string{"X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto"} {
-		if got := headers.Get(h); got != "" {
-			t.Errorf("upstream saw %s = %q, want it absent", h, got)
-		}
-	}
-}
-
-// TestInboundAuthorizationHeaderIsReplacedByInjectedCredential confirms the
-// client's inbound Authorization header — whether
-// presented as HTTP Basic or as an `Authorization: Bearer <token>`
-// header — must never reach the upstream. httputil.ReverseProxy only
-// strips the RFC hop-by-hop header set by default, and Authorization is
-// end-to-end, not hop-by-hop, so without an explicit strip it clones
-// straight through, letting anything with visibility into the upstream
-// leg replay the haybale credential directly against haybale itself.
-// rewrite replaces it with the configured upstream credential.
-func TestInboundAuthorizationHeaderIsReplacedByInjectedCredential(t *testing.T) {
-	tests := []struct {
-		name    string
-		setAuth func(*http.Request)
-	}{
-		{
-			name: "basic auth",
-			setAuth: func(r *http.Request) {
-				r.SetBasicAuth("ignored-username", "haybale-secret-token")
-			},
-		},
-		{
-			name: "bearer token",
-			setAuth: func(r *http.Request) {
-				r.Header.Set("Authorization", "Bearer haybale-secret-token")
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			up := &recordingUpstream{}
-			upstreamSrv := httptest.NewServer(up.handler())
-			defer upstreamSrv.Close()
-
-			p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
-			srv := httptest.NewServer(p)
-			defer srv.Close()
-
-			req, err := http.NewRequest(http.MethodGet, srv.URL+"/testhost/acme/widgets.git/info/refs?service=git-upload-pack", nil)
-			if err != nil {
-				t.Fatalf("NewRequest: %v", err)
-			}
-			tt.setAuth(req)
-
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				t.Fatalf("Do: %v", err)
-			}
-			defer func() { _ = resp.Body.Close() }()
-			_, _ = io.Copy(io.Discard, resp.Body)
-			if resp.StatusCode != http.StatusOK {
-				t.Fatalf("status = %d, want 200", resp.StatusCode)
-			}
-
-			_, _, _, headers, _ := up.snapshot()
-			got := headers.Get("Authorization")
-			if strings.Contains(got, "haybale-secret-token") {
-				t.Errorf("upstream saw Authorization = %q, must never contain the client's haybale token", got)
-			}
-			wantAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte(defaultTestCredential.Username+":"+defaultTestCredential.Password))
-			if got != wantAuth {
-				t.Errorf("upstream saw Authorization = %q, want the injected credential %q", got, wantAuth)
-			}
-		})
 	}
 }
 
@@ -1043,22 +937,26 @@ func TestCredentialSourceErrorMaps502(t *testing.T) {
 // ServeHTTP: a host present in upstreams but absent from
 // credentialSources (a caller-assembled pair that got out of sync — not
 // a path config.Validate() output should ever produce) must still map
-// to 502, never panic and never 401.
+// to 502, never panic and never 401, on both paths.
 func TestMissingCredentialSourceMaps502(t *testing.T) {
-	upstreams := newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"})
-	p := mustNewWithCredentials(t, upstreams, map[string]upstream.CredentialSource{}, allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
-	srv := httptest.NewServer(p)
-	defer srv.Close()
+	for _, path := range proxyPaths() {
+		t.Run(path.name, func(t *testing.T) {
+			upstreams := newUpstreamMap(t, map[string]string{"testhost": "http://127.0.0.1:1"})
+			p := mustNewWithCredentials(t, upstreams, map[string]upstream.CredentialSource{}, allowAllAuthenticator{}, allowAllPolicy{}, discardLogger(), path.options(t)...)
+			srv := httptest.NewServer(p)
+			defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, resp.Body)
+			resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
+			if err != nil {
+				t.Fatalf("GET: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			_, _ = io.Copy(io.Discard, resp.Body)
 
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadGateway)
+			if resp.StatusCode != http.StatusBadGateway {
+				t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadGateway)
+			}
+		})
 	}
 }
 
@@ -1109,189 +1007,6 @@ func respondingUpstreamHandler(status int, setWWWAuthenticate bool) http.Handler
 		}
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte("upstream error body containing details that must never reach the client"))
-	}
-}
-
-// TestPostInjectionUpstream401Maps502AndStripsWWWAuthenticate confirms rewrite
-// injects a credential before every proxied request reaches upstream, so a 401
-// arriving back means the upstream rejected haybale's own injected
-// credential — not something the client did. That must never surface to
-// the client as an ordinary 401 (which would make git re-prompt for a
-// credential the sandbox has no way to supply); it must be a 502 with no
-// WWW-Authenticate header and none of the upstream's own response body.
-func TestPostInjectionUpstream401Maps502AndStripsWWWAuthenticate(t *testing.T) {
-	upstreamSrv := httptest.NewServer(respondingUpstreamHandler(http.StatusUnauthorized, true))
-	defer upstreamSrv.Close()
-
-	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
-	srv := httptest.NewServer(p)
-	defer srv.Close()
-
-	resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("ReadAll: %v", err)
-	}
-
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadGateway)
-	}
-	if got := resp.Header.Get("WWW-Authenticate"); got != "" {
-		t.Errorf("WWW-Authenticate = %q, want it stripped so git never re-prompts", got)
-	}
-	if strings.Contains(string(body), "upstream error body") {
-		t.Errorf("response body = %q, must not contain the upstream's own error body", body)
-	}
-}
-
-// TestPostInjectionUpstream401StripsAllUpstreamHeaders confirms
-// modifyResponse does not merely delete WWW-Authenticate from
-// the upstream's 401 response, it must reset the client-visible headers
-// to a minimal known-safe set. A compromised, misconfigured, or
-// lookalike upstream could set Set-Cookie or any other header on its
-// 401/403 page; none of it may survive onto the synthetic 502.
-func TestPostInjectionUpstream401StripsAllUpstreamHeaders(t *testing.T) {
-	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("WWW-Authenticate", `Basic realm="upstream"`)
-		w.Header().Set("Set-Cookie", "session=upstream-secret-cookie; Path=/")
-		w.Header().Set("X-Upstream-Custom", "must-not-leak")
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte("upstream error body containing details that must never reach the client"))
-	}))
-	defer upstreamSrv.Close()
-
-	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
-	srv := httptest.NewServer(p)
-	defer srv.Close()
-
-	resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("ReadAll: %v", err)
-	}
-
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadGateway)
-	}
-	for _, h := range []string{"WWW-Authenticate", "Set-Cookie", "X-Upstream-Custom"} {
-		if got := resp.Header.Get(h); got != "" {
-			t.Errorf("%s = %q, want it stripped from the synthetic 502 (headers must be reset wholesale, not selectively deleted)", h, got)
-		}
-	}
-	if strings.Contains(string(body), "upstream error body") || strings.Contains(string(body), "must-not-leak") {
-		t.Errorf("response body = %q, must not contain any upstream-controlled content", body)
-	}
-}
-
-// TestPostInjectionUpstream401DrainsBodyForConnectionReuse confirms the
-// discarded upstream 401 body is drained to EOF before its reader is closed,
-// so the proxy's Transport can return
-// the proxy->upstream connection to its keep-alive pool. net/http's
-// Transport treats a response body that is closed before being read to
-// completion as unreusable and redials on the next request — a bad or
-// expired credential is a sustained failure mode (every request to this
-// upstream repeats it), so this matters most exactly when it's least
-// convenient. This is verified indirectly: the upstream's ConnState hook
-// counts how many distinct TCP connections it accepts across two
-// sequential requests through the same Proxy (and therefore the same
-// underlying http.Transport) — one connection for two requests proves
-// the body was drained, not merely that nothing panicked.
-func TestPostInjectionUpstream401DrainsBodyForConnectionReuse(t *testing.T) {
-	var newConns atomic.Int32
-	upstreamSrv := httptest.NewUnstartedServer(respondingUpstreamHandler(http.StatusUnauthorized, true))
-	upstreamSrv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
-		if state == http.StateNew {
-			newConns.Add(1)
-		}
-	}
-	upstreamSrv.Start()
-	defer upstreamSrv.Close()
-
-	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
-	srv := httptest.NewServer(p)
-	defer srv.Close()
-
-	for i := 0; i < 2; i++ {
-		resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
-		if err != nil {
-			t.Fatalf("GET %d: %v", i, err)
-		}
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusBadGateway {
-			t.Fatalf("request %d status = %d, want %d", i, resp.StatusCode, http.StatusBadGateway)
-		}
-	}
-
-	if got := newConns.Load(); got != 1 {
-		t.Errorf("upstream accepted %d new TCP connections for 2 sequential requests, want 1 — the discarded 401 body must be drained to EOF so the proxy's Transport can reuse the connection instead of redialing", got)
-	}
-}
-
-// TestPostInjectionUpstream403Maps502 mirrors the 401 case for 403 — the
-// plan's invariant covers both statuses identically.
-func TestPostInjectionUpstream403Maps502(t *testing.T) {
-	upstreamSrv := httptest.NewServer(respondingUpstreamHandler(http.StatusForbidden, true))
-	defer upstreamSrv.Close()
-
-	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, discardLogger())
-	srv := httptest.NewServer(p)
-	defer srv.Close()
-
-	resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, resp.Body)
-
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusBadGateway)
-	}
-	if got := resp.Header.Get("WWW-Authenticate"); got != "" {
-		t.Errorf("WWW-Authenticate = %q, want it stripped", got)
-	}
-}
-
-func TestUpstreamAuthFailedEventLoggedOnPostInjectionFailure(t *testing.T) {
-	upstreamSrv := httptest.NewServer(respondingUpstreamHandler(http.StatusUnauthorized, true))
-	defer upstreamSrv.Close()
-
-	buf := &syncBuffer{}
-	logger := slog.New(slog.NewJSONHandler(buf, nil))
-	p := mustNew(t, newUpstreamMap(t, map[string]string{"testhost": upstreamSrv.URL}), allowAllAuthenticator{}, allowAllPolicy{}, logger)
-	srv := httptest.NewServer(p)
-	defer srv.Close()
-
-	resp, err := http.Get(srv.URL + "/testhost/acme/widgets.git/info/refs?service=git-upload-pack")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, resp.Body)
-
-	line := strings.Join(waitForLogLines(t, buf, 1), "\n")
-	for _, want := range []string{
-		`"event":"upstream_auth_failed"`,
-		`"host":"testhost"`,
-		`"owner":"acme"`,
-		`"repo":"widgets"`,
-		`"verb":"read"`,
-	} {
-		if !strings.Contains(line, want) {
-			t.Errorf("log output = %q, want it to contain %q", line, want)
-		}
-	}
-	if strings.Contains(line, defaultTestCredential.Password) {
-		t.Errorf("log output = %q, must never contain the injected credential", line)
 	}
 }
 

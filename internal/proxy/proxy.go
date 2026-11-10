@@ -5,20 +5,27 @@
 // a configured upstream is authenticated (internal/identity) and
 // authorized (internal/policy) before it is forwarded. Once authorized,
 // a per-upstream upstream.CredentialSource mints (or returns a fixed)
-// upstream credential that rewrite injects in place of the client's own
+// upstream credential that is injected in place of the client's own
 // Authorization header — the client's haybale token never reaches the
 // upstream, and the upstream credential never reaches the client (see
-// modifyResponse). Pack data can run to gigabytes, so nothing here may
-// buffer or parse a body — only httputil.ReverseProxy's plumbing (and a
-// byte-counting wrapper for the request log) touches it.
+// sanitizeUpstreamResponse). Pack data can run to gigabytes, so the
+// passthrough path never buffers or parses a body — only
+// httputil.ReverseProxy's plumbing (and a byte-counting wrapper for the
+// request log) touches it. When a response cache is configured
+// (WithCache), a policy-allowed read is offered to it first; the cache
+// reads that request's body, bounded by its own limit, to classify it,
+// and streams the response through a disk spool (see internal/cache).
+// Writes and reads the cache declines take the passthrough path.
 package proxy
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -32,6 +39,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/rxbynerd/haybale/internal/cache"
 	"github.com/rxbynerd/haybale/internal/gitproto"
 	"github.com/rxbynerd/haybale/internal/identity"
 	"github.com/rxbynerd/haybale/internal/observability"
@@ -44,6 +52,37 @@ import (
 // alongside a 401: it names the Basic scheme so a git client re-prompts
 // for (or retries with) credentials rather than giving up outright.
 const wwwAuthenticateChallenge = `Basic realm="haybale"`
+
+// upstreamConnectTimeout bounds dialing and the TLS handshake of an
+// upstream connection. Transfers themselves stay unbounded.
+const upstreamConnectTimeout = 30 * time.Second
+
+// cacheUserAgent is the User-Agent of every request the response cache
+// sends upstream. It begins with "git/" because git hosts gate
+// smart-HTTP behaviour on that prefix.
+const cacheUserAgent = "git/2.0 (haybale)"
+
+// errNoCredentialSource reports an upstream host with no credential
+// source, a caller-assembled configuration error.
+var errNoCredentialSource = errors.New("proxy: no credential source configured for this upstream")
+
+// ResponseCache is the consumer-side interface of the response cache;
+// *cache.Cache satisfies it. Serve is offered every policy-allowed read
+// and reports whether it wrote the response; Invalidate is called after
+// every git-receive-pack POST.
+type ResponseCache interface {
+	Serve(w http.ResponseWriter, r *http.Request, repo gitproto.Repo, baseURL *url.URL, fetch cache.Fetcher) (cache.Outcome, bool)
+	Invalidate(ctx context.Context, repo gitproto.Repo, baseURL *url.URL)
+}
+
+// Option configures a Proxy at construction.
+type Option func(*Proxy)
+
+// WithCache serves policy-allowed reads through c. A nil c leaves the
+// proxy a pure passthrough.
+func WithCache(c ResponseCache) Option {
+	return func(p *Proxy) { p.cache = c }
+}
 
 // Proxy is an http.Handler that validates inbound smart-HTTP requests,
 // authenticates and authorizes the caller, and streams the request
@@ -58,11 +97,16 @@ type Proxy struct {
 	// credential injected into that upstream's requests. Also treated as
 	// immutable after New returns.
 	credentialSources map[string]upstream.CredentialSource
-	rp                *httputil.ReverseProxy
-	logger            *slog.Logger
-	metrics           *observability.Metrics
-	authenticator     identity.Authenticator
-	policyEngine      policy.Engine
+	// transport is the one upstream transport; the passthrough reverse
+	// proxy and the cache's fetcher share it so both legs carry the same
+	// timeouts, compression posture and instrumentation.
+	transport     http.RoundTripper
+	rp            *httputil.ReverseProxy
+	cache         ResponseCache
+	logger        *slog.Logger
+	metrics       *observability.Metrics
+	authenticator identity.Authenticator
+	policyEngine  policy.Engine
 
 	// draining is set by BeginDrain, called from cmd/haybale/cmd/serve.go
 	// on SIGTERM/SIGINT before http.Server.Shutdown is invoked. Once true,
@@ -122,8 +166,10 @@ type credentialContext struct {
 //
 // A nil logger falls back to slog.Default(); a nil metrics falls back to
 // observability.NewNoopMetrics() so every record call site is
-// unconditional and no path has to nil-check.
-func New(upstreams map[string]*url.URL, credentialSources map[string]upstream.CredentialSource, authenticator identity.Authenticator, policyEngine policy.Engine, logger *slog.Logger, metrics *observability.Metrics) (*Proxy, error) {
+// unconditional and no path has to nil-check. opts apply optional
+// features such as WithCache; without them the proxy is a pure
+// passthrough.
+func New(upstreams map[string]*url.URL, credentialSources map[string]upstream.CredentialSource, authenticator identity.Authenticator, policyEngine policy.Engine, logger *slog.Logger, metrics *observability.Metrics, opts ...Option) (*Proxy, error) {
 	if authenticator == nil {
 		return nil, fmt.Errorf("proxy: authenticator is required")
 	}
@@ -144,6 +190,41 @@ func New(upstreams map[string]*url.URL, credentialSources map[string]upstream.Cr
 		logger:            logger,
 		metrics:           metrics,
 	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	// otelhttp.NewTransport wraps the upstream leg, shared by the
+	// passthrough reverse proxy and the cache fetcher, so each upstream
+	// request produces a client span (parented to the inbound server span)
+	// and an http.client.* metric. It is given an EMPTY propagator
+	// deliberately: haybale must not inject its own
+	// traceparent/tracestate/baggage upstream, so the passthrough carries
+	// only the client's headers plus the injected Authorization (see
+	// rewrite) and the fetcher only its fixed header set. Inbound trace
+	// continuation still works: the server handler uses the global W3C
+	// propagator to extract a caller-supplied traceparent. When telemetry
+	// is disabled the global tracer is a no-op.
+	p.transport = otelhttp.NewTransport(
+		&http.Transport{
+			// Dial and TLS handshake are the only bounded phases of an
+			// upstream connection; a transfer may take as long as it
+			// needs.
+			DialContext:         (&net.Dialer{Timeout: upstreamConnectTimeout, KeepAlive: 30 * time.Second}).DialContext,
+			TLSHandshakeTimeout: upstreamConnectTimeout,
+			// The transport never adds or decodes gzip itself, so the
+			// passthrough forwards Accept-Encoding and Content-Encoding
+			// exactly as sent, and the cache fetcher's explicit
+			// Accept-Encoding: identity is what reaches upstream.
+			DisableCompression: true,
+			// ForceAttemptHTTP2 already defaults to false on a
+			// manually-constructed http.Transport (it is only true on
+			// http.DefaultTransport); set explicitly so the HTTP/1.1
+			// requirement is visible here rather than relying on that
+			// default.
+			ForceAttemptHTTP2: false,
+		},
+		otelhttp.WithPropagators(propagation.NewCompositeTextMapPropagator()),
+	)
 	p.rp = &httputil.ReverseProxy{
 		Rewrite: p.rewrite,
 		// -1 disables periodic batching and flushes on every write
@@ -151,39 +232,13 @@ func New(upstreams map[string]*url.URL, credentialSources map[string]upstream.Cr
 		// percentages) streams live through the proxy rather than
 		// arriving in bursts.
 		FlushInterval: -1,
-		// otelhttp.NewTransport wraps the upstream leg so each forwarded
-		// request produces a client span (parented to the inbound server
-		// span) and an http.client.* metric. It is given an EMPTY
-		// propagator deliberately: haybale must not inject its own
-		// traceparent/tracestate/baggage into the request it sends
-		// upstream, preserving the byte-for-byte passthrough invariant
-		// (the upstream leg carries only the headers the client sent plus
-		// the Authorization rewrite injects — see rewrite). Inbound trace
-		// continuation still works: the server handler uses the global W3C
-		// propagator to extract a caller-supplied traceparent. When telemetry
-		// is disabled the global tracer is a no-op.
-		Transport: otelhttp.NewTransport(
-			&http.Transport{
-				// Never let the transport request/decode its own gzip
-				// encoding — Content-Encoding and Accept-Encoding must pass
-				// through exactly as the client sent them, since this is a
-				// byte-for-byte passthrough, not a decoding proxy.
-				DisableCompression: true,
-				// ForceAttemptHTTP2 already defaults to false on a
-				// manually-constructed http.Transport (it is only true on
-				// http.DefaultTransport); set explicitly so the HTTP/1.1
-				// requirement is visible here rather than relying on that
-				// default.
-				ForceAttemptHTTP2: false,
-			},
-			otelhttp.WithPropagators(propagation.NewCompositeTextMapPropagator()),
-		),
-		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError),
+		Transport:     p.transport,
+		ErrorLog:      slog.NewLogLogger(logger.Handler(), slog.LevelError),
 		// ModifyResponse maps a post-injection upstream 401/403 to a 502
 		// and resets the response headers to a minimal known-safe set
 		// (so WWW-Authenticate and anything else upstream-controlled
-		// never reaches the client) — see modifyResponse's doc comment
-		// for the security invariant this enforces.
+		// never reaches the client) — see sanitizeUpstreamResponse's doc
+		// comment for the security invariant this enforces.
 		ModifyResponse: p.modifyResponse,
 	}
 	return p, nil
@@ -301,6 +356,39 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		span.SetAttributes(attribute.String("haybale.issuer", id.Issuer))
 	}
 
+	// The byte counters wrap the request body and response writer before
+	// anything reads or writes them, on both the cache and passthrough
+	// paths; they never buffer pack data.
+	var bytesIn atomic.Int64
+	r.Body = &countingReadCloser{ReadCloser: r.Body, n: &bytesIn}
+	var bytesOut atomic.Int64
+	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK, bytesOut: &bytesOut}
+
+	// In-flight gauge brackets exactly the transfer: incremented
+	// immediately before the (possibly multi-gigabyte, arbitrarily long)
+	// stream begins and decremented via defer when it returns, so a stuck
+	// or saturating upstream shows up as a rising gauge. Uses r.Context()
+	// so the observation carries the request's trace context.
+	p.metrics.InFlightAdd(r.Context(), repo.Host, verb.String(), 1)
+	defer p.metrics.InFlightAdd(r.Context(), repo.Host, verb.String(), -1)
+	start := time.Now()
+
+	// The cache is offered only a read, and only after policy allowed it:
+	// it is the first thing that may read the body. A declined read
+	// continues down the passthrough path with its body restored.
+	var cacheAttrs []any
+	if verb == gitproto.Read && p.cache != nil {
+		outcome, handled := p.cache.Serve(rec, r, repo, base, &cacheFetcher{proxy: p, base: base, repo: repo})
+		cacheAttrs = cacheLogAttrs(outcome)
+		span.SetAttributes(cacheSpanAttrs(outcome)...)
+		if handled {
+			// The cache reports what it actually wrote; a zero status
+			// means the client left before any header went out.
+			p.finishProxied(r, span, id, repo, verb, outcome.Status, time.Since(start), bytesIn.Load(), outcome.BytesOut, cacheAttrs)
+			return
+		}
+	}
+
 	source, ok := p.credentialSources[repo.Host]
 	if !ok || source == nil {
 		// Every upstream host in production config.Validate() output has
@@ -339,42 +427,78 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := context.WithValue(r.Context(), routeKey{}, base)
 	ctx = context.WithValue(ctx, credentialContextKey{}, credentialContext{credential: cred, repo: repo, verb: verb})
 
-	var bytesIn atomic.Int64
-	r.Body = &countingReadCloser{ReadCloser: r.Body, n: &bytesIn}
+	// A push changes the repository's refs whatever its status (a rejected
+	// push still returns 200), so the cached refs entries go either way.
+	// It runs as soon as the response has been copied and, via defer, when
+	// ReverseProxy panics with http.ErrAbortHandler because the client
+	// disconnected mid-response. The request context may already be
+	// cancelled then, so the call does not use it.
+	invalidate := func() {}
+	if p.cache != nil && verb == gitproto.Write && r.Method == http.MethodPost {
+		invalidated := false
+		invalidate = func() {
+			if !invalidated {
+				invalidated = true
+				p.cache.Invalidate(context.WithoutCancel(r.Context()), repo, base)
+			}
+		}
+	}
 
-	var bytesOut atomic.Int64
-	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK, bytesOut: &bytesOut}
+	defer invalidate()
 
-	// In-flight gauge brackets exactly the forwarded transfer: incremented
-	// immediately before the (possibly multi-gigabyte, arbitrarily long)
-	// upstream stream begins and decremented via defer when it returns, so
-	// a stuck or saturating upstream shows up as a rising gauge. Uses
-	// r.Context() so the observation carries the request's trace context.
-	p.metrics.InFlightAdd(r.Context(), repo.Host, verb.String(), 1)
-	defer p.metrics.InFlightAdd(r.Context(), repo.Host, verb.String(), -1)
-
-	start := time.Now()
 	p.rp.ServeHTTP(rec, r.WithContext(ctx))
-	duration := time.Since(start)
+	invalidate()
+	p.finishProxied(r, span, id, repo, verb, rec.status, time.Since(start), bytesIn.Load(), bytesOut.Load(), cacheAttrs)
+}
 
-	span.SetAttributes(
-		attribute.String("haybale.outcome", observability.OutcomeProxied),
-		attribute.Int("http.response.status_code", rec.status),
-	)
-	p.metrics.RecordProxied(r.Context(), repo.Host, verb.String(), rec.status, duration, bytesIn.Load(), bytesOut.Load())
+// finishProxied records the outcome of a request answered on the client's
+// behalf, from the cache or from upstream: the span attributes, the
+// proxied-request metrics and the request log line. extra holds the cache
+// log fields, when a cache is configured and the request was a read.
+//
+// A status of zero means the client left before any response header was
+// written; there is no status to report, so the status attribute, the
+// proxied-request metrics and the log status field are omitted.
+//
+// The log record uses InfoContext (not Info) so it carries r.Context():
+// when telemetry is on, the SpanContextHandler stamps the line with the
+// same trace_id/span_id as the request span and the otelslog bridge ships
+// it correlated. With telemetry off there is no active span and the
+// context is simply ignored.
+func (p *Proxy) finishProxied(r *http.Request, span trace.Span, id *identity.Identity, repo gitproto.Repo, verb gitproto.Verb, status int, duration time.Duration, bytesIn, bytesOut int64, extra []any) {
+	span.SetAttributes(attribute.String("haybale.outcome", observability.OutcomeProxied))
+	attrs := []any{
+		"identity", id.ID, "issuer", id.Issuer, "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "verb", verb.String(),
+	}
+	if status != 0 {
+		span.SetAttributes(attribute.Int("http.response.status_code", status))
+		p.metrics.RecordProxied(r.Context(), repo.Host, verb.String(), status, duration, bytesIn, bytesOut)
+		attrs = append(attrs, "status", status)
+	}
+	attrs = append(attrs, "bytesIn", bytesIn, "bytesOut", bytesOut, "durationMs", duration.Milliseconds())
+	p.logger.InfoContext(r.Context(), "proxied request", append(attrs, extra...)...)
+}
 
-	// Log after proxying so the record includes response status, byte counts,
-	// and duration. The counters wrap the request body and response writer;
-	// they never buffer pack data.
-	//
-	// InfoContext (not Info) so the record carries r.Context(): when
-	// telemetry is on, the SpanContextHandler stamps this line with the
-	// same trace_id/span_id as the request span and the otelslog bridge
-	// ships it correlated. With telemetry off there is no active span and
-	// the context is simply ignored.
-	p.logger.InfoContext(r.Context(), "proxied request",
-		"identity", id.ID, "issuer", id.Issuer, "host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "verb", verb.String(), "status", rec.status,
-		"bytesIn", bytesIn.Load(), "bytesOut", bytesOut.Load(), "durationMs", duration.Milliseconds())
+// cacheLogAttrs renders a cache outcome as request-log fields: cache
+// always, and the collapsed and stored flags for a miss.
+func cacheLogAttrs(o cache.Outcome) []any {
+	attrs := []any{"cache", o.Result}
+	if o.Result == observability.ResultMiss {
+		attrs = append(attrs, "cacheCollapsed", o.Collapsed, "cacheStored", o.Stored)
+	}
+	return attrs
+}
+
+// cacheSpanAttrs renders a cache outcome as span attributes.
+func cacheSpanAttrs(o cache.Outcome) []attribute.KeyValue {
+	attrs := []attribute.KeyValue{attribute.String("haybale.cache.result", o.Result)}
+	if o.Result == observability.ResultMiss {
+		attrs = append(attrs,
+			attribute.Bool("haybale.cache.collapsed", o.Collapsed),
+			attribute.Bool("haybale.cache.stored", o.Stored),
+		)
+	}
+	return attrs
 }
 
 // countingReadCloser wraps an io.ReadCloser and atomically tallies every
@@ -426,6 +550,53 @@ func (s *statusRecorder) Flush() {
 	}
 }
 
+// prepareUpstreamRequest applies the credential boundary to an outbound
+// request on either path: the client's Authorization header is removed
+// and the upstream credential injected in its place. The client's
+// Authorization is the haybale token Authenticate just checked, never a
+// credential the upstream understands; forwarding it would leak that
+// token to anything with visibility into the upstream leg. Nothing here
+// adds Forwarded or X-Forwarded-* headers: haybale never tells the
+// upstream the client's address, host or scheme.
+func prepareUpstreamRequest(out *http.Request, cred upstream.BasicAuth) {
+	out.Header.Del("Authorization")
+	out.SetBasicAuth(cred.Username, cred.Password)
+}
+
+// sanitizeUpstreamResponse enforces the response side of the credential
+// boundary on either path. A 401 or 403 from upstream arrives strictly
+// after prepareUpstreamRequest injected haybale's own credential, so it
+// means the upstream rejected that credential, not something the client
+// did. Treating it as an ordinary 401 would make git re-prompt the client
+// for a credential it has no way to supply (the sandbox has no real git
+// credentials — that's the entire premise of haybale existing); the
+// response becomes a 502 whose headers are replaced wholesale with a
+// minimal known-safe set, so WWW-Authenticate, Set-Cookie or anything
+// else upstream-controlled never reaches the client. The discarded body
+// is drained to EOF before its reader is closed, so the connection it
+// arrived on can be reused: a bad credential is a sustained failure mode
+// and every subsequent request hits this same path until it is fixed.
+//
+// It returns the upstream status and whether the response was rewritten;
+// every other status is left completely unmodified.
+func sanitizeUpstreamResponse(resp *http.Response) (upstreamStatus int, sanitized bool) {
+	upstreamStatus = resp.StatusCode
+	if upstreamStatus != http.StatusUnauthorized && upstreamStatus != http.StatusForbidden {
+		return upstreamStatus, false
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	body := []byte(http.StatusText(http.StatusBadGateway) + "\n")
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.Header = http.Header{}
+	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	resp.Header.Set("Content-Type", "text/plain; charset=utf-8")
+	resp.StatusCode = http.StatusBadGateway
+	resp.Status = fmt.Sprintf("%d %s", http.StatusBadGateway, http.StatusText(http.StatusBadGateway))
+	return upstreamStatus, true
+}
+
 // rewrite implements httputil.ReverseProxy.Rewrite. It points the
 // outbound request at the upstream base URL ServeHTTP resolved, with the
 // path rewritten to strip only the leading /{host} segment — the
@@ -433,7 +604,7 @@ func (s *statusRecorder) Flush() {
 // every header (Git-Protocol, Content-Type, Content-Encoding, Accept,
 // Accept-Encoding included) that pr.Out already carries as a clone of
 // the inbound request, pass through unchanged — except Authorization,
-// which is explicitly deleted and replaced (see below).
+// which prepareUpstreamRequest replaces.
 //
 // Deliberately absent: a call to pr.SetXForwarded(). ReverseProxy only
 // strips inbound Forwarded/X-Forwarded-* headers and reintroduces its
@@ -455,97 +626,99 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 	pr.Out.URL.Path = base.Path + stripHostSegment(pr.In.URL.Path)
 	pr.Out.URL.RawPath = ""
 
-	// httputil.ReverseProxy only strips the small RFC hop-by-hop header
-	// set (Connection, Keep-Alive, Proxy-Authenticate,
-	// Proxy-Authorization, TE, Trailers, Transfer-Encoding, Upgrade) by
-	// default — Authorization is end-to-end, not hop-by-hop, so it would
-	// otherwise clone straight through to pr.Out. The client's
-	// Authorization here is the haybale auth token Authenticate just
-	// checked (Basic password or Bearer), never a credential the
-	// upstream git host understands; forwarding it verbatim would leak
-	// that token to anything with visibility into the upstream leg.
-	pr.Out.Header.Del("Authorization")
-
-	// Order matters: the delete above must run before this SetBasicAuth
-	// call, never after — the inbound client credential must be replaced
-	// by the injected upstream one, never appended alongside it (which
-	// SetBasicAuth's own Header.Set semantics already guarantee even if
-	// the order were reversed, but the delete keeps that guarantee
-	// explicit rather than incidental). credentialContext is always
-	// present here: ServeHTTP sets it in the same context value it uses
-	// for routeKey, immediately before invoking p.rp.ServeHTTP, and
-	// rewrite only ever runs as part of that same call.
+	// credentialContext is always present here: ServeHTTP sets it in the
+	// same context value it uses for routeKey, immediately before
+	// invoking p.rp.ServeHTTP, and rewrite only ever runs as part of that
+	// same call.
 	if cc, ok := pr.In.Context().Value(credentialContextKey{}).(credentialContext); ok {
-		pr.Out.SetBasicAuth(cc.credential.Username, cc.credential.Password)
+		prepareUpstreamRequest(pr.Out, cc.credential)
 	}
 }
 
-// modifyResponse implements httputil.ReverseProxy.ModifyResponse. It prevents
-// upstream authentication responses from exposing credential challenges or
-// other upstream-controlled error data to the client. A
-// 401 or 403 arriving here happened strictly after rewrite already set
-// Authorization to that injected credential — httputil.ReverseProxy
-// calls Rewrite before every RoundTrip, with no path that sends a
-// request without it — so any 401/403 response means the upstream
-// rejected haybale's own credential, not something the client did.
-// Treating it as an ordinary passthrough 401 would make git re-prompt
-// the client for a credential it has no way to supply (the sandbox has
-// no real git credentials — that's the entire premise of haybale
-// existing); this maps it to 502 instead and resets the response headers
-// to a minimal known-safe set so git never even considers re-prompting
-// and no upstream-controlled header (WWW-Authenticate, Set-Cookie, or
-// anything else) reaches the client. The discarded upstream body is
-// drained to EOF before its reader is closed, so the connection this
-// response arrived on can be reused for the next request to the same
-// upstream — a bad credential is a sustained failure mode, so every
-// subsequent request hits this same path until it's fixed.
-//
-// Every other status (success or any other error) is streamed through
-// completely unmodified — this function must never rewrite a genuine
-// upstream success response.
+// modifyResponse implements httputil.ReverseProxy.ModifyResponse by
+// applying sanitizeUpstreamResponse and logging the security event when
+// the upstream rejected the injected credential.
 func (p *Proxy) modifyResponse(resp *http.Response) error {
-	if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
+	upstreamStatus, sanitized := sanitizeUpstreamResponse(resp)
+	if !sanitized {
 		return nil
 	}
-
 	cc, _ := resp.Request.Context().Value(credentialContextKey{}).(credentialContext)
-	security.Log(p.logger, security.EventUpstreamAuthFailed,
-		"host", cc.repo.Host, "owner", cc.repo.Owner, "repo", cc.repo.Name, "verb", cc.verb.String(),
-		"upstreamStatus", resp.StatusCode, "reason", "upstream rejected injected credential")
-
-	// The original body is drained to EOF before being closed (not merely
-	// closed) so the Transport can return the underlying connection to
-	// its keep-alive pool instead of being forced to discard it — a
-	// closed-but-unread body makes net/http treat the connection as
-	// unreusable. A bad or expired credential is a sustained failure
-	// mode: every subsequent request to this upstream hits this same
-	// path, so without draining, an incident becomes "redial upstream on
-	// every single request" at the worst possible time. The drained bytes
-	// are discarded, never inspected: an upstream error page for a
-	// 401/403 is not something haybale can vouch for the contents of, and
-	// there is no reason to give the client anything more than a fixed,
-	// safe message.
-	_, _ = io.Copy(io.Discard, resp.Body)
-	_ = resp.Body.Close()
-	body := []byte(http.StatusText(http.StatusBadGateway) + "\n")
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	resp.ContentLength = int64(len(body))
-	// The client-visible headers are replaced wholesale with a minimal,
-	// known-safe set, rather than merely deleting WWW-Authenticate —
-	// this is what actually stops Set-Cookie, a bespoke challenge header,
-	// or anything else a compromised, misconfigured, or lookalike
-	// upstream's 401/403 page happens to set from streaming through on
-	// this synthetic 502. WWW-Authenticate in particular must never
-	// survive: without stripping it, a git client sees it on what looks
-	// like a 401 and re-prompts for credentials the sandbox cannot
-	// supply — the wholesale reset below covers that case too, so no
-	// separate Header.Del("WWW-Authenticate") call is needed.
-	resp.Header = http.Header{}
-	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
-	resp.Header.Set("Content-Type", "text/plain; charset=utf-8")
-	resp.StatusCode = http.StatusBadGateway
-	resp.Status = fmt.Sprintf("%d %s", http.StatusBadGateway, http.StatusText(http.StatusBadGateway))
+	p.logUpstreamRejected(cc.repo, cc.verb, upstreamStatus)
 	return nil
+}
+
+func (p *Proxy) logUpstreamRejected(repo gitproto.Repo, verb gitproto.Verb, upstreamStatus int) {
+	security.Log(p.logger, security.EventUpstreamAuthFailed,
+		"host", repo.Host, "owner", repo.Owner, "repo", repo.Name, "verb", verb.String(),
+		"upstreamStatus", upstreamStatus, "reason", "upstream rejected injected credential")
+}
+
+// cacheFetcher is the cache.Fetcher for one request: it synthesises the
+// upstream request from the canonical cache.Request, mints the credential
+// only when a fetch is needed, and sends it through the proxy's shared
+// transport with the same request and response boundaries as the
+// passthrough path.
+type cacheFetcher struct {
+	proxy *Proxy
+	base  *url.URL
+	repo  gitproto.Repo
+}
+
+// Fetch sends req upstream. Only the allowlisted headers are set:
+// Content-Type (POST), Accept, Git-Protocol when present,
+// Accept-Encoding: identity so the stored body is never encoded, a fixed
+// User-Agent, and the injected Authorization. Nothing from the client's
+// own request is carried. A credential mint failure is returned as an
+// error; the cache then releases the request to the passthrough path,
+// which answers 502 and logs upstream_auth_failed.
+func (f *cacheFetcher) Fetch(ctx context.Context, req cache.Request) (*http.Response, error) {
+	source, ok := f.proxy.credentialSources[f.repo.Host]
+	if !ok || source == nil {
+		return nil, errNoCredentialSource
+	}
+	cred, err := source.Credentials(ctx, f.repo, gitproto.Read)
+	if err != nil {
+		return nil, fmt.Errorf("proxy: credential source: %w", err)
+	}
+
+	endpoint, query, _ := strings.Cut(req.Endpoint, "?")
+	target := *f.base
+	target.Path = f.base.Path + "/" + f.repo.Owner + "/" + f.repo.Name + ".git/" + endpoint
+	target.RawPath = ""
+	switch {
+	case f.base.RawQuery == "":
+		target.RawQuery = query
+	case query != "":
+		target.RawQuery = f.base.RawQuery + "&" + query
+	}
+	var body io.Reader
+	if req.Method == http.MethodPost {
+		body = bytes.NewReader(req.Body)
+	}
+	out, err := http.NewRequestWithContext(ctx, req.Method, target.String(), body)
+	if err != nil {
+		return nil, fmt.Errorf("proxy: build upstream request: %w", err)
+	}
+	if req.ContentType != "" {
+		out.Header.Set("Content-Type", req.ContentType)
+	}
+	out.Header.Set("Accept", req.Accept)
+	if req.Protocol != "" {
+		out.Header.Set("Git-Protocol", req.Protocol)
+	}
+	out.Header.Set("Accept-Encoding", "identity")
+	out.Header.Set("User-Agent", cacheUserAgent)
+	prepareUpstreamRequest(out, cred)
+
+	resp, err := f.proxy.transport.RoundTrip(out)
+	if err != nil {
+		return nil, err
+	}
+	if upstreamStatus, sanitized := sanitizeUpstreamResponse(resp); sanitized {
+		f.proxy.logUpstreamRejected(f.repo, gitproto.Read, upstreamStatus)
+	}
+	return resp, nil
 }
 
 // stripHostSegment removes the leading /{host} segment from an

@@ -26,6 +26,14 @@ const (
 	attrOutcome = "haybale.outcome"
 	attrStatus  = "http.response.status_code"
 	attrResult  = "haybale.result"
+	// The response-cache attributes. class is bounded by the request
+	// classes the cache recognises, reason by the FillReason* set,
+	// tier by the Tier* set, and operation by the cache's store
+	// operations; none carries a repository or identity.
+	attrClass     = "haybale.class"
+	attrReason    = "haybale.reason"
+	attrTier      = "haybale.tier"
+	attrOperation = "haybale.operation"
 )
 
 // Request outcome values for the attrOutcome label on
@@ -49,12 +57,72 @@ const (
 	OutcomeUpstreamAuthFailed = "upstream_auth_failed"
 )
 
-// Token-cache result values for the attrResult label on
-// haybale.token_cache.total.
+// Cache lookup result values for the attrResult label. The token cache
+// (haybale.token_cache.lookups.total) records only ResultHit and
+// ResultMiss; the response cache (haybale.response_cache.lookups.total)
+// uses all four.
 const (
 	ResultHit  = "hit"
 	ResultMiss = "miss"
+	// ResultStale — a stale entry was served because upstream could not
+	// answer.
+	ResultStale = "stale"
+	// ResultBypass — the request was not eligible for the response cache
+	// and went straight upstream.
+	ResultBypass = "bypass"
 )
+
+// Response-cache fill result values for the attrResult label on
+// haybale.response_cache.fills.total.
+const (
+	// FillResultStored — the fill completed and its entry was committed.
+	FillResultStored = "stored"
+	// FillResultDiscarded — the response was delivered (or abandoned) but
+	// not stored; the attrReason label says why.
+	FillResultDiscarded = "discarded"
+)
+
+// Response-cache fill reason values for the attrReason label on
+// haybale.response_cache.fills.total, set on discarded fills only.
+const (
+	FillReasonErrorPacket    = "error_packet"
+	FillReasonSidebandError  = "sideband_error"
+	FillReasonFraming        = "framing"
+	FillReasonTruncated      = "truncated"
+	FillReasonTooLarge       = "too_large"
+	FillReasonDiskBudget     = "disk_budget"
+	FillReasonStoreError     = "store_error"
+	FillReasonGeneration     = "generation"
+	FillReasonUpstreamStatus = "upstream_status"
+	FillReasonFetchError     = "fetch_error"
+	FillReasonEncoding       = "encoding"
+)
+
+// Response-cache storage tier values for the attrTier label. TierUpstream
+// labels bytes that came from the upstream rather than a stored entry.
+const (
+	TierDisk     = "disk"
+	TierRemote   = "remote"
+	TierUpstream = "upstream"
+)
+
+// Response-cache store operation values for the attrOperation label on
+// haybale.response_cache.store_errors.total.
+const (
+	OperationOpen   = "open"
+	OperationCreate = "create"
+	OperationWrite  = "write"
+	OperationCommit = "commit"
+	OperationAbort  = "abort"
+	OperationDelete = "delete"
+	OperationEvict  = "evict"
+	OperationExpire = "expire"
+	OperationSweep  = "sweep"
+)
+
+// ClassBypass is the attrClass value for a response-cache lookup of a
+// request the cache did not classify.
+const ClassBypass = "bypass"
 
 // Metrics holds haybale's OTel metric instruments. When telemetry is
 // disabled (NewNoopMetrics), every instrument is backed by
@@ -95,6 +163,37 @@ type Metrics struct {
 	// and result (hit|miss) — the cache hit ratio that governs how much
 	// mint traffic haybale generates.
 	TokenCacheLookups metric.Int64Counter
+
+	// ResponseCacheLookups counts response-cache lookups tagged by host,
+	// request class, and result (hit|miss|stale|bypass).
+	ResponseCacheLookups metric.Int64Counter
+	// ResponseCacheFills counts finished cache fills tagged by host,
+	// class, result (stored|discarded), and, for a discarded fill, the
+	// reason it was not stored.
+	ResponseCacheFills metric.Int64Counter
+	// ResponseCacheFillBytes counts bytes written into the cache by fills,
+	// and ResponseCacheServedBytes counts response bytes served to clients
+	// through the cache path; both are tagged by host, class, and the tier
+	// the bytes came from (disk|remote|upstream).
+	ResponseCacheFillBytes   metric.Int64Counter
+	ResponseCacheServedBytes metric.Int64Counter
+	// ResponseCacheCollapsed counts subscribers that joined a fill already
+	// in flight instead of starting their own upstream request, tagged by
+	// host.
+	ResponseCacheCollapsed metric.Int64Counter
+	// ResponseCacheStoreErrors counts storage failures tagged by tier and
+	// the operation that failed.
+	ResponseCacheStoreErrors metric.Int64Counter
+	// ResponseCacheEvictions counts entries evicted to stay within the
+	// disk budget or retention.
+	ResponseCacheEvictions metric.Int64Counter
+	// ResponseCacheUploads counts uploads of committed entries to the
+	// remote tier, tagged by result.
+	ResponseCacheUploads metric.Int64Counter
+	// ResponseCacheDiskBytes tracks the bytes the disk tier currently
+	// holds. It is an up/down counter fed with deltas, like InFlight,
+	// because Metrics is built before the cache exists.
+	ResponseCacheDiskBytes metric.Int64UpDownCounter
 }
 
 // NewNoopMetrics returns a Metrics whose instruments are all no-ops,
@@ -209,6 +308,76 @@ func newMetricsFromMeter(meter metric.Meter, provider *sdkmetric.MeterProvider) 
 	); err != nil {
 		return nil, err
 	}
+	return newResponseCacheInstruments(m, meter)
+}
+
+// newResponseCacheInstruments constructs the response-cache instruments on
+// m from meter, returning m.
+func newResponseCacheInstruments(m *Metrics, meter metric.Meter) (*Metrics, error) {
+	var err error
+	if m.ResponseCacheLookups, err = meter.Int64Counter(
+		"haybale.response_cache.lookups.total",
+		metric.WithDescription("Response-cache lookups, tagged by host, class, and result (hit|miss|stale|bypass)."),
+		metric.WithUnit("{lookup}"),
+	); err != nil {
+		return nil, err
+	}
+	if m.ResponseCacheFills, err = meter.Int64Counter(
+		"haybale.response_cache.fills.total",
+		metric.WithDescription("Response-cache fills, tagged by host, class, result (stored|discarded), and reason for a discarded fill."),
+		metric.WithUnit("{fill}"),
+	); err != nil {
+		return nil, err
+	}
+	if m.ResponseCacheFillBytes, err = meter.Int64Counter(
+		"haybale.response_cache.fill_bytes.total",
+		metric.WithDescription("Bytes written into the response cache by fills, tagged by host, class, and tier."),
+		metric.WithUnit("By"),
+	); err != nil {
+		return nil, err
+	}
+	if m.ResponseCacheServedBytes, err = meter.Int64Counter(
+		"haybale.response_cache.served_bytes.total",
+		metric.WithDescription("Response bytes served through the response cache, tagged by host, class, and tier."),
+		metric.WithUnit("By"),
+	); err != nil {
+		return nil, err
+	}
+	if m.ResponseCacheCollapsed, err = meter.Int64Counter(
+		"haybale.response_cache.collapsed.total",
+		metric.WithDescription("Requests that joined an in-flight cache fill instead of fetching upstream, tagged by host."),
+		metric.WithUnit("{request}"),
+	); err != nil {
+		return nil, err
+	}
+	if m.ResponseCacheStoreErrors, err = meter.Int64Counter(
+		"haybale.response_cache.store_errors.total",
+		metric.WithDescription("Response-cache storage failures, tagged by tier and operation."),
+		metric.WithUnit("{error}"),
+	); err != nil {
+		return nil, err
+	}
+	if m.ResponseCacheEvictions, err = meter.Int64Counter(
+		"haybale.response_cache.evictions.total",
+		metric.WithDescription("Response-cache entries evicted."),
+		metric.WithUnit("{entry}"),
+	); err != nil {
+		return nil, err
+	}
+	if m.ResponseCacheUploads, err = meter.Int64Counter(
+		"haybale.response_cache.uploads.total",
+		metric.WithDescription("Uploads of cache entries to the remote tier, tagged by result."),
+		metric.WithUnit("{upload}"),
+	); err != nil {
+		return nil, err
+	}
+	if m.ResponseCacheDiskBytes, err = meter.Int64UpDownCounter(
+		"haybale.response_cache.disk_bytes",
+		metric.WithDescription("Bytes currently held by the response cache's disk tier."),
+		metric.WithUnit("By"),
+	); err != nil {
+		return nil, err
+	}
 	return m, nil
 }
 
@@ -271,14 +440,93 @@ func (m *Metrics) RecordMint(ctx context.Context, host, verb string) {
 	))
 }
 
-// RecordCacheLookup counts one token-cache lookup for host/verb with the
+// RecordTokenCacheLookup counts one token-cache lookup for host/verb with the
 // given result (ResultHit or ResultMiss).
-func (m *Metrics) RecordCacheLookup(ctx context.Context, host, verb, result string) {
+func (m *Metrics) RecordTokenCacheLookup(ctx context.Context, host, verb, result string) {
 	m.TokenCacheLookups.Add(ctx, 1, metric.WithAttributes(
 		attribute.String(attrHost, host),
 		attribute.String(attrVerb, verb),
 		attribute.String(attrResult, result),
 	))
+}
+
+// RecordResponseCacheLookup counts one response-cache lookup for host and
+// request class with the given result (ResultHit, ResultMiss, ResultStale
+// or ResultBypass).
+func (m *Metrics) RecordResponseCacheLookup(ctx context.Context, host, class, result string) {
+	m.ResponseCacheLookups.Add(ctx, 1, metric.WithAttributes(
+		attribute.String(attrHost, host),
+		attribute.String(attrClass, class),
+		attribute.String(attrResult, result),
+	))
+}
+
+// RecordResponseCacheFill counts one finished cache fill with the given
+// result (FillResultStored or FillResultDiscarded). reason is one of the
+// FillReason* values for a discarded fill and empty for a stored one, in
+// which case the reason label is omitted.
+func (m *Metrics) RecordResponseCacheFill(ctx context.Context, host, class, result, reason string) {
+	attrs := []attribute.KeyValue{
+		attribute.String(attrHost, host),
+		attribute.String(attrClass, class),
+		attribute.String(attrResult, result),
+	}
+	if reason != "" {
+		attrs = append(attrs, attribute.String(attrReason, reason))
+	}
+	m.ResponseCacheFills.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+// RecordResponseCacheFillBytes counts n bytes written into the cache for
+// host and class, read from tier (TierRemote or TierUpstream).
+func (m *Metrics) RecordResponseCacheFillBytes(ctx context.Context, host, class, tier string, n int64) {
+	m.ResponseCacheFillBytes.Add(ctx, n, metric.WithAttributes(
+		attribute.String(attrHost, host),
+		attribute.String(attrClass, class),
+		attribute.String(attrTier, tier),
+	))
+}
+
+// RecordResponseCacheServedBytes counts n response bytes served to a client
+// for host and class from tier (TierDisk, TierRemote or TierUpstream).
+func (m *Metrics) RecordResponseCacheServedBytes(ctx context.Context, host, class, tier string, n int64) {
+	m.ResponseCacheServedBytes.Add(ctx, n, metric.WithAttributes(
+		attribute.String(attrHost, host),
+		attribute.String(attrClass, class),
+		attribute.String(attrTier, tier),
+	))
+}
+
+// RecordResponseCacheCollapsed counts one request for host that joined a
+// fill already in flight.
+func (m *Metrics) RecordResponseCacheCollapsed(ctx context.Context, host string) {
+	m.ResponseCacheCollapsed.Add(ctx, 1, metric.WithAttributes(attribute.String(attrHost, host)))
+}
+
+// RecordResponseCacheStoreError counts one storage failure in tier
+// (TierDisk or TierRemote) during operation.
+func (m *Metrics) RecordResponseCacheStoreError(ctx context.Context, tier, operation string) {
+	m.ResponseCacheStoreErrors.Add(ctx, 1, metric.WithAttributes(
+		attribute.String(attrTier, tier),
+		attribute.String(attrOperation, operation),
+	))
+}
+
+// RecordResponseCacheEvictions counts n cache entries evicted.
+func (m *Metrics) RecordResponseCacheEvictions(ctx context.Context, n int64) {
+	m.ResponseCacheEvictions.Add(ctx, n)
+}
+
+// RecordResponseCacheUpload counts one upload to the remote tier with the
+// given result.
+func (m *Metrics) RecordResponseCacheUpload(ctx context.Context, result string) {
+	m.ResponseCacheUploads.Add(ctx, 1, metric.WithAttributes(attribute.String(attrResult, result)))
+}
+
+// ResponseCacheDiskBytesAdd adds delta (positive when an entry is
+// committed, negative when one is removed) to the disk-tier size gauge.
+func (m *Metrics) ResponseCacheDiskBytesAdd(ctx context.Context, delta int64) {
+	m.ResponseCacheDiskBytes.Add(ctx, delta)
 }
 
 // shutdown flushes and shuts the meter provider down. A no-op on the

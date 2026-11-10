@@ -130,9 +130,12 @@ func TestSetupEnabledBuildsRealPipeline(t *testing.T) {
 			done := make(chan error, 1)
 			go func() { done <- providers.Shutdown(ctx) }()
 			select {
-			case <-done:
-				// Returned within the bound (error or nil both acceptable —
-				// a dead collector may surface a flush error).
+			case shutdownErr := <-done:
+				// Returned within the bound; a dead collector may surface a
+				// flush error, which is acceptable here.
+				if shutdownErr != nil {
+					t.Logf("Providers.Shutdown returned %v (acceptable with no collector listening)", shutdownErr)
+				}
 			case <-time.After(6 * time.Second):
 				t.Fatal("Providers.Shutdown did not return within the bounded window")
 			}

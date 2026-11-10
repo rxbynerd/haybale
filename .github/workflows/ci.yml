@@ -33,6 +33,11 @@ jobs:
       - name: Test (race detector)
         run: go test -race ./...
 
+      # The cache's fills, subscribers and timers interleave differently on
+      # one CPU, which the default GOMAXPROCS run never exercises.
+      - name: Test the response cache on one and four CPUs
+        run: go test -race -count=1 -cpu 1,4 ./internal/cache/...
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

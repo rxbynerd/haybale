@@ -30,6 +30,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
+	"github.com/rxbynerd/haybale/internal/cache"
 	"github.com/rxbynerd/haybale/internal/config"
 	"github.com/rxbynerd/haybale/internal/gitproto"
 	"github.com/rxbynerd/haybale/internal/identity"
@@ -200,6 +201,180 @@ func buildTestConfig(t *testing.T, tokenEnv string) *config.Config {
 			{Host: "github.com", BaseURL: "https://github.com", Credential: config.CredentialConfig{Type: "static", TokenEnv: tokenEnv}},
 			{Host: "git.internal.example", BaseURL: "https://git.internal.example:8443", Credential: config.CredentialConfig{Type: "static", Username: "git", TokenEnv: tokenEnv}},
 		},
+	}
+}
+
+// TestNewResponseCacheDisabled confirms a config without a cache block
+// yields no cache and no proxy option, so the proxy is a pure
+// passthrough, and that closing a nil cache is a no-op.
+func TestNewResponseCacheDisabled(t *testing.T) {
+	const tokenEnv = "HAYBALE_SERVE_TEST_CACHE_OFF_TOKEN" //nolint:gosec // G101: an environment-variable name, not a credential value
+	t.Setenv(tokenEnv, "test-token-value")
+	cfg := buildTestConfig(t, tokenEnv)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	c, opts, err := newResponseCache(cfg, discardLogger(), observability.NewNoopMetrics())
+	if err != nil {
+		t.Fatalf("newResponseCache: %v", err)
+	}
+	if c != nil || len(opts) != 0 {
+		t.Errorf("newResponseCache = %v, %d options; want nil and none", c, len(opts))
+	}
+	closeResponseCache(nil, discardLogger(), time.Second)
+}
+
+// TestNewResponseCacheEnabled confirms an enabled cache block builds a
+// cache under an ephemeral key, creates its directory, yields the proxy
+// option that installs it, and closes cleanly within the bound.
+func TestNewResponseCacheEnabled(t *testing.T) {
+	const tokenEnv = "HAYBALE_SERVE_TEST_CACHE_ON_TOKEN" //nolint:gosec // G101: an environment-variable name, not a credential value
+	t.Setenv(tokenEnv, "test-token-value")
+	cfg := buildTestConfig(t, tokenEnv)
+	cfg.Cache = config.CacheConfig{
+		Enabled:       true,
+		Dir:           filepath.Join(t.TempDir(), "cache"),
+		MaxDiskSize:   64 << 20,
+		MaxEntrySize:  8 << 20,
+		Retention:     "1h",
+		AccessRecheck: "5m",
+	}
+	// Validate parses the durations BuildCache needs; the remaining
+	// defaults come from Load in production and are supplied here.
+	cfg.Cache.MaxConcurrentFills, cfg.Cache.MaxRequestBody = 2, 1<<20
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	c, opts, err := newResponseCache(cfg, logger, observability.NewNoopMetrics())
+	if err != nil {
+		t.Fatalf("newResponseCache: %v", err)
+	}
+	if c == nil || len(opts) != 1 {
+		t.Fatalf("newResponseCache = %v, %d options; want a cache and one option", c, len(opts))
+	}
+	if info, err := os.Stat(cfg.Cache.Dir); err != nil || !info.IsDir() {
+		t.Errorf("cache dir was not created: %v", err)
+	}
+	if !strings.Contains(buf.String(), "does not survive a restart") {
+		t.Errorf("log = %q, want the ephemeral-key notice", buf.String())
+	}
+	// The option must be usable by proxy.New.
+	auth, _ := newJWTTestAuth(t, "cache-wiring")
+	eng, err := policy.NewGlobEngine(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstreams, err := buildUpstreams(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources, err := buildCredentialSources(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := proxy.New(upstreams, sources, auth, eng, discardLogger(), observability.NewNoopMetrics(), opts...); err != nil {
+		t.Fatalf("proxy.New with the cache option: %v", err)
+	}
+	closeResponseCache(c, logger, cacheCloseTimeout)
+	if strings.Contains(buf.String(), "did not close cleanly") {
+		t.Errorf("log = %q, want a clean close", buf.String())
+	}
+}
+
+// newTestResponseCache opens a small cache on a fresh directory under an
+// ephemeral key. The caller closes it.
+func newTestResponseCache(t *testing.T) *cache.Cache {
+	t.Helper()
+	keyring, err := cache.EphemeralKeyring()
+	if err != nil {
+		t.Fatalf("EphemeralKeyring: %v", err)
+	}
+	c, err := cache.New(cache.Options{
+		Dir:                filepath.Join(t.TempDir(), "cache"),
+		Keyring:            keyring,
+		MaxDiskSize:        64 << 20,
+		MaxEntrySize:       8 << 20,
+		MaxConcurrentFills: 2,
+		MaxRequestBody:     1 << 20,
+		Retention:          time.Hour,
+		AccessRecheck:      5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	return c
+}
+
+// blockingFetcher holds every upstream fetch until release is closed,
+// ignoring the fill's cancellation so the cache cannot finish closing.
+type blockingFetcher struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (f *blockingFetcher) Fetch(context.Context, cache.Request) (*http.Response, error) {
+	close(f.entered)
+	<-f.release
+	return nil, errors.New("upstream unavailable")
+}
+
+// TestCloseResponseCacheLogsACleanClose confirms a cache with no fills
+// running closes and says so at Info level.
+func TestCloseResponseCacheLogsACleanClose(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	closeResponseCache(newTestResponseCache(t), logger, 5*time.Second)
+
+	log := buf.String()
+	if !strings.Contains(log, "level=INFO") || !strings.Contains(log, `msg="response cache closed"`) {
+		t.Errorf("log = %q, want an Info line saying the response cache closed", log)
+	}
+	if strings.Contains(log, "did not close cleanly") {
+		t.Errorf("log = %q, want no close warning", log)
+	}
+}
+
+// TestCloseResponseCacheWarnsWhenFillsOutlastTheBound confirms a close
+// that has to wait past the timeout logs a warning carrying the error and
+// does not claim a clean close.
+func TestCloseResponseCacheWarnsWhenFillsOutlastTheBound(t *testing.T) {
+	c := newTestResponseCache(t)
+	fetcher := &blockingFetcher{entered: make(chan struct{}), release: make(chan struct{})}
+
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		r := httptest.NewRequest(http.MethodGet, "/github.com/acme/widgets.git/info/refs?service=git-upload-pack", nil)
+		repo := gitproto.Repo{Host: "github.com", Owner: "acme", Name: "widgets"}
+		baseURL, _ := url.Parse("https://github.com")
+		c.Serve(httptest.NewRecorder(), r, repo, baseURL, fetcher)
+	}()
+	select {
+	case <-fetcher.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the cache never started a fill")
+	}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	closeResponseCache(c, logger, 50*time.Millisecond)
+
+	close(fetcher.release)
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after the fetch was released")
+	}
+
+	log := buf.String()
+	if !strings.Contains(log, "level=WARN") || !strings.Contains(log, "response cache did not close cleanly") || !strings.Contains(log, "fills still running") {
+		t.Errorf("log = %q, want a Warn line with the close error", log)
+	}
+	if strings.Contains(log, "response cache closed") {
+		t.Errorf("log = %q, want no clean-close line", log)
 	}
 }
 

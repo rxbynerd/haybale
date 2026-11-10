@@ -18,6 +18,9 @@ client.
 - per-request, least-privilege GitHub App installation tokens, or static
   credentials for other Git hosts
 - streaming Git smart-HTTP proxying with no pack-size limit
+- an optional, encrypted on-disk response cache that serves the pack transfer
+  of repeated identical clones and fetches from disk instead of fetching it
+  from the upstream again
 - TLS, graceful draining, structured security logs, and optional OpenTelemetry
   traces, metrics, and logs
 
@@ -92,9 +95,13 @@ For each smart-HTTP request, haybale:
 1. parses the upstream host, owner, repository, and Git read/write operation;
 2. verifies the caller's JWT and derives its policy identity;
 3. authorizes the identity against `policy.yaml` and any token repository scope;
-4. replaces the caller's authorization header with the configured upstream
-   credential; and
-5. streams the request and response between the client and upstream.
+4. with the optional response cache enabled, offers a read to the cache, which
+   reads the request body and serves a stored response without contacting the
+   upstream; and
+5. when the request needs the upstream (a cache miss, a request the cache does
+   not handle, a push, or no cache), mints the upstream credential, replaces the
+   caller's authorization header with it, and streams the request and response
+   between the client and upstream.
 
 See the [configuration reference](docs/configuration.md) for complete examples.
 
@@ -103,6 +110,7 @@ See the [configuration reference](docs/configuration.md) for complete examples.
 ```text
 haybale serve [--config haybale.yaml]
 haybale policy check --config haybale.yaml --id ID --repo HOST/OWNER/REPO --verb read|write
+haybale cache purge --config haybale.yaml --repo HOST/OWNER/REPO [--group refs|pack]
 haybale version
 ```
 
@@ -112,6 +120,7 @@ draining.
 ## Documentation
 
 - [Configuration reference](docs/configuration.md)
+- [Response cache guide](docs/caching.md)
 - [JWT issuer contract](docs/jwt-identity.md)
 - [GitHub Actions OIDC integration](docs/github-actions.md)
 - [OpenTelemetry signals](docs/observability.md)
