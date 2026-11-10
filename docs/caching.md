@@ -600,8 +600,11 @@ While the gate is open:
   current, while the probe's upstream request carries on in the background
   until headers arrive or `responseHeaderTimeout` expires. The probe ends
   only then, and its result reaches the gate either way, so an upstream that
-  is reachable but slower than 5 seconds still closes it; a response that can
-  be stored is stored. A client that disconnects does not cancel its probe. A
+  is reachable but slower than 5 seconds still closes it. The probe's response
+  is discarded unless a client is still attached to it, and a request that
+  arrives after the probe's client was answered stale never joins the probe;
+  it is held by the gate or makes its own request. A client that disconnects
+  does not cancel its probe. A
   probe without a qualifying disk entry waits the full
   `responseHeaderTimeout`. A `responseHeaderTimeout` under 5 seconds expires
   before the probe deadline, so a probe with an entry is then answered stale
@@ -627,7 +630,10 @@ before it is answered stale, so for that kind of outage lower
 `responseHeaderTimeout`. A read that cannot be answered stale then takes the
 passthrough path, which also waits at most `responseHeaderTimeout` for the
 upstream's response headers before it answers `502`; pushes are not bounded
-this way.
+this way. For a request whose body the cache did not buffer, because it was
+over `maxRequestBody` or arrived when every classification slot was busy, the
+bound covers the whole round trip, including the client's upload of its body,
+so a client that uploads slowly can be answered `502` at the bound.
 
 ## Observing the cache
 

@@ -197,9 +197,9 @@ type CacheConfig struct {
 	// would stop packs hitting while refs still hit.
 	AccessRecheck string `yaml:"accessRecheck"`
 	// ResponseHeaderTimeout is a Go duration string bounding how long a
-	// cache fill waits for the upstream's response headers. "0s" applies
-	// no bound. It does not affect reads proxied without the cache.
-	// Defaults to "60s".
+	// cache fill, and a read the cache declines to the passthrough path,
+	// waits for the upstream's response headers. "0s" applies no bound.
+	// Pushes are never bounded. Defaults to "60s".
 	ResponseHeaderTimeout string `yaml:"responseHeaderTimeout"`
 	// IdleTimeout is a Go duration string bounding the gap between body
 	// bytes from the upstream during a cache fill. "0s" leaves the gap

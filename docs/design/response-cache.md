@@ -784,10 +784,13 @@ Both limits are stated in the documentation.
 > fetch error arrive. Its purge marker check starts beside its upstream
 > request; at the deadline its subscribers are answered stale only when that
 > check is current and the tier-1 entry still qualifies, and otherwise keep
-> waiting for upstream. A probe is never abandoned, even when its client
-> leaves; once it ends, a probe fill that no subscriber holds behaves as any
-> such fill, so a storable late answer is stored and an idle one is
-> cancelled after the grace period. A connect failure of an attempt that
+> waiting for upstream. Once the deadline has answered, the fill is
+> unregistered, so a later request for the key is held by the gate or
+> starts its own fill and never inherits the stale answer; two fills for one
+> key can briefly overlap. A probe is never abandoned, even when its client
+> leaves; once its headers have reached the gate, a probe fill that no
+> subscriber holds ends at once and its response is discarded unread, with
+> no mark. A connect failure of an attempt that
 > began before the latest success is ignored. A request the gate holds back
 > that has no qualifying entry goes upstream, and a held request answered
 > from tier 1 records no fill metric. With the cache enabled, the
@@ -913,7 +916,7 @@ cache:
   retention: 24h                   # all entries; also the post-rewrite exposure window
   refsMaxAge: 0s                   # 0s = always revalidate refs upstream
   accessRecheck: 5m                # pack hits need a recent upstream refs success
-  responseHeaderTimeout: 60s       # fills only: time to upstream response headers
+  responseHeaderTimeout: 60s       # fills and passthrough reads: time to upstream response headers
   idleTimeout: 2m                  # fills only: max gap between upstream body bytes
   exposeStatus: false              # emit Cache-Status
   remote:                          # optional tier 2
